@@ -6,6 +6,8 @@ from .scan_utils import associative_scan, binary_operator_diag
 
 
 class LRU(nn.Module):
+    """ Linear Recurrent Unit. The LRU is simulated using Parallel Scan (fast!) when
+     "scan" is set to True (default), otherwise recursively (slow)."""
     def __init__(
         self, in_features, out_features, state_features, rmin=0.0, rmax=1.0, max_phase=6.283
     ):
@@ -150,19 +152,102 @@ class LRU(nn.Module):
         return y
 
 
-if __name__ == "__main__":
+# WORK IN PROGRESS
 
-    N = 40 #256 # hidden state dimension
-    H = 20 #512 # model dimension (input/output dimension)
-    L = 10_000 #2048 # input sequence length
-    B = 32 # batch size
+class LRU_Robust(nn.Module):
+    """ Implements a Linear Recurrent Unit (LRU) with trainable or prescribed l2 gain gamma.
+    No parallel scan implementation is available at the moment. """
+    def __init__(self, state_features):
+        super().__init__()
+        self.state_features = state_features
+        self.register_buffer('state', torch.zeros(state_features))
+        self.gamma = nn.Parameter(10*torch.randn(1, 1)) # l2 gain
+        self.epsilon = nn.Parameter(torch.tensor([.9]))
+        self.register_buffer('ID', torch.eye(state_features))
 
-    layer = LRU(in_features=H, out_features=H, state_features=N)
+        self.Skew = nn.Parameter(torch.randn(state_features, state_features))
+
+        # Define each block of X as a parameter
+        self.X11 = nn.Parameter(torch.eye(state_features))
+        self.X12 = nn.Parameter(torch.eye(state_features))
+        self.X22 = nn.Parameter(torch.eye(state_features))
+        self.X21 = nn.Parameter(torch.eye(state_features))
+
+        self.C = nn.Parameter(torch.eye(state_features))
+        self.D = nn.Parameter(torch.eye(state_features))
+
+    def set_param(self):  # Parameter update for L2 gain (free param)
+
+        # Create a skew-symmetric matrix
+        Sk = self.Skew - self.Skew.T
+        # Create orthogonal matrix via Cayley Transform
+        Q = (self.ID-Sk)@torch.linalg.inv(self.ID+Sk)
 
 
-    input_sequences = torch.randn((B, L, H)) # multiple sequences
-    
-    output_sequences = layer(input_sequences)
-    output_sequences_scan = layer.forward_scan(input_sequences)
+        # Compute the blocks of H= X*X.T
+        HHt_22 = self.X21 @ self.X21.T + self.X22 @ self.X22.T +self.D.T@self.D
 
-    torch.allclose(output_sequences_scan, output_sequences, 1e-2)
+        normfactor = (self.gamma**2)/torch.max((torch.linalg.eigvals(HHt_22)).real)
+        tnorm = torch.sqrt(normfactor)
+        # Define the normalized blocks
+        X21n = self.X21*tnorm
+        X22n = self.X22*tnorm
+        Dn = self.D*tnorm
+        HHt_22n = HHt_22*normfactor
+
+
+        HHt_11 = self.X11 @ self.X11.T + self.X12@self.X12.T+self.C.T@self.C
+
+        HHt_12 = self.X11 @ X21n.T + self.X12 @ X22n.T + self.C.T@Dn
+        HHt_21 = HHt_12.T
+
+        # # Assemble H*H.T in block form
+        # HHt = torch.cat([
+        #     torch.cat([HHt_11, HHt_12], dim=1),
+        #     torch.cat([HHt_21, HHt_22n], dim=1)
+        # ], dim=0)
+
+        V = HHt_22n-(self.gamma**2+torch.abs(self.epsilon))*self.ID
+        R = HHt_12@torch.linalg.inv(V).T@HHt_12.T
+
+        CR = torch.linalg.cholesky(-R)
+        CRH = torch.linalg.cholesky(-R+HHt_11)
+
+        Atilde = CRH@Q@torch.linalg.inv(CR)
+
+        A = torch.linalg.inv(Atilde).T
+        self.P = -Atilde@R@Atilde.T
+        la= torch.abs(torch.linalg.eigvals(A))
+        #lp = torch.linalg.eigvals(self.P)
+        B = torch.linalg.pinv(HHt_12.T@Atilde.T)@V.T
+        C=self.C
+
+
+        # row1 = torch.cat([-self.LambdaM.T@self.P@ self.LambdaM+self.P, -self.LambdaM.T@self.P@self.B], dim=1)
+        # row2 = torch.cat([-(self.LambdaM.T@self.P@self.B).T, -self.B.T@self.P@self.B+(self.gamma**2+torch.abs(self.epsilon))*self.IDu], dim=1)
+        # M = torch.cat([row1, row2], dim=0)
+        # eigs = torch.linalg.eigvals(M)
+        #
+        # eigs
+        return A, B, C, Dn
+
+    def forward(self, input, state=None, mode=None):
+        # Input size: (B, L, H)
+        A, B, C, D = self.set_param()
+        if state is None:
+            state=torch.zeros(self.state_features)
+        output = torch.empty(
+            [i for i in input.shape[:-1]] + [self.state_features], device=self.C.device
+        )
+
+        states = []
+        for u_step in input.split(1, dim=1): # 1 is the time dimension
+
+            u_step = u_step.squeeze(1)
+            state = state @ A.T + u_step @ B.T
+            states.append(state)
+
+        states = torch.stack(states, 1)
+        output = states @ C.mT + input @ D.T
+
+        return output

@@ -2,7 +2,9 @@ import math
 from dataclasses import dataclass
 import torch
 import torch.nn as nn
-from .linear import LRU
+from .linear import LRU, LRU_Robust
+from .L_bounded_MLPs import FirstChannel, SandwichFc, SandwichLin
+
 
 
 @dataclass
@@ -16,15 +18,18 @@ class DWNConfig:
     rmax: float = 1.0
     max_phase: float = 2*math.pi
     ff: str = "GLU"
+    scale: float = 1
+    dim_amp: int =4
+    robust: bool = False
 
 
 class MLP(nn.Module):
     """ Standard Transformer MLP """
     def __init__(self, config: DWNConfig):
         super().__init__()
-        self.c_fc = nn.Linear(config.d_model, 4 * config.d_model, bias=config.bias)
+        self.c_fc = nn.Linear(config.d_model, config.dim_amp * config.d_model, bias=config.bias)
         self.gelu = nn.GELU()
-        self.c_proj = nn.Linear(4 * config.d_model, config.d_model, bias=config.bias)
+        self.c_proj = nn.Linear(config.dim_amp * config.d_model, config.d_model, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout) if config.dropout > 0 else nn.Identity()
 
     def forward(self, x):
@@ -32,6 +37,24 @@ class MLP(nn.Module):
         x = self.gelu(x)
         x = self.c_proj(x)
         x = self.dropout(x)
+        return x
+
+
+class LMLP(nn.Module):
+    """ Implements an L-bounded MLP with sandwich layers. The square root
+    # of the L. bound is given by scale """
+    def __init__(self, config: DWNConfig):
+        super().__init__()
+        layers=[FirstChannel(config.d_model, scale=config.scale),
+               SandwichFc(config.d_model, config.dim_amp * config.d_model, bias=config.bias, scale=config.scale),
+               SandwichFc(config.dim_amp *config.d_model, config.dim_amp * config.d_model, bias=config.bias, scale=config.scale),
+               SandwichFc(config.dim_amp *config.d_model, config.dim_amp * config.d_model, bias=config.bias, scale=config.scale),
+               SandwichLin(config.dim_amp * config.d_model, config.d_model, bias=config.bias, scale=config.scale),
+               nn.Dropout(config.dropout) if config.dropout > 0 else nn.Identity()]
+        self.model = nn.Sequential(*layers)
+
+    def forward(self, input):
+        x = self.model(input)
         return x
 
 
@@ -55,14 +78,21 @@ class DWNBlock(nn.Module):
     def __init__(self, config: DWNConfig):
         super().__init__()
         self.ln = nn.LayerNorm(config.d_model, bias=config.bias)
-        self.lru = LRU(config.d_model, config.d_model, config.d_state,
-                        rmin=config.rmin, rmax=config.rmax, max_phase=config.max_phase)
+
+        if config.robust:
+            self.lru = LRU_Robust(config.d_model)
+        else:
+            self.lru = LRU(config.d_model, config.d_model, config.d_state,
+                           rmin=config.rmin, rmax=config.rmax, max_phase=config.max_phase)
+
         #self.ff = MLP(config)  # feedforward layer, or GLU
         match config.ff:
             case "GLU":
                 self.ff = GLU(config)
             case "MLP":
                 self.ff = MLP(config)
+            case "LMLP":
+                self.ff = LMLP(config)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x, state=None, mode="scan"):
