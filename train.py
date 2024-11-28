@@ -57,7 +57,7 @@ if __name__ == "__main__":
     # Train loop
     for itr in tqdm(range(5000)):
 
-        y_pred = model(u)
+        y_pred = model(u, mode="scan")
         loss = torch.nn.functional.mse_loss(y, y_pred)
 
         loss.backward()
