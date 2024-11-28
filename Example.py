@@ -2,14 +2,11 @@ import numpy as np
 import matplotlib.pyplot as plt
 import scipy
 import os
-from os.path import dirname, join as pjoin
-import torch
+from os.path import  join as pjoin
 from torch import nn
-import time
 import math
 from argparse import Namespace
 import torch
-from sklearn.preprocessing import StandardScaler
 from lru.architectures import DWN, DWNConfig
 from tqdm import tqdm
 
@@ -49,22 +46,23 @@ cfg = {
     "d_model": 5,
     "d_state": 5,
     "n_layers": 4,
-    "ff": "LMLP",  # GLU | MLP
+    "ff": "LMLP",  # GLU | MLP | LMLP
     "max_phase": math.pi,
     "r_min": 0.7,
     "r_max": 0.9,
-    "robust": True,
+    "gamma": True,
 }
 cfg = Namespace(**cfg)
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 torch.set_default_device(device)
-torch.set_num_threads(10)
+#torch.set_num_threads(10)
 
 # Build model
 config = DWNConfig(d_model=cfg.d_model, d_state=cfg.d_state, n_layers=cfg.n_layers, ff=cfg.ff, rmin=cfg.r_min,
-                   rmax=cfg.r_max, max_phase=cfg.max_phase, robust=cfg.robust)
+                   rmax=cfg.r_max, max_phase=cfg.max_phase, gamma=cfg.gamma)
 model = DWN(cfg.n_u, cfg.n_y, config)
+model.cuda()
 
 # Configure optimizer
 opt = torch.optim.AdamW(model.parameters(), lr=2e-2)
@@ -80,7 +78,7 @@ MSE = nn.MSELoss()
 LOSS = []
 # Train loop
 for itr in tqdm(range(800)):
-    yRNN = model(u)
+    yRNN = model(u, state=None, mode="loop")
     yRNN = torch.squeeze(yRNN)
     loss = MSE(yRNN, y)
     loss.backward()

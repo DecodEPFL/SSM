@@ -20,7 +20,7 @@ class DWNConfig:
     ff: str = "GLU"
     scale: float = 1
     dim_amp: int =4
-    robust: bool = False
+    gamma: bool = False
 
 
 class MLP(nn.Module):
@@ -79,7 +79,7 @@ class DWNBlock(nn.Module):
         super().__init__()
         self.ln = nn.LayerNorm(config.d_model, bias=config.bias)
 
-        if config.robust:
+        if config.gamma:
             self.lru = LRU_Robust(config.d_model)
         else:
             self.lru = LRU(config.d_model, config.d_model, config.d_state,
@@ -98,11 +98,11 @@ class DWNBlock(nn.Module):
     def forward(self, x, state=None, mode="scan"):
 
         z = x
-        z = self.ln(z)  # prenorm
+     #   z = self.ln(z)  # prenorm
 
         z = self.lru(z, state, mode)
 
-        z = self.ff(z) # MLP or GLU
+        z = self.ff(z) # MLP, GLU or LMLP
         z = self.dropout(z)
 
         # Residual connection
