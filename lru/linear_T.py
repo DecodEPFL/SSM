@@ -9,8 +9,9 @@ import torch.jit as jit
 class LRU(nn.Module):
     """ Linear Recurrent Unit. The LRU is simulated using Parallel Scan (fast!) when
      "scan" is set to True (default), otherwise recursively (slow)."""
+
     def __init__(
-        self, in_features, out_features, state_features, rmin=0.0, rmax=1.0, max_phase=6.283
+            self, in_features, out_features, state_features, rmin=0.0, rmax=1.0, max_phase=6.283
     ):
         super().__init__()
         self.out_features = out_features
@@ -20,7 +21,7 @@ class LRU(nn.Module):
         u1 = torch.rand(state_features)
         u2 = torch.rand(state_features)
         self.nu_log = nn.Parameter(
-            torch.log(-0.5 * torch.log(u1 * (rmax + rmin) * (rmax - rmin) + rmin**2))
+            torch.log(-0.5 * torch.log(u1 * (rmax + rmin) * (rmax - rmin) + rmin ** 2))
         )
         self.theta_log = nn.Parameter(torch.log(max_phase * u2))
         lambda_abs = torch.exp(-torch.exp(self.nu_log))
@@ -31,45 +32,43 @@ class LRU(nn.Module):
         )
         B_re = torch.randn([state_features, in_features]) / math.sqrt(2 * in_features)
         B_im = torch.randn([state_features, in_features]) / math.sqrt(2 * in_features)
-        self.B = nn.Parameter(torch.complex(B_re, B_im)) # N, U
+        self.B = nn.Parameter(torch.complex(B_re, B_im))  # N, U
         C_re = torch.randn([out_features, state_features]) / math.sqrt(state_features)
         C_im = torch.randn([out_features, state_features]) / math.sqrt(state_features)
-        self.C = nn.Parameter(torch.complex(C_re, C_im)) # H, N
+        self.C = nn.Parameter(torch.complex(C_re, C_im))  # H, N
 
         self.in_features = in_features
         self.out_features = out_features
         self.state_features = state_features
 
-
     def ss_params(self):
         lambda_abs = torch.exp(-torch.exp(self.nu_log))
         lambda_phase = torch.exp(self.theta_log)
-        
+
         lambda_re = lambda_abs * torch.cos(lambda_phase)
         lambda_im = lambda_abs * torch.sin(lambda_phase)
         lambdas = torch.complex(lambda_re, lambda_im)
-        #lambdas = lambda_abs*torch.exp(1j*lambda_phase)
+        # lambdas = lambda_abs*torch.exp(1j*lambda_phase)
         gammas = torch.exp(self.gamma_log).unsqueeze(-1).to(self.B.device)
         B = gammas * self.B
         return lambdas, B, self.C, self.D
-
 
     def ss_real_matrices(self, to_numpy=True):
 
         lambdas, B, self.C, self.D = self.ss_params()
 
-        lambdas_full = torch.zeros(2*self.state_features, device=lambdas.device, dtype=lambdas.dtype)
+        lambdas_full = torch.zeros(2 * self.state_features, device=lambdas.device, dtype=lambdas.dtype)
         lambdas_full[::2] = lambdas
         lambdas_full[1::2] = lambdas.conj()
 
         # First convert to complex conjugate system....
         A_full = torch.diag(lambdas_full)
-        B_full = torch.zeros((2*self.state_features, self.in_features), device=lambdas.device, dtype=lambdas.dtype)
+        B_full = torch.zeros((2 * self.state_features, self.in_features), device=lambdas.device, dtype=lambdas.dtype)
         B_full[::2] = B
         B_full[1::2] = B.conj()
-        C_full = torch.zeros((self.out_features, 2*self.state_features), device=lambdas.device, dtype=lambdas.dtype)
-        C_full[:, ::2] = 0.5*self.C # we take the real part of the complex conjugate system as output...
-        C_full[:, 1::2] = 0.5*self.C.conj()
+        C_full = torch.zeros((self.out_features, 2 * self.state_features), device=lambdas.device, dtype=lambdas.dtype)
+        C_full[:, ::2] = 0.5 * self.C  # we take the real part of the complex conjugate system as output...
+        C_full[:, 1::2] = 0.5 * self.C.conj()
         D_full = self.D
 
         # Then apply transformation to real domain
@@ -81,14 +80,13 @@ class LRU(nn.Module):
         A_real = (T_full @ A_full @ T_full_inv).real
         B_real = (T_full @ B_full).real
         C_real = (C_full @ T_full_inv).real
-        D_real = D_full 
+        D_real = D_full
 
         ss_real_params = [A_real, B_real, C_real, D_real]
         if to_numpy:
             ss_real_params = [ss_real_param.detach().numpy() for ss_real_param in ss_real_params]
 
-        return (*ss_real_params, )
-    
+        return (*ss_real_params,)
 
     def forward_loop(self, input, state=None):
 
@@ -99,7 +97,7 @@ class LRU(nn.Module):
         )
 
         states = []
-        for u_step in input.split(1, dim=1): # 1 is the time dimension
+        for u_step in input.split(1, dim=1):  # 1 is the time dimension
 
             u_step = u_step.squeeze(1)
             state = lambdas * state + u_step.to(B.dtype) @ B.T
@@ -125,25 +123,24 @@ class LRU(nn.Module):
         # Bu_elements will have shape (B, L, N)
         Bu_elements = input.to(B.dtype) @ B.T
         if state is not None:
-            Bu_elements[:, 0, :] = Bu_elements[:, 0, :] + lambdas * state 
-        # Vmap the associative scan since Bu_elements is a batch of B sequences.
+            Bu_elements[:, 0, :] = Bu_elements[:, 0, :] + lambdas * state
+            # Vmap the associative scan since Bu_elements is a batch of B sequences.
         # Recall that Lambda_elements has been repeated L times to (L, N),
         # while Bu_seq has shape (B, L, N)
         inner_state_fn = lambda Bu_seq: associative_scan(binary_operator_diag, (lambda_elements, Bu_seq))[1]
         # inner_states will be of shape (B, L, N)
         inner_states = torch.vmap(inner_state_fn)(Bu_elements)
 
-        #y = (inner_states @ self.C.T).real + input_sequences * self.D
+        # y = (inner_states @ self.C.T).real + input_sequences * self.D
         y = (inner_states @ C.T).real + input @ D.T
         return y
-    
 
     def forward(self, input, state=None, mode="scan"):
 
         if state is None:
             state = torch.view_as_complex(
                 torch.zeros((self.state_features, 2), device=input.device)
-            ) # default initial state, size N
+            )  # default initial state, size N
 
         match mode:
             case "scan":
@@ -158,11 +155,11 @@ class LRU(nn.Module):
 class LRU_Robust(jit.ScriptModule):
     """ Implements a Linear Recurrent Unit (LRU) with trainable or prescribed l2 gain gamma.
     No parallel scan implementation is available at the moment. """
+
     def __init__(self, state_features):
         super().__init__()
         self.state_features = state_features
         self.register_buffer('state', torch.zeros(state_features))
-        self.gamma = nn.Parameter(10*torch.randn(1, 1)) # l2 gain
         self.epsilon = nn.Parameter(torch.tensor([.9]))
         self.register_buffer('ID', torch.eye(state_features))
 
@@ -178,27 +175,26 @@ class LRU_Robust(jit.ScriptModule):
         self.D = nn.Parameter(torch.eye(state_features))
 
     @jit.script_method
-    def set_param(self):  # Parameter update for L2 gain (free param)
+    def set_param(self, gamma):  # Parameter update for L2 gain (free param)
 
         # Create a skew-symmetric matrix
         Sk = self.Skew - self.Skew.T
         # Create orthogonal matrix via Cayley Transform
-        Q = (self.ID-Sk)@torch.linalg.inv(self.ID+Sk)
+        Q = (self.ID - Sk) @ torch.linalg.inv(self.ID + Sk)
 
         # Compute the blocks of H= X*X.T
-        HHt_22 = self.X21 @ self.X21.T + self.X22 @ self.X22.T +self.D.T@self.D
-        normfactor = (self.gamma**2-torch.abs(self.epsilon))/torch.max((torch.linalg.eigvals(HHt_22)).real)
+        HHt_22 = self.X21 @ self.X21.T + self.X22 @ self.X22.T + self.D.T @ self.D
+        normfactor = (gamma ** 2 - torch.abs(self.epsilon)) / torch.max((torch.linalg.eigvals(HHt_22)).real)
         tnorm = torch.sqrt(normfactor)
         # Define the normalized blocks
-        X21n = self.X21*tnorm
-        X22n = self.X22*tnorm
-        Dn = self.D*tnorm
-        HHt_22n = HHt_22*normfactor
+        X21n = self.X21 * tnorm
+        X22n = self.X22 * tnorm
+        Dn = self.D * tnorm
+        HHt_22n = HHt_22 * normfactor
 
+        HHt_11 = self.X11 @ self.X11.T + self.X12 @ self.X12.T + self.C.T @ self.C
 
-        HHt_11 = self.X11 @ self.X11.T + self.X12@self.X12.T+self.C.T@self.C
-
-        HHt_12 = self.X11 @ X21n.T + self.X12 @ X22n.T + self.C.T@Dn
+        HHt_12 = self.X11 @ X21n.T + self.X12 @ X22n.T + self.C.T @ Dn
         HHt_21 = HHt_12.T
 
         # # Assemble H*H.T in block form
@@ -207,24 +203,23 @@ class LRU_Robust(jit.ScriptModule):
         #     torch.cat([HHt_21, HHt_22n], dim=1)
         # ], dim=0)
 
-        V = HHt_22n-(self.gamma**2)*self.ID
-        R = HHt_12@torch.linalg.inv(V).T@HHt_12.T
+        V = HHt_22n - (gamma ** 2) * self.ID
+        R = HHt_12 @ torch.linalg.inv(V).T @ HHt_12.T
 
         CR = torch.linalg.cholesky(-R)
-        CRH = torch.linalg.cholesky(-R+HHt_11)
+        CRH = torch.linalg.cholesky(-R + HHt_11)
 
-        Atilde = CRH@Q@torch.linalg.inv(CR)
+        Atilde = CRH @ Q @ torch.linalg.inv(CR)
 
         A = torch.linalg.inv(Atilde).T
-        P = -Atilde@R@Atilde.T
-        #la= torch.abs(torch.linalg.eigvals(A))
-        #lp = torch.linalg.eigvals(self.P)
-        B = torch.linalg.pinv(HHt_12.T@Atilde.T)@V.T
-        C=self.C
-
+        P = -Atilde @ R @ Atilde.T
+        # la= torch.abs(torch.linalg.eigvals(A))
+        # lp = torch.linalg.eigvals(self.P)
+        B = torch.linalg.pinv(HHt_12.T @ Atilde.T) @ V.T
+        C = self.C
 
         # row1 = torch.cat([-self.LambdaM.T@self.P@ self.LambdaM+self.P, -self.LambdaM.T@self.P@self.B], dim=1)
-        # row2 = torch.cat([-(self.LambdaM.T@self.P@self.B).T, -self.B.T@self.P@self.B+(self.gamma**2*self.IDu], dim=1)
+        # row2 = torch.cat([-(self.LambdaM.T@self.P@self.B).T, -self.B.T@self.P@self.B+(gamma**2*self.IDu], dim=1)
         # M = torch.cat([row1, row2], dim=0)
         # eigs = torch.linalg.eigvals(M)
         #
@@ -232,18 +227,18 @@ class LRU_Robust(jit.ScriptModule):
         return A, B, C, Dn
 
     @jit.script_method
-    def forward(self, input, state=None):
+    def forward(self, input, gamma, state=None):
         state = torch.zeros(self.state_features, device=self.C.device)
         # Input size: (B, L, H)
-        A, B, C, D = self.set_param()
+        A, B, C, D = self.set_param(gamma)
         if state is None:
-            state=torch.zeros(self.state_features)
+            state = torch.zeros(self.state_features)
         output = torch.empty(
             [i for i in input.shape[:-1]] + [self.state_features], device=self.C.device
         )
 
         states = []
-        for u_step in input.split(1, dim=1): # 1 is the time dimension
+        for u_step in input.split(1, dim=1):  # 1 is the time dimension
 
             u_step = u_step.squeeze(1)
             state = state @ A.T + u_step @ B.T
