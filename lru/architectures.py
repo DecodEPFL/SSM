@@ -4,8 +4,9 @@ import torch
 import torch.nn as nn
 from .linear import LRU, LRU_Robust
 from .L_bounded_MLPs import FirstChannel, SandwichFc, SandwichLin
+import torch.jit as jit
 
-
+""" Data class to set up the model (values here are used just to initialize all fields) """
 
 @dataclass
 class DWNConfig:
@@ -21,7 +22,9 @@ class DWNConfig:
     scale: float = 1
     dim_amp: int =4
     gamma: bool = False
+    gain: float = 8
 
+    """ Scaffolding Layers """
 
 class MLP(nn.Module):
     """ Standard Transformer MLP """
@@ -73,8 +76,11 @@ class GLU(nn.Module):
         x = self.dropout(self.activation(x))
         x = self.output_linear(x)
         return x
+
+    """ SSMs blocks """
     
 class DWNBlock(nn.Module):
+    """ SSM block: LRU --> MLP + skip connection """
     def __init__(self, config: DWNConfig):
         super().__init__()
         self.ln = nn.LayerNorm(config.d_model, bias=config.bias)
@@ -84,8 +90,6 @@ class DWNBlock(nn.Module):
         else:
             self.lru = LRU(config.d_model, config.d_model, config.d_state,
                            rmin=config.rmin, rmax=config.rmax, max_phase=config.max_phase)
-
-        #self.ff = MLP(config)  # feedforward layer, or GLU
         match config.ff:
             case "GLU":
                 self.ff = GLU(config)
@@ -98,9 +102,8 @@ class DWNBlock(nn.Module):
     def forward(self, x, state=None, mode="scan"):
 
         z = x
-     #   z = self.ln(z)  # prenorm
-
-        z = self.lru(z, state, mode)
+     #  z = self.ln(z)  # prenorm
+        z = self.lru(z, state)
 
         z = self.ff(z) # MLP, GLU or LMLP
         z = self.dropout(z)
@@ -112,6 +115,7 @@ class DWNBlock(nn.Module):
 
 
 class DWN(nn.Module):
+    """ Deep SSMs block: encoder --> cascade of n SSMs --> decoder  """
     def __init__(self, n_u, n_y, config: DWNConfig):
         super().__init__()
         self.encoder = nn.Linear(n_u, config.d_model)

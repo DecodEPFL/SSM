@@ -78,7 +78,7 @@ MSE = nn.MSELoss()
 LOSS = []
 # Train loop
 for itr in tqdm(range(800)):
-    yRNN = model(u, state=None, mode="loop")
+    yRNN = model(u, state=None, mode="scan")
     yRNN = torch.squeeze(yRNN)
     loss = MSE(yRNN, y)
     loss.backward()

@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from .scan_utils import associative_scan, binary_operator_diag
+import torch.jit as jit
 
 
 class LRU(nn.Module):
@@ -154,7 +155,7 @@ class LRU(nn.Module):
 
 # WORK IN PROGRESS
 
-class LRU_Robust(nn.Module):
+class LRU_Robust(jit.ScriptModule):
     """ Implements a Linear Recurrent Unit (LRU) with trainable or prescribed l2 gain gamma.
     No parallel scan implementation is available at the moment. """
     def __init__(self, state_features):
@@ -176,6 +177,7 @@ class LRU_Robust(nn.Module):
         self.C = nn.Parameter(torch.eye(state_features))
         self.D = nn.Parameter(torch.eye(state_features))
 
+    @jit.script_method
     def set_param(self):  # Parameter update for L2 gain (free param)
 
         # Create a skew-symmetric matrix
@@ -183,10 +185,8 @@ class LRU_Robust(nn.Module):
         # Create orthogonal matrix via Cayley Transform
         Q = (self.ID-Sk)@torch.linalg.inv(self.ID+Sk)
 
-
         # Compute the blocks of H= X*X.T
         HHt_22 = self.X21 @ self.X21.T + self.X22 @ self.X22.T +self.D.T@self.D
-
         normfactor = (self.gamma**2)/torch.max((torch.linalg.eigvals(HHt_22)).real)
         tnorm = torch.sqrt(normfactor)
         # Define the normalized blocks
@@ -216,8 +216,8 @@ class LRU_Robust(nn.Module):
         Atilde = CRH@Q@torch.linalg.inv(CR)
 
         A = torch.linalg.inv(Atilde).T
-        self.P = -Atilde@R@Atilde.T
-        la= torch.abs(torch.linalg.eigvals(A))
+        P = -Atilde@R@Atilde.T
+        #la= torch.abs(torch.linalg.eigvals(A))
         #lp = torch.linalg.eigvals(self.P)
         B = torch.linalg.pinv(HHt_12.T@Atilde.T)@V.T
         C=self.C
@@ -231,7 +231,9 @@ class LRU_Robust(nn.Module):
         # eigs
         return A, B, C, Dn
 
-    def forward(self, input, state=None, mode=None):
+    @jit.script_method
+    def forward(self, input, state=None):
+        state = torch.zeros(self.state_features, device=self.C.device)
         # Input size: (B, L, H)
         A, B, C, D = self.set_param()
         if state is None:
