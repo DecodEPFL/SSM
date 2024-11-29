@@ -7,7 +7,7 @@ from torch import nn
 import math
 from argparse import Namespace
 import torch
-from lru.architectures import DWN, DWNConfig
+from lru.Architectures_T import DWN, DWNConfig
 from tqdm import tqdm
 
 dtype = torch.float
@@ -51,6 +51,8 @@ cfg = {
     "r_min": 0.7,
     "r_max": 0.9,
     "gamma": True,
+    "trainable": True,
+    "gain": 6.4
 }
 cfg = Namespace(**cfg)
 
@@ -60,7 +62,7 @@ torch.set_default_device(device)
 
 # Build model
 config = DWNConfig(d_model=cfg.d_model, d_state=cfg.d_state, n_layers=cfg.n_layers, ff=cfg.ff, rmin=cfg.r_min,
-                   rmax=cfg.r_max, max_phase=cfg.max_phase, gamma=cfg.gamma)
+                   rmax=cfg.r_max, max_phase=cfg.max_phase, gamma=cfg.gamma, trainable=cfg.trainable, gain=cfg.gain)
 model = DWN(cfg.n_u, cfg.n_y, config)
 model.cuda()
 

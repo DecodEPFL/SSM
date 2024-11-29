@@ -187,7 +187,7 @@ class LRU_Robust(jit.ScriptModule):
 
         # Compute the blocks of H= X*X.T
         HHt_22 = self.X21 @ self.X21.T + self.X22 @ self.X22.T +self.D.T@self.D
-        normfactor = (self.gamma**2)/torch.max((torch.linalg.eigvals(HHt_22)).real)
+        normfactor = (self.gamma**2-torch.abs(self.epsilon))/torch.max((torch.linalg.eigvals(HHt_22)).real)
         tnorm = torch.sqrt(normfactor)
         # Define the normalized blocks
         X21n = self.X21*tnorm
@@ -207,7 +207,7 @@ class LRU_Robust(jit.ScriptModule):
         #     torch.cat([HHt_21, HHt_22n], dim=1)
         # ], dim=0)
 
-        V = HHt_22n-(self.gamma**2+torch.abs(self.epsilon))*self.ID
+        V = HHt_22n-(self.gamma**2)*self.ID
         R = HHt_12@torch.linalg.inv(V).T@HHt_12.T
 
         CR = torch.linalg.cholesky(-R)
@@ -224,7 +224,7 @@ class LRU_Robust(jit.ScriptModule):
 
 
         # row1 = torch.cat([-self.LambdaM.T@self.P@ self.LambdaM+self.P, -self.LambdaM.T@self.P@self.B], dim=1)
-        # row2 = torch.cat([-(self.LambdaM.T@self.P@self.B).T, -self.B.T@self.P@self.B+(self.gamma**2+torch.abs(self.epsilon))*self.IDu], dim=1)
+        # row2 = torch.cat([-(self.LambdaM.T@self.P@self.B).T, -self.B.T@self.P@self.B+(self.gamma**2*self.IDu], dim=1)
         # M = torch.cat([row1, row2], dim=0)
         # eigs = torch.linalg.eigvals(M)
         #
