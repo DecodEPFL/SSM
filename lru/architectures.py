@@ -23,6 +23,7 @@ class DWNConfig:
     dim_amp: int =4
     gamma: bool = False
     gain: float = 8
+    trainable: bool = True
 
     """ Scaffolding Layers """
 
@@ -125,8 +126,8 @@ class DWN(nn.Module):
         self.decoder = nn.Linear(config.d_model, n_y)
 
     def forward(self, u, state=None, mode="scan"):
-        x = self.encoder(u)
 
+        x = self.encoder(u)
         for layer, block in enumerate(self.blocks):
             state_block = state[layer] if state is not None else None
             x = block(x, state=state_block, mode=mode)

@@ -2,6 +2,8 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from sympy.abc import epsilon
+
 from .scan_utils import associative_scan, binary_operator_diag
 import torch.jit as jit
 
@@ -11,7 +13,7 @@ class LRU(nn.Module):
      "scan" is set to True (default), otherwise recursively (slow)."""
 
     def __init__(
-            self, in_features, out_features, state_features, rmin=0.0, rmax=1.0, max_phase=6.283
+            self, in_features: int, out_features: int, state_features: int, rmin=0.7, rmax=1.0, max_phase=6.283
     ):
         super().__init__()
         self.out_features = out_features
@@ -154,15 +156,25 @@ class LRU(nn.Module):
 
 class LRU_Robust(jit.ScriptModule):
     """ Implements a Linear Recurrent Unit (LRU) with trainable or prescribed l2 gain gamma.
-    No parallel scan implementation is available at the moment. """
+    No parallel scan implementation available at the moment. """
 
-    def __init__(self, state_features):
+    def __init__(self, state_features: int, trainable: bool):
         super().__init__()
+        self.trainable = trainable
         self.state_features = state_features
         self.register_buffer('state', torch.zeros(state_features))
-        self.epsilon = nn.Parameter(torch.tensor([.9]))
         self.register_buffer('ID', torch.eye(state_features))
 
+        self.alpha = nn.Parameter(torch.tensor(-1.8)) # controls the initialization of the matrix A:
+        # the more negative the alpha at initialization, the closer the eigenvalues of A will be
+        # to the boundary of the unitary circle at initialization. This helps the SSM to obtain long memory properties.
+
+
+        if self.trainable:
+            self.gamma = nn.Parameter(10 * torch.randn(1, 1)) # l2 gain
+            self.epsilon = nn.Parameter(torch.tensor([.9]))
+        else:
+            self.register_buffer('gamma', torch.tensor(3))
         self.Skew = nn.Parameter(torch.randn(state_features, state_features))
 
         # Define each block of X as a parameter
@@ -174,8 +186,17 @@ class LRU_Robust(jit.ScriptModule):
         self.C = nn.Parameter(torch.eye(state_features))
         self.D = nn.Parameter(torch.eye(state_features))
 
+
+
+
     @jit.script_method
-    def set_param(self, gamma):  # Parameter update for L2 gain (free param)
+    def set_param(self, gamma_lru = None):  # Parameter update for l2 gain (free param)
+
+        gamma = self.gamma
+        if not self.trainable and gamma_lru is not None:
+            gamma = gamma_lru
+
+        epsilon = gamma**2 * torch.sigmoid(self.alpha)
 
         # Create a skew-symmetric matrix
         Sk = self.Skew - self.Skew.T
@@ -184,7 +205,8 @@ class LRU_Robust(jit.ScriptModule):
 
         # Compute the blocks of H= X*X.T
         HHt_22 = self.X21 @ self.X21.T + self.X22 @ self.X22.T + self.D.T @ self.D
-        normfactor = (gamma ** 2 - torch.abs(self.epsilon)) / torch.max((torch.linalg.eigvals(HHt_22)).real)
+        lmax= torch.max(torch.linalg.eigvals(HHt_22).real)
+        normfactor = (gamma**2-epsilon)/lmax
         tnorm = torch.sqrt(normfactor)
         # Define the normalized blocks
         X21n = self.X21 * tnorm
@@ -203,7 +225,7 @@ class LRU_Robust(jit.ScriptModule):
         #     torch.cat([HHt_21, HHt_22n], dim=1)
         # ], dim=0)
 
-        V = HHt_22n - (gamma ** 2) * self.ID
+        V = HHt_22n-gamma**2*self.ID
         R = HHt_12 @ torch.linalg.inv(V).T @ HHt_12.T
 
         CR = torch.linalg.cholesky(-R)
@@ -212,22 +234,22 @@ class LRU_Robust(jit.ScriptModule):
         Atilde = CRH @ Q @ torch.linalg.inv(CR)
 
         A = torch.linalg.inv(Atilde).T
-        P = -Atilde @ R @ Atilde.T
-        # la= torch.abs(torch.linalg.eigvals(A))
+        #P = -Atilde @ R @ Atilde.T
+        #la= torch.abs(torch.linalg.eigvals(A))
         # lp = torch.linalg.eigvals(self.P)
         B = torch.linalg.pinv(HHt_12.T @ Atilde.T) @ V.T
         C = self.C
 
-        # row1 = torch.cat([-self.LambdaM.T@self.P@ self.LambdaM+self.P, -self.LambdaM.T@self.P@self.B], dim=1)
-        # row2 = torch.cat([-(self.LambdaM.T@self.P@self.B).T, -self.B.T@self.P@self.B+(gamma**2*self.IDu], dim=1)
+        # row1 = torch.cat([-A.T@P@ A+P, -A.T@P@B], dim=1)
+        # row2 = torch.cat([-(A.T@P@B).T, -B.T@P@B+(gamma**2*self.ID)], dim=1)
         # M = torch.cat([row1, row2], dim=0)
         # eigs = torch.linalg.eigvals(M)
-        #
-        # eigs
+
+       #eigs
         return A, B, C, Dn
 
     @jit.script_method
-    def forward(self, input, gamma, state=None):
+    def forward(self, input, gamma = None, state=None):
         state = torch.zeros(self.state_features, device=self.C.device)
         # Input size: (B, L, H)
         A, B, C, D = self.set_param(gamma)

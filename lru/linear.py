@@ -155,7 +155,7 @@ class LRU(nn.Module):
 
 # WORK IN PROGRESS
 
-class LRU_Robust(jit.ScriptModule):
+class LRU_Robust(nn.Module):
     """ Implements a Linear Recurrent Unit (LRU) with trainable or prescribed l2 gain gamma.
     No parallel scan implementation is available at the moment. """
     def __init__(self, state_features):
@@ -177,7 +177,7 @@ class LRU_Robust(jit.ScriptModule):
         self.C = nn.Parameter(torch.eye(state_features))
         self.D = nn.Parameter(torch.eye(state_features))
 
-    @jit.script_method
+
     def set_param(self):  # Parameter update for L2 gain (free param)
 
         # Create a skew-symmetric matrix
@@ -187,7 +187,7 @@ class LRU_Robust(jit.ScriptModule):
 
         # Compute the blocks of H= X*X.T
         HHt_22 = self.X21 @ self.X21.T + self.X22 @ self.X22.T +self.D.T@self.D
-        normfactor = (self.gamma**2-torch.abs(self.epsilon))/torch.max((torch.linalg.eigvals(HHt_22)).real)
+        normfactor = (self.gamma**2)/torch.max((torch.linalg.eigvals(HHt_22)).real)
         tnorm = torch.sqrt(normfactor)
         # Define the normalized blocks
         X21n = self.X21*tnorm
@@ -207,7 +207,7 @@ class LRU_Robust(jit.ScriptModule):
         #     torch.cat([HHt_21, HHt_22n], dim=1)
         # ], dim=0)
 
-        V = HHt_22n-(self.gamma**2)*self.ID
+        V = HHt_22n-(self.gamma**2+torch.abs(self.epsilon))*self.ID
         R = HHt_12@torch.linalg.inv(V).T@HHt_12.T
 
         CR = torch.linalg.cholesky(-R)
@@ -231,8 +231,8 @@ class LRU_Robust(jit.ScriptModule):
         # eigs
         return A, B, C, Dn
 
-    @jit.script_method
-    def forward(self, input, state=None):
+
+    def forward(self, input, gamma=None, state=None):
         state = torch.zeros(self.state_features, device=self.C.device)
         # Input size: (B, L, H)
         A, B, C, D = self.set_param()

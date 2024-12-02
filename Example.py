@@ -7,8 +7,13 @@ from torch import nn
 import math
 from argparse import Namespace
 import torch
-from lru.Architectures_T import DWN, DWNConfig
 from tqdm import tqdm
+
+seed = 2
+torch.manual_seed(seed)
+
+from lru.Architectures_T import DWN, DWNConfig
+
 
 dtype = torch.float
 device = torch.device("cuda")
@@ -36,8 +41,7 @@ for j in range(nExp):
     u[j, :, :] = torch.unsqueeze(inputActive[:, inputnumberD], 1)
     y[j, :, :] = (torch.from_numpy(yExp[0, j])).T
 
-seed = 2
-torch.manual_seed(seed)
+
 
 # very small architecture
 cfg = {
@@ -51,8 +55,8 @@ cfg = {
     "r_min": 0.7,
     "r_max": 0.9,
     "gamma": True,
-    "trainable": True,
-    "gain": 6.4
+    "trainable": False,
+    "gain": 2.4
 }
 cfg = Namespace(**cfg)
 
