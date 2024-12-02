@@ -17,5 +17,5 @@ Moreover, the use of [parallel scan algorithms](https://en.wikipedia.org/wiki/Pr
 
 LRU units are typically organized in a deep LRU architecture like:
 
-<img src="architecture/lru_architecture.png"  width="500">
+<img src="architecture/Arch.png"  width="500">
 
