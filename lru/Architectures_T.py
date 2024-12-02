@@ -15,7 +15,7 @@ class DWNConfig:
     d_state: int = 64 # state size of the LRU (n)
     n_layers: int = 6 # number of SSMs blocks in cascade for deep structures
     dropout: float = 0.0 # set it different from 0 if you want to introduce dropout regularization
-    bias: bool = True # bias of linear layers
+    bias: bool = True # bias of MLP layers
     rmin: float = 0.0 # min. magnitude of the eigenvalues at initialization in the complex parametrization
     rmax: float = 1.0 # max. magnitude of the eigenvalues at initialization in the complex parametrization
     max_phase: float = 2 * math.pi # maximum phase of the eigenvalues at initialization in the complex parametrization
@@ -54,12 +54,12 @@ class LMLP(nn.Module):
     def __init__(self, config: DWNConfig):
         super().__init__()
         layers = [FirstChannel(config.d_model, scale=config.scale),
-                  SandwichFc(config.d_model, config.dim_amp * config.d_model, bias=config.bias, scale=config.scale),
-                  SandwichFc(config.dim_amp * config.d_model, config.dim_amp * config.d_model, bias=config.bias,
+                  SandwichFc(config.d_model, config.dim_amp * config.d_model, bias=False, scale=config.scale),
+                  SandwichFc(config.dim_amp * config.d_model, config.dim_amp * config.d_model, bias=False,
                              scale=config.scale),
-                  SandwichFc(config.dim_amp * config.d_model, config.dim_amp * config.d_model, bias=config.bias,
+                  SandwichFc(config.dim_amp * config.d_model, config.dim_amp * config.d_model, bias=False,
                              scale=config.scale),
-                  SandwichLin(config.dim_amp * config.d_model, config.d_model, bias=config.bias, scale=config.scale),
+                  SandwichLin(config.dim_amp * config.d_model, config.d_model, bias=False, scale=config.scale),
                   nn.Dropout(config.dropout) if config.dropout > 0 else nn.Identity()]
         self.model = nn.Sequential(*layers)
 

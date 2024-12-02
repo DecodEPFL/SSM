@@ -9,7 +9,7 @@ from argparse import Namespace
 import torch
 from tqdm import tqdm
 
-seed = 2
+seed = 1
 torch.manual_seed(seed)
 
 from lru.Architectures_T import DWN, DWNConfig
@@ -43,7 +43,7 @@ for j in range(nExp):
 
 
 
-# very small architecture
+# set up a simple architecture
 cfg = {
     "n_u": 1,
     "n_y": 3,
@@ -53,9 +53,9 @@ cfg = {
     "ff": "LMLP",  # GLU | MLP | LMLP
     "max_phase": math.pi,
     "r_min": 0.7,
-    "r_max": 0.9,
+    "r_max": 0.98,
     "gamma": True,
-    "trainable": False,
+    "trainable": True,
     "gain": 2.4
 }
 cfg = Namespace(**cfg)
@@ -75,12 +75,18 @@ opt = torch.optim.AdamW(model.parameters(), lr=2e-2)
 opt.zero_grad()
 
 
+
+
 total_params = sum(p.numel() for p in model.parameters())
 print(f"Number of parameters: {total_params}")
 
 
 MSE = nn.MSELoss()
 
+
+# Variables for tracking the lowest loss
+lowest_loss = float('inf')  # Initialize with a very large value
+best_model_path = "best_model.pth"
 LOSS = []
 # Train loop
 for itr in tqdm(range(800)):
@@ -89,11 +95,15 @@ for itr in tqdm(range(800)):
     loss = MSE(yRNN, y)
     loss.backward()
     opt.step()
+    # Check if this epoch has the lowest loss
+    if loss.item() < lowest_loss:
+        lowest_loss = loss.item()
+        torch.save(model.state_dict(), best_model_path)  # Save model
     opt.zero_grad()
     if itr % 100 == 0:
         print(loss.item())
     LOSS.append(loss.item())
-
+print(f"Training complete. Best model saved with loss: {lowest_loss:.4f}.")
 checkpoint = {
     'model': model.state_dict(),
     'LOSS': np.array(LOSS),
@@ -109,6 +119,10 @@ nExp = yExp_val.size
 
 uval = torch.zeros(nExp, t_end, 1,  device = device)
 yval = torch.zeros(nExp, t_end, 3,  device = device)
+
+#model.load_state_dict(torch.load(best_model_path))
+#model.eval()  # Set to evaluation mode
+
 
 for j in range(nExp):
     inputActive = (torch.from_numpy(dExp_val[0, j])).T
@@ -127,44 +141,44 @@ plt.title("LOSS")
 plt.show()
 
 plt.figure('9')
-plt.plot(yRNN[0, :, 0].cpu().detach().numpy(), label='REN')
+plt.plot(yRNN[0, :, 0].cpu().detach().numpy(), label='SSM')
 plt.plot(y[0, :, 0].cpu().detach().numpy(), label='y train')
 plt.title("output 1 train single RNN")
 plt.legend()
 plt.show()
 
 plt.figure('10')
-plt.plot(yRNN_val[:, 0].cpu().detach().numpy(), label='REN val')
+plt.plot(yRNN_val[:, 0].cpu().detach().numpy(), label='SSM val')
 plt.plot(yval[:, 0].cpu().detach().numpy(), label='y val')
-plt.title("output 1 val single RNN")
+plt.title("output 1 val single SSM")
 plt.legend()
 plt.show()
 
 plt.figure('11')
-plt.plot(yRNN[0, :, 1].cpu().detach().numpy(), label='REN')
+plt.plot(yRNN[0, :, 1].cpu().detach().numpy(), label='SSM')
 plt.plot(y[0, :, 1].cpu().detach().numpy(), label='y train')
-plt.title("output 1 train single RNN")
+plt.title("output 1 train single SSM")
 plt.legend()
 plt.show()
 
 plt.figure('12')
-plt.plot(yRNN_val[:, 1].cpu().detach().numpy(), label='REN val')
+plt.plot(yRNN_val[:, 1].cpu().detach().numpy(), label='SSM val')
 plt.plot(yval[:, 1].cpu().detach().numpy(), label='y val')
-plt.title("output 1 val single REN")
+plt.title("output 1 val single SSM")
 plt.legend()
 plt.show()
 
 plt.figure('13')
-plt.plot(yRNN[0, :, 2].cpu().detach().numpy(), label='REN')
+plt.plot(yRNN[0, :, 2].cpu().detach().numpy(), label='SSM')
 plt.plot(y[0, :, 2].cpu().detach().numpy(), label='y train')
-plt.title("output 1 train single RNN")
+plt.title("output 1 train single SSM")
 plt.legend()
 plt.show()
 
 plt.figure('14')
-plt.plot(yRNN_val[:, 2].cpu().detach().numpy(), label='REN val')
+plt.plot(yRNN_val[:, 2].cpu().detach().numpy(), label='SSM val')
 plt.plot(yval[:, 2].cpu().detach().numpy(), label='y val')
-plt.title("output 1 val single RNN")
+plt.title("output 1 val single SSM")
 plt.legend()
 plt.show()
 
