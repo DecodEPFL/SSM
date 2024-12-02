@@ -53,7 +53,7 @@ class LMLP(nn.Module):
                SandwichFc(config.d_model, config.dim_amp * config.d_model, bias=config.bias, scale=config.scale),
                SandwichFc(config.dim_amp *config.d_model, config.dim_amp * config.d_model, bias=config.bias, scale=config.scale),
                SandwichFc(config.dim_amp *config.d_model, config.dim_amp * config.d_model, bias=config.bias, scale=config.scale),
-               SandwichLin(config.dim_amp * config.d_model, config.d_model, bias=config.bias, scale=config.scale),
+               SandwichLin(config.dim_amp * config.d_model, config.d_model, bias=False, scale=config.scale),
                nn.Dropout(config.dropout) if config.dropout > 0 else nn.Identity()]
         self.model = nn.Sequential(*layers)
 

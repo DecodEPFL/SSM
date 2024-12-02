@@ -1,9 +1,6 @@
 import math
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from sympy.abc import epsilon
-
 from .scan_utils import associative_scan, binary_operator_diag
 import torch.jit as jit
 
@@ -13,7 +10,7 @@ class LRU(nn.Module):
      "scan" is set to True (default), otherwise recursively (slow)."""
 
     def __init__(
-            self, in_features: int, out_features: int, state_features: int, rmin=0.7, rmax=1.0, max_phase=6.283
+            self, in_features: int, out_features: int, state_features: int, rmin=0.9, rmax=1.0, max_phase=6.283
     ):
         super().__init__()
         self.out_features = out_features
