@@ -6,7 +6,7 @@ A PyTorch implementation of DeepMind's [Linear Recurrent Unit](https://arxiv.org
 The LRU block is a discrete-time linear time-invariant system implemented in state-space form as:
 ```math
 \begin{align}
-x_{k} = Ax_{x-1} + B u_k\\
+x_{k+1} = Ax_{x} + B u_k\\
 y_k = C x_k + D u_k,
 \end{align}
 ```
