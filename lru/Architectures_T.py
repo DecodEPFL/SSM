@@ -4,30 +4,30 @@ import torch
 import torch.nn as nn
 from .linear_T import LRU, LRU_Robust
 from .L_bounded_MLPs import FirstChannel, SandwichFc, SandwichLin
-import torch.jit as jit
+
 
 """ Data class to set up the model (values here are used just to initialize all fields) """
 
 
 @dataclass
 class DWNConfig:
-    d_model: int = 10
-    d_state: int = 64
-    n_layers: int = 6
-    dropout: float = 0.0
-    bias: bool = True
-    rmin: float = 0.0
-    rmax: float = 1.0
-    max_phase: float = 2 * math.pi
-    ff: str = "GLU"
-    scale: float = 1
-    dim_amp: int = 4
-    gamma: bool = False
-    gain: float = 8
-    trainable: bool = True
+    d_model: int = 10 # input/output size of the LRU (u and y)
+    d_state: int = 64 # state size of the LRU (n)
+    n_layers: int = 6 # number of SSMs blocks in cascade for deep structures
+    dropout: float = 0.0 # set it different from 0 if you want to introduce dropout regularization
+    bias: bool = True # bias of linear layers
+    rmin: float = 0.0 # min. magnitude of the eigenvalues at initialization in the complex parametrization
+    rmax: float = 1.0 # max. magnitude of the eigenvalues at initialization in the complex parametrization
+    max_phase: float = 2 * math.pi # maximum phase of the eigenvalues at initialization in the complex parametrization
+    ff: str = "MLP" # non-linear block used in the scaffolding
+    scale: float = 1 # Lipschitz constant of the l. bounded MLP (LMLP)
+    dim_amp: int = 4 # controls the hidden layer's dimension of the MLP
+    gamma: bool = True # set this to true if you want to use the l2 gain parametrization for the SSM. If set to false,
+    # the complex diagonal parametrization of the LRU will be used instead.
+    gain: float = 8 # set the overall l2 gain in case you want to keep it fixed and not trainable
+    trainable: bool = True # set this to true if you want a trainable l2 gain.
 
     """ Scaffolding Layers """
-
 
 class MLP(nn.Module):
     """ Standard Transformer MLP """
@@ -98,7 +98,7 @@ class DWNBlock(nn.Module):
         self.ln = nn.LayerNorm(config.d_model, bias=config.bias)
 
         if config.gamma:
-            self.lru = LRU_Robust(config.d_model)
+            self.lru = LRU_Robust(config.d_model, config.trainable)
 
         else:
             self.lru = LRU(config.d_model, config.d_model, config.d_state,
@@ -116,6 +116,7 @@ class DWNBlock(nn.Module):
 
         z = x
         #  z = self.ln(z)  # prenorm
+
         z = self.lru(z, gamma, state)
 
         z = self.ff(z)  # MLP, GLU or LMLP
@@ -130,29 +131,59 @@ class DWNBlock(nn.Module):
 class DWN(nn.Module):
     """ Deep SSMs block: encoder --> cascade of n SSMs --> decoder  """
 
-    def __init__(self, n_u, n_y, config: DWNConfig):
+    def __init__(self, n_u: int, n_y: int, config: DWNConfig):
         super().__init__()
-        if config.gamma:
-            if config.trainable:
-                self.gammat = nn.Parameter(torch.tensor(config.gain))
-            else:
-                self.register_buffer('gammat', torch.tensor(config.gain))
-            self.gammas = nn.Parameter(torch.pow(self.gammat, 1/(config.n_layers+2))*torch.ones(config.n_layers+1))
-        self.encoder = nn.Parameter(torch.randn(n_u, config.d_model))
-        self.blocks = nn.ModuleList(
-            [DWNBlock(config) for _ in range(config.n_layers)]
-        )
-        self.decoder = nn.Parameter(torch.randn(config.d_model, n_y))
 
-    def forward(self, u, state=None, mode="scan"):
-        gammad = self.gammat / torch.prod(self.gammas)
-        gammae=torch.abs(self.gammas[0])
-        gammad=torch.abs(gammad)
-        encoder=gammae*self.encoder/torch.norm(self.encoder,2)
-        decoder = gammad*self.decoder/torch.norm(self.decoder,2)
+        self.config = config
+
+        self.encoder = nn.Linear(n_u, config.d_model)
+        self.decoder = nn.Linear(config.d_model, n_y, bias=False)
+
+        if not config.trainable: # parameters needed for when the l2 gain is fixed and prescribed
+            self.alpha = nn.Parameter(torch.randn(1))
+            self.gamma_e = nn.Parameter(torch.randn(1))
+            self.register_buffer('gamma_t', torch.tensor(config.gain))
+            self.encoder = nn.Parameter(torch.randn(n_u, config.d_model))
+            self.decoder = nn.Parameter(torch.randn(config.d_model, n_y))
+
+
+
+
+        self.blocks = nn.ModuleList([DWNBlock(config) for _ in range(config.n_layers)])
+
+    def forward_fixed_gamma(self, u, state=None, mode="scan"):
+
+        gamma_t = torch.abs(self.gamma_t)
+        gamma_e = torch.abs(self.gamma_e)
+        gamma_mid = torch.pow(1 / torch.sigmoid(self.alpha), 1 / self.config.n_layers) * torch.ones(
+            self.config.n_layers)
+        gamma_d = torch.sigmoid(self.alpha) * gamma_t / self.gamma_e
+        encoder = gamma_e * self.encoder / torch.norm(self.encoder, 2)
+        decoder = gamma_d * self.decoder / torch.norm(self.decoder, 2)
         x = u@encoder
         for layer, block in enumerate(self.blocks):
             state_block = state[layer] if state is not None else None
-            x = block(x, self.gammas[layer+1], state=state_block, mode=mode)
+            x = block(x, gamma_mid[layer]-1, state=state_block, mode=mode)
         x = x@decoder
+
+        return x
+
+    def forward_trainable_gamma(self, u, state=None, mode="scan"):
+
+        x = self.encoder(u)
+        for layer, block in enumerate(self.blocks):
+            state_block = state[layer] if state is not None else None
+            x = block(x, state=state_block, mode=mode)
+        x = self.decoder(x)
+
+        return x
+
+
+    def forward(self, u, state=None, mode="scan"):
+
+        if not self.config.trainable:
+            x = self.forward_fixed_gamma(u, state, mode)
+        else:
+            x = self.forward_trainable_gamma(u, state, mode)
+
         return x
