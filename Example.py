@@ -12,7 +12,7 @@ from tqdm import tqdm
 seed = 2
 torch.manual_seed(seed)
 
-from lru.Architectures_T import DWN, DWNConfig
+from lru.architectures import DWN, DWNConfig
 
 
 dtype = torch.float
