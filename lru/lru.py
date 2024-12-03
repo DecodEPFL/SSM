@@ -7,7 +7,7 @@ import torch.jit as jit
 
 class LRU(nn.Module):
     """ Linear Recurrent Unit. The LRU is simulated using Parallel Scan (fast!) when
-     "scan" is set to True (default), otherwise recursively (slow)."""
+     "scan" is set to True (default) in the forward pass, otherwise recursively (slow)."""
 
     def __init__(
             self, in_features: int, out_features: int, state_features: int, rmin=0.9, rmax=1.0, max_phase=6.283
