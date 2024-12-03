@@ -1,6 +1,6 @@
 # Pytorch port of associative scan
 
-#@title PyTorch associative/parallel scan
+# @title PyTorch associative/parallel scan
 # Taken from https://github.com/i404788/s5-pytorch/blob/74e2fdae00b915a62c914bf3615c0b8a4279eb84/s5/jax_compat.py#L50-L134
 import torch
 from jax.tree_util import tree_flatten, tree_unflatten
@@ -28,11 +28,13 @@ def safe_map(f: Callable[[T1, T2], T], __arg1: Iterable[T1], __arg2: Iterable[T2
 
 
 @overload
-def safe_map(f: Callable[[T1, T2, T3], T], __arg1: Iterable[T1], __arg2: Iterable[T2], __arg3: Iterable[T3]) -> List[T]: ...
+def safe_map(f: Callable[[T1, T2, T3], T], __arg1: Iterable[T1], __arg2: Iterable[T2], __arg3: Iterable[T3]) -> List[
+    T]: ...
 
 
 @overload
-def safe_map(f: Callable[..., T], __arg1: Iterable[Any], __arg2: Iterable[Any], __arg3: Iterable[Any], __arg4: Iterable[Any], *args) -> List[T]: ...
+def safe_map(f: Callable[..., T], __arg1: Iterable[Any], __arg2: Iterable[Any], __arg3: Iterable[Any],
+             __arg4: Iterable[Any], *args) -> List[T]: ...
 
 
 def safe_map(f, *args):
@@ -45,6 +47,7 @@ def safe_map(f, *args):
 
 def slice_along_axis(start, end, stride=None, axis=0):
     return (slice(None),) * axis + (slice(start, end, stride),)
+
 
 # Pytorch impl. of jax.lax.associative_scan
 def associative_scan(operator, elems, axis=0, reverse=False):
@@ -79,8 +82,8 @@ def associative_scan(operator, elems, axis=0, reverse=False):
 
         # Combine adjacent pairs of elements.
         reduced_elems = combine(
-          [elem[slice_along_axis(0, -1, stride=2, axis=axis)] for elem in elems],
-          [elem[slice_along_axis(1, None, stride=2, axis=axis)] for elem in elems])
+            [elem[slice_along_axis(0, -1, stride=2, axis=axis)] for elem in elems],
+            [elem[slice_along_axis(1, None, stride=2, axis=axis)] for elem in elems])
 
         # Recursively compute scan for partially reduced tensors.
         odd_elems = _scan(reduced_elems)
@@ -97,11 +100,11 @@ def associative_scan(operator, elems, axis=0, reverse=False):
         # The first element of a scan is the same as the first element
         # of the original `elems`.
         even_elems = [
-          torch.cat([elem[slice_along_axis(0, 1, axis=axis)], result], dim=axis)
-          if result.shape.numel() > 0 and elem.shape[axis] > 0 else
-          result if result.shape.numel() > 0 else
-          elem[slice_along_axis(0, 1, axis=axis)]  # Jax allows/ignores concat with 0-dim, Pytorch does not
-          for (elem, result) in zip(elems, even_elems)]
+            torch.cat([elem[slice_along_axis(0, 1, axis=axis)], result], dim=axis)
+            if result.shape.numel() > 0 and elem.shape[axis] > 0 else
+            result if result.shape.numel() > 0 else
+            elem[slice_along_axis(0, 1, axis=axis)]  # Jax allows/ignores concat with 0-dim, Pytorch does not
+            for (elem, result) in zip(elems, even_elems)]
 
         return list(safe_map(partial(_interleave, axis=axis), even_elems, odd_elems))
 
@@ -117,16 +120,15 @@ def _interleave(a, b, axis):
     # https://stackoverflow.com/questions/60869537/how-can-i-interleave-5-pytorch-tensors
     if b_trunc := (a.shape[axis] == b.shape[axis] + 1):
         pad = [0, 0] * b.ndim
-        pad[(b.ndim-axis-1)*2+1] = 1 # +1=always end of dim, pad-order is reversed so start is at end
+        pad[(b.ndim - axis - 1) * 2 + 1] = 1  # +1=always end of dim, pad-order is reversed so start is at end
         b = torch.nn.functional.pad(b, pad)
 
-    stacked = torch.stack([a, b], dim=axis+1)
-    interleaved = torch.flatten(stacked, start_dim=axis, end_dim=axis+1)
+    stacked = torch.stack([a, b], dim=axis + 1)
+    interleaved = torch.flatten(stacked, start_dim=axis, end_dim=axis + 1)
     if b_trunc:
         # TODO: find torch alternative for slice_along axis for torch.jit.script to work
-        interleaved = interleaved[slice_along_axis(0, b.shape[axis]+a.shape[axis]-1, axis=axis)]
+        interleaved = interleaved[slice_along_axis(0, b.shape[axis] + a.shape[axis] - 1, axis=axis)]
     return interleaved
-
 
 
 # Taken from https://github.com/i404788/s5-pytorch/blob/74e2fdae00b915a62c914bf3615c0b8a4279eb84/s5/s5_model.py
@@ -142,6 +144,5 @@ def binary_operator_diag(q_i: Tuple[torch.Tensor, torch.Tensor], q_j: Tuple[torc
     A_i, b_i = q_i
     A_j, b_j = q_j
 
-    
     # return A_j * A_i, A_j * b_i + b_j
     return A_j * A_i, torch.addcmul(b_j, A_j, b_i)
