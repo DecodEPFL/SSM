@@ -20,14 +20,16 @@ class DWNConfig:
     rmax: float = 1.0 # max. magnitude of the eigenvalues at initialization in the complex parametrization
     max_phase: float = 2 * math.pi # maximum phase of the eigenvalues at initialization in the complex parametrization
     ff: str = "MLP" # non-linear block used in the scaffolding
-    scale: float = 1 # Lipschitz constant of the l. bounded MLP (LMLP)
+    scale: float = 1 # Lipschitz constant of the Lipschitz bounded MLP (LMLP)
     dim_amp: int = 4 # controls the hidden layer's dimension of the MLP
     gamma: bool = True # set this to true if you want to use the l2 gain parametrization for the SSM. If set to false,
     # the complex diagonal parametrization of the LRU will be used instead.
     gain: float = 8 # set the overall l2 gain in case you want to keep it fixed and not trainable
     trainable: bool = True # set this to true if you want a trainable l2 gain.
 
+
     """ Scaffolding Layers """
+
 
 class MLP(nn.Module):
     """ Standard Transformer MLP """
@@ -48,8 +50,8 @@ class MLP(nn.Module):
 
 
 class LMLP(nn.Module):
-    """ Implements an L-bounded MLP with sandwich layers. The square root
-    # of the L. bound is given by scale """
+    """ Implements a Lipschitz.-bounded MLP with sandwich layers. The square root
+    # of the Lipschitz bound is given by scale """
 
     def __init__(self, config: DWNConfig):
         super().__init__()
@@ -69,7 +71,7 @@ class LMLP(nn.Module):
 
 
 class GLU(nn.Module):
-    """ The static nonlinearity used in the S4 paper"""
+    """ The static non-linearity used in the S4 paper """
 
     def __init__(self, config: DWNConfig):
         super().__init__()
@@ -112,12 +114,12 @@ class DWNBlock(nn.Module):
                 self.ff = LMLP(config)
         self.dropout = nn.Dropout(config.dropout)
 
-    def forward(self, x, gamma=None, state=None, mode="scan"):
+    def forward(self, x, gamma=None, state=None, mode: str ="scan"):
 
         z = x
         #  z = self.ln(z)  # prenorm
 
-        z = self.lru(z, gamma, state)
+        z = self.lru(z, gamma, state, mode)
 
         z = self.ff(z)  # MLP, GLU or LMLP
         z = self.dropout(z)

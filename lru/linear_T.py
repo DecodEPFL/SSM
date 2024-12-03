@@ -134,7 +134,7 @@ class LRU(nn.Module):
         y = (inner_states @ C.T).real + input @ D.T
         return y
 
-    def forward(self, input, state=None, mode="scan"):
+    def forward(self, input, gamma=None, state=None, mode="scan"):
 
         if state is None:
             state = torch.view_as_complex(
@@ -246,7 +246,7 @@ class LRU_Robust(jit.ScriptModule):
         return A, B, C, Dn
 
     @jit.script_method
-    def forward(self, input, gamma = None, state=None):
+    def forward(self, input, gamma = None, state=None, mode: str="scan"):
         state = torch.zeros(self.state_features, device=self.C.device)
         # Input size: (B, L, H)
         A, B, C, D = self.set_param(gamma)
