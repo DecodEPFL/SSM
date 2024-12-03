@@ -9,7 +9,7 @@ from argparse import Namespace
 import torch
 from tqdm import tqdm
 
-seed = 1
+seed = 2
 torch.manual_seed(seed)
 
 from lru.Architectures_T import DWN, DWNConfig
@@ -49,13 +49,13 @@ cfg = {
     "n_y": 3,
     "d_model": 5,
     "d_state": 5,
-    "n_layers": 4,
+    "n_layers": 2,
     "ff": "LMLP",  # GLU | MLP | LMLP
     "max_phase": math.pi,
     "r_min": 0.7,
     "r_max": 0.98,
     "gamma": True,
-    "trainable": True,
+    "trainable": False,
     "gain": 2.4
 }
 cfg = Namespace(**cfg)
@@ -71,7 +71,7 @@ model = DWN(cfg.n_u, cfg.n_y, config)
 model.cuda()
 
 # Configure optimizer
-opt = torch.optim.AdamW(model.parameters(), lr=2e-2)
+opt = torch.optim.AdamW(model.parameters(), lr=2e-3)
 opt.zero_grad()
 
 
@@ -89,7 +89,7 @@ lowest_loss = float('inf')  # Initialize with a very large value
 best_model_path = "best_model.pth"
 LOSS = []
 # Train loop
-for itr in tqdm(range(800)):
+for itr in tqdm(range(2500)):
     yRNN = model(u, state=None, mode="scan")
     yRNN = torch.squeeze(yRNN)
     loss = MSE(yRNN, y)

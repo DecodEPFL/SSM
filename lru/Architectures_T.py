@@ -136,7 +136,7 @@ class DWN(nn.Module):
 
         self.config = config
 
-        self.encoder = nn.Linear(n_u, config.d_model)
+        self.encoder = nn.Linear(n_u, config.d_model, bias=False)
         self.decoder = nn.Linear(config.d_model, n_y, bias=False)
 
         if not config.trainable: # parameters needed for when the l2 gain is fixed and prescribed
