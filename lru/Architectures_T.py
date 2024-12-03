@@ -27,6 +27,8 @@ class DWNConfig:
     gain: float = 8 # set the overall l2 gain in case you want to keep it fixed and not trainable
     trainable: bool = True # set this to true if you want a trainable l2 gain.
 
+    # Parallel scan must be selected in the forward call. It will be disabled when gamma is set to True.
+
 
     """ Scaffolding Layers """
 
