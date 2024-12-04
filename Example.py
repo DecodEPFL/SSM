@@ -70,6 +70,8 @@ config = DWNConfig(d_model=cfg.d_model, d_state=cfg.d_state, n_layers=cfg.n_laye
 model = DWN(cfg.n_u, cfg.n_y, config)
 model.cuda()
 
+
+
 # Configure optimizer
 opt = torch.optim.AdamW(model.parameters(), lr=2e-3)
 opt.zero_grad()
@@ -82,7 +84,7 @@ print(f"Number of parameters: {total_params}")
 
 
 MSE = nn.MSELoss()
-
+#model = torch.compile(model)
 
 # Variables for tracking the lowest loss
 lowest_loss = float('inf')  # Initialize with a very large value
