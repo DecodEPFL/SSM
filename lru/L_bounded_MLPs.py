@@ -15,6 +15,7 @@ def cayley(W):
     iIpA = torch.inverse(I + A)
     return torch.cat((iIpA @ (I - A), -2 * V @ iIpA), axis=1)
 
+
 class FirstChannel(nn.Module):
     def __init__(self, cout, scale=1.0):
         super().__init__()
@@ -29,7 +30,6 @@ class FirstChannel(nn.Module):
             return self.scale * x[:, :self.cout]
         elif xdim == 3:
             return self.scale * x[:, :, :]
-
 
 
 class SandwichLin(nn.Linear):
@@ -76,9 +76,3 @@ class SandwichFc(nn.Linear):
         x = F.relu(x) * torch.exp(self.psi)  # \Psi z
         x = 2 ** 0.5 * F.linear(x, Q[:, :fout].T)  # sqrt(2) A^top \Psi z
         return x
-
-
-
-
-
-

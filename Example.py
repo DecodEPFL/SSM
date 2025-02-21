@@ -2,21 +2,22 @@ import numpy as np
 import matplotlib.pyplot as plt
 import scipy
 import os
-from os.path import  join as pjoin
+from os.path import join as pjoin
 from torch import nn
 import math
 from argparse import Namespace
 import torch
 from tqdm import tqdm
+from lru.architectures import DeepSSM, DWNConfig
 
 seed = 2
 torch.manual_seed(seed)
 
-from lru.architectures import DWN, DWNConfig
 
 
 dtype = torch.float
-device = torch.device("cuda")
+device = "cuda" if torch.cuda.is_available() else "cpu"
+torch.set_default_device(device)
 
 plt.close('all')
 # Import Data
@@ -32,16 +33,14 @@ t = np.arange(0, np.size(dExp[0, 0], 1) * Ts - Ts, Ts)
 
 t_end = t.size
 
-u = torch.zeros(nExp, t_end, 1, device = device)
-y = torch.zeros(nExp, t_end, 3, device = device)
+u = torch.zeros(nExp, t_end, 1, device=device)
+y = torch.zeros(nExp, t_end, 3, device=device)
 inputnumberD = 1
 
 for j in range(nExp):
     inputActive = (torch.from_numpy(dExp[0, j])).T
     u[j, :, :] = torch.unsqueeze(inputActive[:, inputnumberD], 1)
     y[j, :, :] = (torch.from_numpy(yExp[0, j])).T
-
-
 
 # set up a simple architecture
 cfg = {
@@ -55,33 +54,25 @@ cfg = {
     "r_min": 0.7,
     "r_max": 0.98,
     "gamma": True,
-    "trainable": False,
+    "trainable": True,
     "gain": 2.4
 }
 cfg = Namespace(**cfg)
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
-torch.set_default_device(device)
 #torch.set_num_threads(10)
 
 # Build model
 config = DWNConfig(d_model=cfg.d_model, d_state=cfg.d_state, n_layers=cfg.n_layers, ff=cfg.ff, rmin=cfg.r_min,
                    rmax=cfg.r_max, max_phase=cfg.max_phase, gamma=cfg.gamma, trainable=cfg.trainable, gain=cfg.gain)
-model = DWN(cfg.n_u, cfg.n_y, config)
-model.cuda()
-
-
+model = DeepSSM(cfg.n_u, cfg.n_y, config)
+#model.cuda()
 
 # Configure optimizer
 opt = torch.optim.AdamW(model.parameters(), lr=2e-3)
 opt.zero_grad()
 
-
-
-
 total_params = sum(p.numel() for p in model.parameters())
 print(f"Number of parameters: {total_params}")
-
 
 MSE = nn.MSELoss()
 #model = torch.compile(model)
@@ -92,7 +83,7 @@ best_model_path = "best_model.pth"
 LOSS = []
 # Train loop
 for itr in tqdm(range(2500)):
-    yRNN = model(u, state=None, mode="scan")
+    yRNN, _ = model(u, state=None, mode="scan")
     yRNN = torch.squeeze(yRNN)
     loss = MSE(yRNN, y)
     loss.backward()
@@ -114,13 +105,12 @@ checkpoint = {
 
 torch.save(checkpoint, "ckpt.pt")
 
-
 t_end = yExp_val[0, 0].shape[1]
 
 nExp = yExp_val.size
 
-uval = torch.zeros(nExp, t_end, 1,  device = device)
-yval = torch.zeros(nExp, t_end, 3,  device = device)
+uval = torch.zeros(nExp, t_end, 1, device=device)
+yval = torch.zeros(nExp, t_end, 3, device=device)
 
 #model.load_state_dict(torch.load(best_model_path))
 #model.eval()  # Set to evaluation mode
@@ -131,7 +121,7 @@ for j in range(nExp):
     uval[j, :, :] = torch.unsqueeze(inputActive[:, inputnumberD], 1)
     yval[j, :, :] = (torch.from_numpy(yExp_val[0, j])).T
 
-yRNN_val = model(uval)
+yRNN_val, _ = model(uval)
 yRNN_val = torch.squeeze(yRNN_val)
 yval = torch.squeeze(yval)
 
