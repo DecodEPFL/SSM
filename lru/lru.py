@@ -1,11 +1,9 @@
 import math
 import torch
 import torch.nn as nn
-#from cvxpylayers.torch import CvxpyLayer
-
 from .scan_utils import associative_scan, binary_operator_diag
 import torch.jit as jit
-from typing import Optional
+
 
 
 class LRU(nn.Module):
@@ -113,9 +111,9 @@ class LRU(nn.Module):
     @torch.compiler.disable
     def forward_scan(self, input, state=None):
 
-        # Only handles input of size (B, L, H)
-        # Batched parallel scan, borrows heavily from https://colab.research.google.com/drive/1RgIv_3WAOW53CS0BnT7_782VKTYis9WG?usp=sharing
-        # which in turn borrows from https://github.com/i404788/s5-pytorch
+        # Only handles input of size (B, L, H) Batched parallel scan, borrows heavily from
+        # https://colab.research.google.com/drive/1RgIv_3WAOW53CS0BnT7_782VKTYis9WG?usp=sharing which in turn borrows
+        # from https://github.com/i404788/s5-pytorch
         lambdas, B, C, D = self.ss_params()
 
         # lambdas is shape (N,) but needs to be repeated to shape (L, N),
@@ -165,11 +163,12 @@ class LRU_Robust(jit.ScriptModule):
         self.register_buffer('state', torch.zeros(state_features))
         self.register_buffer('ID', torch.eye(state_features))
 
-        self.alpha = nn.Parameter(torch.tensor(1.1))  # controls the initialization of the matrix A:
+        self.alpha = nn.Parameter(torch.tensor(4.1))  # controls the initialization of the matrix A:
         # the larger the alpha at initialization, the closer the eigenvalues of A will be
         # to the boundary of the unitary circle at initialization. This helps the SSM to obtain long memory properties.
 
-        self.gamma = nn.Parameter(11 * torch.tensor(1.1))  # l2 gain
+        self.gamma = nn.Parameter(30 * torch.tensor(1.1))  # l2 gain
+        self.epsilon = nn.Parameter(torch.tensor(-99.9))  # Regularization
 
         self.Skew = nn.Parameter(0.01 * torch.randn(state_features, state_features))
 
@@ -198,9 +197,9 @@ class LRU_Robust(jit.ScriptModule):
 
         Sk = self.Skew - self.Skew.T
         Q = (self.ID - Sk) @ torch.linalg.inv(self.ID + Sk)
-        Z = self.X21 @ self.X21.T + X22 @ X22.T + self.D.T @ self.D
+        Z = self.X21 @ self.X21.T + X22 @ X22.T + self.D.T @ self.D + torch.exp(self.epsilon) * self.ID
         beta = gamma ** 2 * torch.sigmoid(self.alpha) / torch.norm(Z, 2)
-        H11 = X11 @ X11.T + self.C.T @ self.C
+        H11 = X11 @ X11.T + self.C.T @ self.C + beta * torch.exp(self.epsilon) * self.ID
         H12 = torch.sqrt(beta) * (X11 @ self.X21.T + self.C.T @ self.D)
         V = Z * beta - gamma ** 2 * self.ID
         R = H12 @ torch.linalg.inv(V.T) @ H12.T

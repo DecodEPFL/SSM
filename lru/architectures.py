@@ -212,7 +212,7 @@ class DeepSSM(nn.Module):
         gamma_t = torch.abs(self.gamma_t) if gammaT is None else gammaT
         gammaLRU = [block.lru.gamma for layer, block in enumerate(self.blocks)]
         decoder = (gamma_t * self.decoder / (torch.norm(self.decoder, 2) * torch.norm(self.encoder, 2)) /
-                   (torch.prod(torch.abs(torch.tensor(gammaLRU)))) + 1)
+                   (torch.prod(torch.abs(torch.tensor(gammaLRU)))+1))
         x = u @ self.encoder.T
         for layer, block in enumerate(self.blocks):
             state_block = state[layer] if state is not None else None
