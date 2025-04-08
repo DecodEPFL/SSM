@@ -18,7 +18,7 @@ Moreover, the use of [parallel scan algorithms](https://en.wikipedia.org/wiki/Pr
 L2RU units are typically organized in a deep LRU architecture like:
 
 <div align="center">
-  <img src="architecture/Arch.pdf" alt="Description of image" width="800">
+  <img src="architecture/L2RU.png" alt="Description of image" width="800">
 </div>
 
 
