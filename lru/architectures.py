@@ -106,12 +106,11 @@ class DWNBlock(nn.Module):
         else:
             self.lru = LRU(config.d_model, config.d_model, config.d_state,
                            rmin=config.rmin, rmax=config.rmax, max_phase=config.max_phase)
-        match config.ff:
-            case "GLU":
+        if config.ff == "GLU":
                 self.ff = GLU(config)
-            case "MLP":
+        elif  config.ff == "MLP":
                 self.ff = MLP(config)
-            case "LMLP":
+        elif config.ff == "LMLP":
                 self.ff = LMLP(config)
         self.dropout = nn.Dropout(config.dropout)
 
