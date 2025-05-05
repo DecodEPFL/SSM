@@ -104,6 +104,8 @@ class LRU(nn.Module):
             states.append(state)
 
         states = torch.stack(states, 1)
+
+        states = states[:, -1, :].unsqueeze(1)
         output = (states @ C.mT).real + input @ D.T
 
         return output, states
@@ -131,6 +133,8 @@ class LRU(nn.Module):
         # inner_states will be of shape (B, L, N)
         inner_states = torch.vmap(inner_state_fn)(Bu_elements)
 
+        inner_states = torch.cat((state, inner_states), dim=1)[:,:-1,:]
+
         # y = (inner_states @ self.C.T).real + input_sequences * self.D
         y = (inner_states @ C.T).real + input @ D.T
         return y, inner_states
@@ -142,11 +146,10 @@ class LRU(nn.Module):
                 torch.zeros((self.state_features, 2), device=input.device)
             )  # default initial state, size N
 
-        match mode:
-            case "scan":
-                y, st = self.forward_scan(input, state)
-            case "loop":
-                y, st = self.forward_loop(input, state)
+        if mode == "scan":
+            y, st = self.forward_scan(input, state)
+        elif mode == "loop":
+            y, st = self.forward_loop(input, state)
         return y, st
 
 
