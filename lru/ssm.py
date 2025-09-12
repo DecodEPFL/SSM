@@ -497,26 +497,15 @@ class DeepSSM(nn.Module):
             # Create a list to store the output of each timestep
             processed_timesteps = []
 
-            # Single optimized loop over time
-            for t in range(seq_len):
-                x_t = x[:, t, :]  # Current timestep: (B, d_model)
 
-                # Optimized layer processing
-                for layer_idx, block in enumerate(self.blocks):
-                    # Reshape for SSL forward: (B, 1, d_model)
-                    x_t_expanded = x_t.unsqueeze(1)
 
-                    # Pass through the SSL block
-                    x_t_out, st = block(x_t_expanded, state=layer_states[layer_idx], mode="loop")
+        # Optimized layer processing
+            for layer_idx, block in enumerate(self.blocks):
+                # Pass through the SSL block
+                x, st = block(x, state=layer_states[layer_idx], mode="loop")
+                layer_states[layer_idx] = st
 
-                    # Squeeze back to (B, d_model) and update the state
-                    x_t = x_t_out.squeeze(1)
-                    layer_states[layer_idx] = st
 
-                processed_timesteps.append(x_t)
-
-            # Stack all timesteps and decode the entire sequence at once
-            processed_sequence = torch.stack(processed_timesteps, dim=1)
 
             if self.config.robust is True and self.config.gamma is not None:
                 """
@@ -530,12 +519,12 @@ class DeepSSM(nn.Module):
                 decoder_norm = torch.norm(self.decoder, 2)
                 gamma_prod = torch.prod(gammaLRU_tensor) + 1
                 decoder_scaled = (gamma_t * self.decoder) / (encoder_norm * decoder_norm * gamma_prod)
-                outputs = processed_sequence @ decoder_scaled.T
+                outputs = x @ decoder_scaled.T
             else:
                 if isinstance(self.decoder, nn.Linear):
-                    outputs = self.decoder(processed_sequence)
+                    outputs = self.decoder(x)
                 else:
-                    outputs = processed_sequence @ self.decoder.T
+                    outputs = x @ self.decoder.T
         else:
             """
                This is the case where we use parallel scan modes.
