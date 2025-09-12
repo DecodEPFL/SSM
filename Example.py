@@ -52,7 +52,7 @@ cfg = {
     "r_min": 0.7,
     "r_max": 0.98,
     "robust": False,
-    "gamma": None
+    "gamma": 2.4
 }
 cfg = Namespace(**cfg)
 
@@ -80,7 +80,7 @@ best_model_path = "best_model.pth"
 LOSS = []
 # Train loop
 for itr in tqdm(range(1500)):
-    yRNN, _ = model(u, state=None, mode="loop")
+    yRNN, _ = model(u, state=None, mode="scan")
     yRNN = torch.squeeze(yRNN)
     loss = MSE(yRNN, y)
     loss.backward()
