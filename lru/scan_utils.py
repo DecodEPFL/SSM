@@ -1,7 +1,7 @@
 # Pytorch port of associative scan
 
-# @title PyTorch associative/parallel scan Taken from
-# https://github.com/i404788/s5-pytorch/blob/74e2fdae00b915a62c914bf3615c0b8a4279eb84/s5/jax_compat.py#L50-L134
+# @title PyTorch associative/parallel scan
+# Taken from https://github.com/i404788/s5-pytorch/blob/74e2fdae00b915a62c914bf3615c0b8a4279eb84/s5/jax_compat.py#L50-L134
 import torch
 from jax.tree_util import tree_flatten, tree_unflatten
 from typing import overload, Callable, Iterable, List, TypeVar, Any, Literal, Union, Sequence, Tuple, Optional

@@ -8,7 +8,7 @@ import math
 from argparse import Namespace
 import torch
 from tqdm import tqdm
-from lru.architectures import DeepSSM, DWNConfig
+from lru.ssm import DeepSSM, SSMConfig
 
 seed = 9
 torch.manual_seed(seed)
@@ -45,23 +45,22 @@ cfg = {
     "n_u": 1,
     "n_y": 3,
     "d_model": 5,
-    "d_state": 5,
+    "d_state": 6,
     "n_layers": 1,
     "ff": "LMLP",  # GLU | MLP | LMLP
     "max_phase": math.pi / 50,
     "r_min": 0.7,
     "r_max": 0.98,
-    "gamma": True,
-    "trainable": False,
-    "gain": 2.4
+    "robust": False,
+    "gamma": None
 }
 cfg = Namespace(**cfg)
 
 #torch.set_num_threads(10)
 
 # Build model
-config = DWNConfig(d_model=cfg.d_model, d_state=cfg.d_state, n_layers=cfg.n_layers, ff=cfg.ff, rmin=cfg.r_min,
-                   rmax=cfg.r_max, max_phase=cfg.max_phase, gamma=cfg.gamma, trainable=cfg.trainable, gain=cfg.gain)
+config = SSMConfig(d_model=cfg.d_model, d_state=cfg.d_state, n_layers=cfg.n_layers, ff=cfg.ff, rmin=cfg.r_min,
+                   rmax=cfg.r_max, max_phase=cfg.max_phase, robust=cfg.robust, gamma=cfg.gamma)
 model = DeepSSM(cfg.n_u, cfg.n_y, config)
 #model.cuda()
 
@@ -81,7 +80,7 @@ best_model_path = "best_model.pth"
 LOSS = []
 # Train loop
 for itr in tqdm(range(1500)):
-    yRNN, _ = model(u, state=None, mode="scan")
+    yRNN, _ = model(u, state=None, mode="loop")
     yRNN = torch.squeeze(yRNN)
     loss = MSE(yRNN, y)
     loss.backward()

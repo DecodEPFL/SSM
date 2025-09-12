@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="AgentMigrationStateService">
+    <option name="pendingSessionIds">
+      <option value="102e7421-efcf-4e29-b82a-6e067b8ff36c" />
+    </option>
+    <option name="pendingTurns">
+      <map>
+        <entry key="102e7421-efcf-4e29-b82a-6e067b8ff36c">
+          <value>
+            <set>
+              <option value="fbfae78f-83a0-4afd-91b3-972feb9596d4" />
+              <option value="a5e6ee10-a746-46a0-98b0-4a1bdd5509f3" />
+              <option value="29c23723-b8ba-4bad-985f-c9fe8fa04e72" />
+              <option value="fc762d9b-295c-4c74-b9d6-1bb710da965e" />
+              <option value="28889c56-4a3d-4c64-9805-6dcbd0e4e50b" />
+              <option value="7947d4f3-d63e-44a7-8171-f065791edec0" />
+              <option value="5ef53e54-980d-4fe0-8844-be03af04bbbd" />
+              <option value="0e3e959c-71ce-4648-986f-a8ceadfe60e6" />
+              <option value="b96be096-8ee6-4e45-b6d3-fffe95c383b2" />
+              <option value="18938c4b-4d3c-47e9-b09e-723612530210" />
+              <option value="cc063dc9-006d-4197-b8ed-b2b75eda8215" />
+              <option value="f8b62d99-4c7c-4088-adb4-f8fed66e0628" />
+              <option value="52b165e4-2f04-4a71-8934-671fcfad7454" />
+              <option value="a0f0884a-88a2-4402-bec2-fb458bbb16a2" />
+              <option value="0d78ac65-c3d4-4653-972f-f2760a033562" />
+            </set>
+          </value>
+        </entry>
+      </map>
+    </option>
+    <pendingWorkingSetItems>
+      <entry key="102e7421-efcf-4e29-b82a-6e067b8ff36c">
+        <set>
+          <option value="file://$PROJECT_DIR$/lru/ssm.py" />
+        </set>
+      </entry>
+    </pendingWorkingSetItems>
+  </component>
+</project>
