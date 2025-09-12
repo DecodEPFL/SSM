@@ -146,3 +146,90 @@ def binary_operator_diag(q_i: Tuple[torch.Tensor, torch.Tensor], q_j: Tuple[torc
 
     # return A_j * A_i, A_j * b_i + b_j
     return A_j * A_i, torch.addcmul(b_j, A_j, b_i)
+
+
+
+# Parallel scan for non diagonal matrices
+
+
+import math
+import torch
+
+def batched_parallel_scan_affine_memopt(A, B, U, x0):
+    """
+    Memory-optimized batched parallel scan for
+        x_{k+1} = A x_k + B u_k
+
+    Square system: A (N,N), B (N,N), U (B,T,N), x0 (B,N)
+
+    Returns:
+        X: (B, T+1, N) with X[:,0,:] = x0, X[:,t+1,:] = x_{t+1}
+    """
+    assert U.dim() == 3
+    BATCH, T, N = U.shape
+    device = U.device
+    dtype = U.dtype
+
+    A = A.to(device=device, dtype=dtype)
+    B = B.to(device=device, dtype=dtype)
+    x0 = x0.to(device=device, dtype=dtype)
+
+    if T == 0:
+        return x0.unsqueeze(1)  # (B,1,N)
+
+    # Precompute Bu = B @ u_k  -> shape (B, T, N)
+    Bu = torch.matmul(U, B.transpose(-1, -2))  # (B, T, N)
+
+    # Precompute powers of A: A_pows[k] = A^{2^k}, for k=0..L-1
+    L = math.ceil(math.log2(T))
+    A_pows = [None] * L
+    A_pows[0] = A
+    for k in range(1, L):
+        A_pows[k] = torch.matmul(A_pows[k-1], A_pows[k-1])
+
+    # --- Compute combined "b" terms in-place with doubling (memory-opt)
+    # b[t] will become sum_{j=0..t} A^{t-j} Bu_j
+    b = Bu.clone()  # (B, T, N)
+
+    step = 1
+    for k in range(L):
+        if step >= T:
+            break
+        prev = b.clone()  # use previous values on left/right
+        left = prev[:, :T-step, :]        # (B, T-step, N)
+        right = prev[:, step:, :]         # (B, T-step, N)
+
+        # A_pows[k] @ left_vec  -> use left @ A_pows[k].T to get (B, T-step, N)
+        left_transformed = torch.matmul(left, A_pows[k].transpose(-1, -2))
+        combined = left_transformed + right
+        b[:, step:, :] = combined
+        step <<= 1
+
+    # --- Compute A^{t+1} x0 for all t efficiently (memory-opt)
+    # initialize v[t] = A @ x0 for all t
+    Ax0 = torch.matmul(x0, A.transpose(-1, -2))        # (B, N)
+    v = Ax0.unsqueeze(1).expand(-1, T, -1).clone()      # (B, T, N)
+
+    step = 1
+    for k in range(L):
+        if step >= T:
+            break
+        prev = v.clone()
+        left = prev[:, :T-step, :]  # (B, T-step, N)
+        # right_A @ left  => left @ A_pows[k].T
+        left_transformed = torch.matmul(left, A_pows[k].transpose(-1, -2))
+        v[:, step:, :] = left_transformed
+        step <<= 1
+
+    # Now:
+    #   v[:, t] == A^{t+1} x0
+    #   b[:, t] == sum_{j=0..t} A^{t-j} B u_j
+    X = torch.empty((BATCH, T+1, N), device=device, dtype=dtype)
+    X[:, 0, :] = x0
+    X[:, 1:, :] = v + b
+
+    return X
+
+
+
+

@@ -3,7 +3,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from collections import OrderedDict
-from lru.scan_utils import associative_scan, binary_operator_diag
+from lru.scan_utils import associative_scan, binary_operator_diag, batched_parallel_scan_affine_memopt
 import torch.jit as jit
 from lru.L_bounded_MLPs import FirstChannel, SandwichFc, SandwichLin
 from typing import Optional
@@ -306,8 +306,10 @@ class LRU_Robust(jit.ScriptModule):
         output = states @ C.mT + input @ D.T
         return output, states
 
+
+
     def reset(self):
-        self.state = torch.zeros(self.state_features, dtype=torch.complex64)  # reset the LRU state to the initial value
+        self.state = torch.zeros(self.state_features)  # reset the LRU state to the initial value
 
 """ SSM models ----------------------------------------- """
 
