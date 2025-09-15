@@ -3,9 +3,9 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from collections import OrderedDict
-from lru.scan_utils import associative_scan, binary_operator_diag, compute_linear_recurrence_parallel
+from SSM.scan_utils import associative_scan, binary_operator_diag, compute_linear_recurrence_parallel
 import torch.jit as jit
-from lru.L_bounded_MLPs import FirstChannel, SandwichFc, SandwichLin
+from SSM.L_bounded_MLPs import FirstChannel, SandwichFc, SandwichLin
 
 
 
@@ -316,9 +316,9 @@ class LRU_Robust(jit.ScriptModule):
 """ Data class to set up the SSM model (values here are used just to initialize all fields) """
 @dataclass
 class SSMConfig:
-    d_model: int = 10  # input/output size of the LRU (n_u = n_y)
-    d_state: int = 64  # state size of the LRU (n_x)
-    n_layers: int = 6  # number of SSMs blocks in cascade for deep structures
+    d_model: int = 10  # input/output size of the LRU after the decoding phase (n_u = n_y)
+    d_state: int = 32  # state size of the LRU (n_x)
+    n_layers: int = 2  # number of SSMs blocks in cascade for deep structures
     dropout: float = 0.0  # set it different from 0 if you want to introduce dropout regularization
     bias: bool = False  # bias of MLP layers
     rmin: float = 0.0  # min. magnitude of the eigenvalues at initialization in the complex parametrization
@@ -359,7 +359,7 @@ class MLP(nn.Module):
 
 class LMLP(nn.Module):
     """ Implements a Lipschitz.-bounded MLP with sandwich layers. The square root
-    # of the Lipschitz bound is given by the scale parameter """
+    # of the Lipschitz bound is given by the scale parameter, by default, set to 1. """
 
     def __init__(self, config: SSMConfig):
         super().__init__()
