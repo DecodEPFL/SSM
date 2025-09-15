@@ -152,84 +152,115 @@ def binary_operator_diag(q_i: Tuple[torch.Tensor, torch.Tensor], q_j: Tuple[torc
 # Parallel scan for non diagonal matrices
 
 
-import math
-import torch
-
-def batched_parallel_scan_affine_memopt(A, B, U, x0):
+# -------------------------
+# Parallel prefix (safe)
+# -------------------------
+def parallel_scan_affine(M: torch.Tensor, v: torch.Tensor):
     """
-    Memory-optimized batched parallel scan for
-        x_{k+1} = A x_k + B u_k
+    Inclusive parallel prefix for affine pairs (M, v) with column-vector convention.
 
-    Square system: A (N,N), B (N,N), U (B,T,N), x0 (B,N)
+    Args:
+        M: (seq_len, batch, D, D)
+        v: (seq_len, batch, D)
 
     Returns:
-        X: (B, T+1, N) with X[:,0,:] = x0, X[:,t+1,:] = x_{t+1}
+        M_p: (seq_len, batch, D, D)  where M_p[t] = M[t] @ M[t-1] @ ... @ M[0]
+        v_p: (seq_len, batch, D)    where v_p[t] = M[t] @ M[t-1] @ ... @ M[1] @ v[0] + ... + v[t]
     """
-    assert U.dim() == 3
-    BATCH, T, N = U.shape
-    device = U.device
-    dtype = U.dtype
+    n = M.shape[0]
+    if n == 0:
+        return M, v
 
-    A = A.to(device=device, dtype=dtype)
-    B = B.to(device=device, dtype=dtype)
-    x0 = x0.to(device=device, dtype=dtype)
+    # Work on copies so we don't mutate inputs
+    M_p = M.clone()
+    v_p = v.clone()
 
-    if T == 0:
-        return x0.unsqueeze(1)  # (B,1,N)
+    offset = 1
+    # Doubling rounds
+    while offset < n:
+        # slice left = M_p[offset:]  (length n-offset)
+        # slice right = M_p[:n-offset] (length n-offset)
+        left = M_p[offset:].clone()   # shape (n-offset, batch, D, D)
+        right = M_p[: n - offset].clone()
+        # new_M[i] for i >= offset equals left[i-offset] @ right[i-offset]
+        new_M_tail = torch.matmul(left, right)  # (n-offset, batch, D, D)
 
-    # Precompute Bu = B @ u_k  -> shape (B, T, N)
-    Bu = torch.matmul(U, B.transpose(-1, -2))  # (B, T, N)
+        # For v: new_v[i] = left[i-offset] @ v_p[i-offset] + v_p[i]
+        right_v = v_p[: n - offset].unsqueeze(-1).clone()   # (n-offset, batch, D, 1)
+        transformed = torch.matmul(left, right_v).squeeze(-1)   # (n-offset, batch, D)
+        new_v_tail = transformed + v_p[offset:].clone()        # (n-offset, batch, D)
 
-    # Precompute powers of A: A_pows[k] = A^{2^k}, for k=0..L-1
-    L = math.ceil(math.log2(T))
-    A_pows = [None] * L
-    A_pows[0] = A
-    for k in range(1, L):
-        A_pows[k] = torch.matmul(A_pows[k-1], A_pows[k-1])
+        # Reconstruct full arrays without in-place overlapping writes
+        if offset == 0:
+            M_p = new_M_tail
+            v_p = new_v_tail
+        else:
+            M_p = torch.cat([M_p[:offset], new_M_tail], dim=0)
+            v_p = torch.cat([v_p[:offset], new_v_tail], dim=0)
 
-    # --- Compute combined "b" terms in-place with doubling (memory-opt)
-    # b[t] will become sum_{j=0..t} A^{t-j} Bu_j
-    b = Bu.clone()  # (B, T, N)
+        offset <<= 1
 
-    step = 1
-    for k in range(L):
-        if step >= T:
-            break
-        prev = b.clone()  # use previous values on left/right
-        left = prev[:, :T-step, :]        # (B, T-step, N)
-        right = prev[:, step:, :]         # (B, T-step, N)
-
-        # A_pows[k] @ left_vec  -> use left @ A_pows[k].T to get (B, T-step, N)
-        left_transformed = torch.matmul(left, A_pows[k].transpose(-1, -2))
-        combined = left_transformed + right
-        b[:, step:, :] = combined
-        step <<= 1
-
-    # --- Compute A^{t+1} x0 for all t efficiently (memory-opt)
-    # initialize v[t] = A @ x0 for all t
-    Ax0 = torch.matmul(x0, A.transpose(-1, -2))        # (B, N)
-    v = Ax0.unsqueeze(1).expand(-1, T, -1).clone()      # (B, T, N)
-
-    step = 1
-    for k in range(L):
-        if step >= T:
-            break
-        prev = v.clone()
-        left = prev[:, :T-step, :]  # (B, T-step, N)
-        # right_A @ left  => left @ A_pows[k].T
-        left_transformed = torch.matmul(left, A_pows[k].transpose(-1, -2))
-        v[:, step:, :] = left_transformed
-        step <<= 1
-
-    # Now:
-    #   v[:, t] == A^{t+1} x0
-    #   b[:, t] == sum_{j=0..t} A^{t-j} B u_j
-    X = torch.empty((BATCH, T+1, N), device=device, dtype=dtype)
-    X[:, 0, :] = x0
-    X[:, 1:, :] = v + b
-
-    return X
+    return M_p, v_p
 
 
+# -------------------------
+# High-level wrapper
+# -------------------------
+def compute_linear_recurrence_parallel(A, B, u, x0):
+    """
+    Compute x_t for t=1..T where x_{t} = A_t @ x_{t-1} + B_t @ u_{t-1}
+
+    Conventions (column-vector):
+      - A: (seq_len, D, D) or (D, D)
+      - B: (seq_len, D, D) or (D, D)
+      - u: (seq_len, batch, D)   (u_0 .. u_{T-1})
+      - x0: (batch, D)
+
+    Returns:
+      x: (seq_len, batch, D)  -> x[0] = x_1, ... x[T-1] = x_T
+    """
+    seq_len = u.shape[0]
+    batch_size = u.shape[1]
+    D = u.shape[2]
+
+    # ensure A,B have time dimension
+    if A.dim() == 2:
+        A = A.unsqueeze(0).expand(seq_len, -1, -1).contiguous()
+    if B.dim() == 2:
+        B = B.unsqueeze(0).expand(seq_len, -1, -1).contiguous()
+
+    # shape (seq_len, batch, D, D)
+    M = A.unsqueeze(1).expand(-1, batch_size, -1, -1).contiguous()
+    B_exp = B.unsqueeze(1).expand(-1, batch_size, -1, -1).contiguous()
+
+    # v_t = B_t @ u_t  (u is (seq_len, batch, D) -> unsqueeze -> (seq_len, batch, D, 1))
+    v = torch.matmul(B_exp, u.unsqueeze(-1)).squeeze(-1)  # (seq_len, batch, D)
+
+    # compute prefix
+    M_p, v_p = parallel_scan_affine(M, v)  # M_p: (seq_len, batch, D, D), v_p: (seq_len, batch, D)
+
+    # compute x_t = M_p[t] @ x0 + v_p[t]
+    # x0.unsqueeze(-1) is (batch, D, 1) -- will broadcast across seq_len
+    x = torch.matmul(M_p, x0.unsqueeze(-1)).squeeze(-1) + v_p  # (seq_len, batch, D)
+    return x
 
 
+# -------------------------
+# Sequential reference
+# -------------------------
+def compute_linear_recurrence_sequential(A, B, u, x0):
+    seq_len = u.shape[0]
+    batch_size, D = x0.shape
+    device = x0.device
+    x = torch.zeros(seq_len, batch_size, D, device=device, dtype=x0.dtype)
+    current_x = x0.clone()
+    A_time = (A.dim() == 3)
+    B_time = (B.dim() == 3)
+
+    for t in range(seq_len):
+        A_t = A[t] if A_time else A
+        B_t = B[t] if B_time else B
+        input_term = torch.matmul(B_t, u[t].unsqueeze(-1)).squeeze(-1)
+        current_x = torch.matmul(A_t, current_x.unsqueeze(-1)).squeeze(-1) + input_term
+        x[t] = current_x
+    return x
