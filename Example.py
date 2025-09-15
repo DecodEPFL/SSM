@@ -8,7 +8,7 @@ import math
 from argparse import Namespace
 import torch
 from tqdm import tqdm
-from lru.ssm import DeepSSM, SSMConfig
+from SSM.ssm import DeepSSM, SSMConfig
 
 seed = 9
 torch.manual_seed(seed)
