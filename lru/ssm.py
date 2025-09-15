@@ -412,7 +412,7 @@ class SSL(nn.Module):
         super().__init__()
         self.ln = nn.LayerNorm(config.d_model, bias=config.bias)
 
-        # More efficient LRU initialization
+        # LRU initialization
         if config.robust:
             self.lru = LRU_Robust(config.d_model)
         else:
@@ -486,23 +486,25 @@ class DeepSSM(nn.Module):
         # Pre-allocate outputs for better memory efficiency
         outputs = torch.empty(batch_size, seq_len, output_dim, device=u.device, dtype=u.dtype)
 
-        # Process encoder once for the entire sequence
+        # Process encoder once for the entire input sequence
         if isinstance(self.encoder, nn.Linear):
             x = self.encoder(u)  # (B, L, d_model)
         else:
             x = u @ self.encoder.T
 
-    # Optimized layer processing
+        # Layer processing (Deep LRU cascade)
         for layer_idx, block in enumerate(self.blocks):
             # Pass through the SSL block
             x, st = block(x, state=layer_states[layer_idx], mode=mode)
             layer_states[layer_idx] = st
 
-
+        # Final decoding step: handle fixed gamma case if needed (decoder rescaling)
 
         if self.config.robust is True and self.config.gamma is not None:
             """
-            This is the case where we use a fixed gamma for LRU_Robust.
+            This is the case where we use a fixed gamma for LRU_Robust: need to rescale the decoder
+            according to the product of the individual LRU gammas to ensure the overall gain is gamma_t.
+            Note that this is only valid when using LRU_Robust blocks, otherwise the gamma values are not defined.
             """
             # Handle the fixed gamma case for LRU_Robust
             gamma_t = torch.abs(self.gamma_t) if gamma is None else gamma
@@ -524,19 +526,7 @@ class DeepSSM(nn.Module):
 
 
     def reset(self):
-        # Reset initial states of LTI systems
+        # Reset initial states of LTI systems in the LRU blocks
         for block in self.blocks:
             block.lru.reset()
 
-    # setters and getters
-    def get_parameter_shapes(self):
-        param_dict = OrderedDict(
-            (name, getattr(self, name).shape) for name in self.training_param_names
-        )
-        return param_dict
-
-    def get_named_parameters(self):
-        param_dict = OrderedDict(
-            (name, getattr(self, name)) for name in self.training_param_names
-        )
-        return param_dict
