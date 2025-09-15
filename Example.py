@@ -80,7 +80,7 @@ best_model_path = "best_model.pth"
 LOSS = []
 # Train loop
 for itr in tqdm(range(1500)):
-    yRNN, _ = model(u, mode="scan")
+    yRNN, _ = model(u, mode="loop")
     yRNN = torch.squeeze(yRNN)
     loss = MSE(yRNN, y)
     loss.backward()

@@ -6,7 +6,7 @@ from collections import OrderedDict
 from lru.scan_utils import associative_scan, binary_operator_diag, compute_linear_recurrence_parallel
 import torch.jit as jit
 from lru.L_bounded_MLPs import FirstChannel, SandwichFc, SandwichLin
-from typing import Optional
+
 
 
 """ Linear Recurrent Units ----------------------------------------- """
@@ -327,7 +327,7 @@ class SSMConfig:
     ff: str = "MLP"  # non-linear block used in the scaffolding
     scale: float = 1  # Lipschitz constant of the Lipschitz bounded MLP (LMLP)
     dim_amp: int = 4  # controls the hidden layer's dimension of the MLP
-    robust: bool = True  # set this to true if you want to use the l2 gain parametrization for the SSM. If set to false,
+    robust: bool = True  # set this to true if you want to use the L2RU parametrization for the SSM. If set to false,
     # the complex diagonal parametrization of the LRU will be used instead.
     gamma: float = None  # set the overall l2 gain value in case you want to keep it fixed and not trainable, if set to
     # None, the gain will be trainable.
