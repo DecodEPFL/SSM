@@ -148,9 +148,7 @@ def binary_operator_diag(q_i: Tuple[torch.Tensor, torch.Tensor], q_j: Tuple[torc
     return A_j * A_i, torch.addcmul(b_j, A_j, b_i)
 
 
-
 # Parallel scan for non diagonal matrices
-
 
 # -------------------------
 # Parallel prefix (safe)
