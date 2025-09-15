@@ -52,7 +52,7 @@ cfg = {
     "r_min": 0.7,
     "r_max": 0.98,
     "robust": True,
-    "gamma": 2.4
+    "gamma": 1
 }
 cfg = Namespace(**cfg)
 
@@ -80,7 +80,7 @@ best_model_path = "best_model.pth"
 LOSS = []
 # Train loop
 for itr in tqdm(range(1500)):
-    yRNN, _ = model(u, mode="loop")
+    yRNN, _ = model(u, mode="scan")
     yRNN = torch.squeeze(yRNN)
     loss = MSE(yRNN, y)
     loss.backward()
@@ -194,3 +194,5 @@ plt.tight_layout(rect=[0, 0, 1, 0.95])  # Leave space for the legend
 # Save as PDF for LaTeX
 plt.savefig('comparison_figure.pdf', format='pdf', bbox_inches='tight')
 plt.show()
+
+plt

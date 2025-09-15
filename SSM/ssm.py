@@ -206,8 +206,7 @@ class LRU(nn.Module):
     def reset(self):
         self.state = None  # reset the SSM state to the initial value
 
-
-# WORK IN PROGRESS
+    """ L2RU parametrization: Implements a Linear Recurrent Unit (LRU) with trainable or prescribed l2 gain gamma. """
 
 class LRU_Robust(jit.ScriptModule):
     """ Implements a Linear Recurrent Unit (LRU) with trainable or prescribed l2 gain gamma. """
@@ -311,6 +310,8 @@ class LRU_Robust(jit.ScriptModule):
         if device is None:
             device = torch.device('cpu')
         self.state = torch.zeros(batch_size, self.state_features, device=device)
+
+
 """ SSM models ----------------------------------------- """
 
 """ Data class to set up the SSM model (values here are used just to initialize all fields) """
@@ -332,8 +333,7 @@ class SSMConfig:
     gamma: float = None  # set the overall l2 gain value in case you want to keep it fixed and not trainable, if set to
     # None, the gain will be trainable.
 
-
-    # Parallel scan must be selected in the forward call. It will be disabled when gamma is set to True.
+ # Parallel scan must be selected in the forward call of the SSM.
 
     """ Scaffolding Layers """
 
