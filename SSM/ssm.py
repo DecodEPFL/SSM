@@ -219,17 +219,22 @@ class LRU_Robust(jit.ScriptModule):
         else: # in this case the l2 gain is learnable (default)
             self.gamma = nn.Parameter(torch.tensor(22.2))
         # initialize the internal state (will be resized per-batch at first forward)
-        self.state = torch.zeros(self.state_features)
+        self.state = torch.zeros(state_features)
         self.register_buffer('ID', torch.eye(state_features))
         self.alpha = nn.Parameter(torch.tensor(4.1))  # controls the initialization of the matrix A:
         self.epsilon = nn.Parameter(torch.tensor(-99.9))  # Regularization
         self.Skew = nn.Parameter(0.01 * torch.randn(state_features, state_features))
-        # Define each block of X as a parameter
+        # Trainable parameters
         self.X11 = nn.Parameter(.01*torch.eye(state_features))
         self.X22 = nn.Parameter(0.01 * torch.eye(state_features))
         self.X21 = nn.Parameter(.01*torch.eye(state_features))
         self.C = nn.Parameter(torch.eye(state_features))
-        self.D = nn.Parameter(torch.eye(state_features))
+        self.Dt = nn.Parameter(torch.eye(state_features))
+
+        # Initialize remaining LTI matrices
+        self.A = torch.zeros(state_features)
+        self.B = torch.zeros(state_features)
+        self.D = torch.zeros(state_features)
 
     #@jit.script_method
     def set_param(self):
@@ -240,10 +245,10 @@ class LRU_Robust(jit.ScriptModule):
         X22 = self.X22
         Sk = self.Skew - self.Skew.T
         Q = (self.ID - Sk) @ torch.linalg.inv(self.ID + Sk)
-        Z = self.X21 @ self.X21.T + X22 @ X22.T + self.D.T @ self.D + torch.exp(self.epsilon) * self.ID
+        Z = self.X21 @ self.X21.T + X22 @ X22.T + self.Dt.T @ self.Dt + torch.exp(self.epsilon) * self.ID
         beta = gamma ** 2 * torch.sigmoid(self.alpha) / torch.linalg.matrix_norm(Z, 2)
         H11 = X11 @ X11.T + self.C.T @ self.C + beta * torch.exp(self.epsilon) * self.ID
-        H12 = torch.sqrt(beta) * (X11 @ self.X21.T + self.C.T @ self.D)
+        H12 = torch.sqrt(beta) * (X11 @ self.X21.T + self.C.T @ self.Dt)
         V = Z * beta - gamma ** 2 * self.ID
         R = H12 @ torch.linalg.inv(V.T) @ H12.T
         CR = torch.linalg.cholesky(-R)
@@ -253,7 +258,11 @@ class LRU_Robust(jit.ScriptModule):
         A = torch.linalg.inv(CRH).T @ Q @ CR.T
         B = A @ torch.linalg.inv(H12.T) @ V.T
         C = self.C
-        D = torch.sqrt(beta) * self.D
+        D = torch.sqrt(beta) * self.Dt
+
+        self.A = A
+        self.B = B
+        self.D = D
 
         return A, B, C, D
 
