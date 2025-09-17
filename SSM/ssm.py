@@ -9,6 +9,7 @@ from SSM.L_bounded_MLPs import FirstChannel, SandwichFc, SandwichLin
 
 
 
+
 """ Linear Recurrent Units ----------------------------------------- """
 
 class LRU(nn.Module):
@@ -210,10 +211,13 @@ class LRU(nn.Module):
 
 class LRU_Robust(jit.ScriptModule):
     """ Implements a Linear Recurrent Unit (LRU) with trainable or prescribed l2 gain gamma. """
-    def __init__(self, state_features: int):
+    def __init__(self, state_features: int, gamma: float = None):
         super().__init__()
         self.state_features = state_features
-        self.gamma = nn.Parameter(torch.tensor(22.2))
+        if gamma is not None: # in this case the l2 gain of the system is fixed
+            self.gamma = gamma
+        else: # in this case the l2 gain is learnable (default)
+            self.gamma = nn.Parameter(torch.tensor(22.2))
         # initialize the internal state (will be resized per-batch at first forward)
         self.state = torch.zeros(self.state_features)
         self.register_buffer('ID', torch.eye(state_features))
@@ -221,13 +225,13 @@ class LRU_Robust(jit.ScriptModule):
         self.epsilon = nn.Parameter(torch.tensor(-99.9))  # Regularization
         self.Skew = nn.Parameter(0.01 * torch.randn(state_features, state_features))
         # Define each block of X as a parameter
-        self.X11 = nn.Parameter(torch.eye(state_features))
+        self.X11 = nn.Parameter(.01*torch.eye(state_features))
         self.X22 = nn.Parameter(0.01 * torch.eye(state_features))
-        self.X21 = nn.Parameter(torch.eye(state_features))
+        self.X21 = nn.Parameter(.01*torch.eye(state_features))
         self.C = nn.Parameter(torch.eye(state_features))
         self.D = nn.Parameter(torch.eye(state_features))
 
-    @jit.script_method
+    #@jit.script_method
     def set_param(self):
         # Parameter update for l2 gain (free param)
         gamma = self.gamma
@@ -244,11 +248,13 @@ class LRU_Robust(jit.ScriptModule):
         R = H12 @ torch.linalg.inv(V.T) @ H12.T
         CR = torch.linalg.cholesky(-R)
         CRH = torch.linalg.cholesky(-R + H11)
+
         # LTI system matrices
         A = torch.linalg.inv(CRH).T @ Q @ CR.T
         B = A @ torch.linalg.inv(H12.T) @ V.T
         C = self.C
         D = torch.sqrt(beta) * self.D
+
         return A, B, C, D
 
     def forward(self, input: torch.Tensor, state=None, mode: str = "loop") -> tuple[torch.Tensor, torch.Tensor]:
@@ -530,3 +536,16 @@ class DeepSSM(nn.Module):
         for block in self.blocks:
             block.lru.reset()
 
+
+
+class PureLRUR(nn.Module):
+    """ Just LRUR """
+
+    def __init__(self, n: int, gamma: float = None ):
+        super().__init__()
+        self.lru = LRU_Robust(n, gamma)
+
+    def forward(self, x, mode: str = "scan"):
+        y, st = self.lru(x, mode=mode)
+
+        return y, st
