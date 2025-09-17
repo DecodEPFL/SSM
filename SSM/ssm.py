@@ -237,7 +237,7 @@ class LRU_Robust(jit.ScriptModule):
         Sk = self.Skew - self.Skew.T
         Q = (self.ID - Sk) @ torch.linalg.inv(self.ID + Sk)
         Z = self.X21 @ self.X21.T + X22 @ X22.T + self.D.T @ self.D + torch.exp(self.epsilon) * self.ID
-        beta = gamma ** 2 * torch.sigmoid(self.alpha) / torch.norm(Z, 2)
+        beta = gamma ** 2 * torch.sigmoid(self.alpha) / torch.linalg.matrix_norm(Z, 2)
         H11 = X11 @ X11.T + self.C.T @ self.C + beta * torch.exp(self.epsilon) * self.ID
         H12 = torch.sqrt(beta) * (X11 @ self.X21.T + self.C.T @ self.D)
         V = Z * beta - gamma ** 2 * self.ID
