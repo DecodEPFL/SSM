@@ -46,12 +46,12 @@ cfg = {
     "n_y": 3,
     "d_model": 5,
     "d_state": 6,
-    "n_layers": 2,
+    "n_layers": 1,
     "ff": "LMLP",  # GLU | MLP | LMLP
     "max_phase": math.pi / 50,
     "r_min": 0.7,
     "r_max": 0.98,
-    "robust": True,
+    "robust": 'l2ru',
     "gamma": 1
 }
 cfg = Namespace(**cfg)

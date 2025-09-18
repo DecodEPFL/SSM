@@ -6,11 +6,10 @@ from collections import OrderedDict
 from SSM.scan_utils import associative_scan, binary_operator_diag, compute_linear_recurrence_parallel
 import torch.jit as jit
 from SSM.L_bounded_MLPs import FirstChannel, SandwichFc, SandwichLin
-
-
-
+from .ssm_zak import LRUZ
 
 """ Linear Recurrent Units ----------------------------------------- """
+
 
 class LRU(nn.Module):
     """ Linear Recurrent Unit. The LRU is simulated using Parallel Scan (fast!) when
@@ -168,7 +167,7 @@ class LRU(nn.Module):
         # If no initial state is provided, initialize it to zeros.
         if self.state is None or self.state.shape[0] != batch_size:
             self.state = torch.zeros(batch_size, self.state_features,
-                                   device=input.device, dtype=torch.complex64)
+                                     device=input.device, dtype=torch.complex64)
 
         # Pre-compute input transformation
         Bu_elements = input.to(B.dtype) @ B.mT
@@ -203,20 +202,21 @@ class LRU(nn.Module):
         else:
             raise ValueError(f"Unknown mode: {mode}. Expected 'scan', 'loop', or 'loop_efficient'.")
 
-
     def reset(self):
         self.state = None  # reset the SSM state to the initial value
 
     """ L2RU parametrization: Implements a Linear Recurrent Unit (LRU) with trainable or prescribed l2 gain gamma. """
 
+
 class LRU_Robust(jit.ScriptModule):
     """ Implements a Linear Recurrent Unit (LRU) with trainable or prescribed l2 gain gamma. """
+
     def __init__(self, state_features: int, gamma: float = None):
         super().__init__()
         self.state_features = state_features
-        if gamma is not None: # in this case the l2 gain of the system is fixed
+        if gamma is not None:  # in this case the l2 gain of the system is fixed
             self.gamma = gamma
-        else: # in this case the l2 gain is learnable (default)
+        else:  # in this case the l2 gain is learnable (default)
             self.gamma = nn.Parameter(torch.tensor(22.2))
         # initialize the internal state (will be resized per-batch at first forward)
         self.state = torch.zeros(state_features)
@@ -225,9 +225,9 @@ class LRU_Robust(jit.ScriptModule):
         self.epsilon = nn.Parameter(torch.tensor(-99.9))  # Regularization
         self.Skew = nn.Parameter(0.01 * torch.randn(state_features, state_features))
         # Trainable parameters
-        self.X11 = nn.Parameter(.01*torch.eye(state_features))
-        self.X22 = nn.Parameter(0.01 * torch.eye(state_features))
-        self.X21 = nn.Parameter(.01*torch.eye(state_features))
+        self.X11 = nn.Parameter(.01 * torch.eye(state_features))
+        self.X22 = nn.Parameter(.01 * torch.eye(state_features))
+        self.X21 = nn.Parameter(.1 * torch.eye(state_features))
         self.C = nn.Parameter(torch.eye(state_features))
         self.Dt = nn.Parameter(torch.eye(state_features))
 
@@ -330,6 +330,8 @@ class LRU_Robust(jit.ScriptModule):
 """ SSM models ----------------------------------------- """
 
 """ Data class to set up the SSM model (values here are used just to initialize all fields) """
+
+
 @dataclass
 class SSMConfig:
     d_model: int = 10  # input/output size of the LRU after the decoding phase (n_u = n_y)
@@ -343,14 +345,15 @@ class SSMConfig:
     ff: str = "MLP"  # non-linear block used in the scaffolding
     scale: float = 1  # Lipschitz constant of the Lipschitz bounded MLP (LMLP)
     dim_amp: int = 4  # controls the hidden layer's dimension of the MLP
-    robust: bool = True  # set this to true if you want to use the L2RU parametrization for the SSM. If set to false,
+    robust: str = None   # set this to true if you want to use the L2RU parametrization for the SSM. If set to false,
     # the complex diagonal parametrization of the LRU will be used instead.
     gamma: float = None  # set the overall l2 gain value in case you want to keep it fixed and not trainable, if set to
     # None, the gain will be trainable.
 
- # Parallel scan must be selected in the forward call of the SSM.
+    # Parallel scan must be selected in the forward call of the SSM.
 
     """ Scaffolding Layers """
+
 
 class MLP(nn.Module):
     """ Standard Transformer MLP """
@@ -420,6 +423,7 @@ class GLU(nn.Module):
 
     """ SSMs blocks ----------------------------------------- """
 
+
 class SSL(nn.Module):
     """ State Space Layer: LRU --> MLP + skip connection """
 
@@ -428,11 +432,14 @@ class SSL(nn.Module):
         self.ln = nn.LayerNorm(config.d_model, bias=config.bias)
 
         # LRU initialization
-        if config.robust:
-            self.lru = LRU_Robust(config.d_model)
-        else:
+        if config.robust is None:
             self.lru = LRU(config.d_model, config.d_model, config.d_state,
-                           rmin=config.rmin, rmax=config.rmax, max_phase=config.max_phase)
+                            rmin=config.rmin, rmax=config.rmax, max_phase=config.max_phase)
+        elif config.robust == "l2ru":
+            self.lru = LRU_Robust(config.d_model)
+        elif config.robust == "zak":
+            self.lru = LRUZ(config.d_model, config.d_model, config.d_state,
+                            rmin=config.rmin, rmax=config.rmax, max_phase=config.max_phase)
 
         # Dictionary for layer selection
         ff_layers = {
@@ -468,7 +475,7 @@ class DeepSSM(nn.Module):
         self.config = config
 
         # Simplified initialization - only handle trainable gamma for LRU_Robust
-        if config.robust is True and config.gamma is not None:
+        if config.robust is not None and config.gamma is not None:
             # Fixed-γ: register buffer and use raw Parameters
             self.register_buffer('gamma_t', torch.tensor(config.gamma))
             self.encoder = nn.Parameter(torch.randn(config.d_model, n_u))
@@ -515,7 +522,7 @@ class DeepSSM(nn.Module):
 
         # Final decoding step: handle fixed gamma case if needed (decoder rescaling)
 
-        if self.config.robust is True and self.config.gamma is not None:
+        if self.config.robust is not None and self.config.gamma is not None:
             """
             This is the case where we use a fixed gamma for LRU_Robust: need to rescale the decoder
             according to the product of the individual LRU gammas to ensure the overall gain is gamma_t.
@@ -536,9 +543,7 @@ class DeepSSM(nn.Module):
             else:
                 outputs = x @ self.decoder.T
 
-
         return outputs, layer_states
-
 
     def reset(self):
         # Reset initial states of LTI systems in the LRU blocks
@@ -546,11 +551,12 @@ class DeepSSM(nn.Module):
             block.lru.reset()
 
 
+# Pure LRU blocks -----------------------------------------------
 
 class PureLRUR(nn.Module):
     """ Just LRUR """
 
-    def __init__(self, n: int, gamma: float = None ):
+    def __init__(self, n: int, gamma: float = None, mode: str ="loop"):
         super().__init__()
         self.lru = LRU_Robust(n, gamma)
 
