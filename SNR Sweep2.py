@@ -88,8 +88,6 @@ if __name__ == "__main__":
     sequence_length_T = 100
 
 
-
-
     # Another example: Identity-like model
     class IdentityModel(nn.Module):
         def __init__(self, N):
@@ -117,7 +115,6 @@ if __name__ == "__main__":
 
     LRUR = PureLRUR(3, 1.0)
 
-
     # Build models
     config_robust = SSMConfig(d_model=cfg_robust.d_model, d_state=cfg_robust.d_state, n_layers=cfg_robust.n_layers,
                               ff=cfg_robust.ff,
@@ -125,12 +122,11 @@ if __name__ == "__main__":
                               robust=cfg_robust.robust, gamma=cfg_robust.gamma)
     model_robust = DeepSSM(cfg_robust.n_u, cfg_robust.n_y, config_robust)
 
-
     identity_model = IdentityModel(input_dim_N)
     estimated_gain_identity = estimate_l2_gain(model_robust, (100, 3), num_batches=15, num_iterations=220)
     print(f"Estimated L2 Gain of the robust model: {estimated_gain_identity:.4f}")
 
-    A,B,C,D = LRUR.lru.set_param()
+    A, B, C, D = LRUR.lru.set_param()
 
     A = A.cpu().detach().numpy()
     B = B.cpu().detach().numpy()
@@ -139,6 +135,6 @@ if __name__ == "__main__":
 
     sys = control.ss(A, B, C, D, dt=1.0)
     # Compute the H∞ norm (L2 gain) and the peak frequency ω_peak
-    gamma= control.norm(sys, p='inf')
+    gamma = control.norm(sys, p='inf')
 
 cfg_robust
