@@ -119,7 +119,7 @@ if __name__ == "__main__":
     config_robust = SSMConfig(d_model=cfg_robust.d_model, d_state=cfg_robust.d_state, n_layers=cfg_robust.n_layers,
                               ff=cfg_robust.ff,
                               rmin=cfg_robust.r_min, rmax=cfg_robust.r_max, max_phase=cfg_robust.max_phase,
-                              robust=cfg_robust.robust, gamma=cfg_robust.gamma)
+                              param=cfg_robust.robust, gamma=cfg_robust.gamma)
     model_robust = DeepSSM(cfg_robust.n_u, cfg_robust.n_y, config_robust)
 
     identity_model = IdentityModel(input_dim_N)

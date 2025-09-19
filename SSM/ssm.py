@@ -215,9 +215,9 @@ class LRU_Robust(jit.ScriptModule):
         super().__init__()
         self.state_features = state_features
         if gamma is not None:  # in this case the l2 gain of the system is fixed
-            self.gamma = gamma
+            self.gamma = torch.tensor(gamma)
         else:  # in this case the l2 gain is learnable (default)
-            self.gamma = nn.Parameter(torch.tensor(22.2))
+            self.gamma = nn.Parameter(torch.tensor(2.2))
         # initialize the internal state (will be resized per-batch at first forward)
         self.state = torch.zeros(state_features)
         self.register_buffer('ID', torch.eye(state_features))
@@ -345,7 +345,7 @@ class SSMConfig:
     ff: str = "MLP"  # non-linear block used in the scaffolding
     scale: float = 1  # Lipschitz constant of the Lipschitz bounded MLP (LMLP)
     dim_amp: int = 4  # controls the hidden layer's dimension of the MLP
-    robust: str = None   # set this to true if you want to use the L2RU parametrization for the SSM. If set to false,
+    param: str = None   # set this to true if you want to use the L2RU parametrization for the SSM. If set to false,
     # the complex diagonal parametrization of the LRU will be used instead.
     gamma: float = None  # set the overall l2 gain value in case you want to keep it fixed and not trainable, if set to
     # None, the gain will be trainable.
@@ -431,14 +431,14 @@ class SSL(nn.Module):
         super().__init__()
         self.ln = nn.LayerNorm(config.d_model, bias=config.bias)
 
-        # LRU initialization
-        if config.robust is None:
-            self.lru = LRU(config.d_model, config.d_model, config.d_state,
+        # LRU initialization depending on the chosen architecture
+        if config.param is None:
+            self.lru = LRU(in_features=config.d_model, out_features=config.d_model, state_features=config.d_state,
                             rmin=config.rmin, rmax=config.rmax, max_phase=config.max_phase)
-        elif config.robust == "l2ru":
-            self.lru = LRU_Robust(config.d_model)
-        elif config.robust == "zak":
-            self.lru = LRUZ(config.d_model, config.d_model, config.d_state,
+        elif config.param == "l2ru":
+            self.lru = LRU_Robust(state_features=config.d_model, gamma = config.gamma)
+        elif config.param == "zak":
+            self.lru = LRUZ(input_features=config.d_model, output_features=config.d_model, state_features=config.d_state, gamma=config.gamma,
                             rmin=config.rmin, rmax=config.rmax, max_phase=config.max_phase)
 
         # Dictionary for layer selection
@@ -456,11 +456,11 @@ class SSL(nn.Module):
 
     def forward(self, x, state=None, mode: str = "loop"):
         z = x
-        # z = self.ln(z)  # prenorm
+        # z = self.ln(z)  # pre-norm
 
         z, st = self.lru(z, state=state, mode=mode)
         z = self.ff(z)  # MLP, GLU or LMLP
-        z = self.dropout(z)
+        z = self.dropout(z) # inactive by default
 
         # Residual connection
         return z + x, st
@@ -475,7 +475,7 @@ class DeepSSM(nn.Module):
         self.config = config
 
         # Simplified initialization - only handle trainable gamma for LRU_Robust
-        if config.robust is not None and config.gamma is not None:
+        if config.param is not None and config.gamma is not None:
             # Fixed-γ: register buffer and use raw Parameters
             self.register_buffer('gamma_t', torch.tensor(config.gamma))
             self.encoder = nn.Parameter(torch.randn(config.d_model, n_u))
@@ -522,7 +522,7 @@ class DeepSSM(nn.Module):
 
         # Final decoding step: handle fixed gamma case if needed (decoder rescaling)
 
-        if self.config.robust is not None and self.config.gamma is not None:
+        if self.config.param is not None and self.config.gamma is not None:
             """
             This is the case where we use a fixed gamma for LRU_Robust: need to rescale the decoder
             according to the product of the individual LRU gammas to ensure the overall gain is gamma_t.
@@ -558,7 +558,7 @@ class PureLRUR(nn.Module):
 
     def __init__(self, n: int, gamma: float = None, mode: str ="loop"):
         super().__init__()
-        self.lru = LRU_Robust(n, gamma)
+        self.lru = LRU_Robust(n, gamma=gamma)
 
     def forward(self, x, mode: str = "scan"):
         y, st = self.lru(x, mode=mode)

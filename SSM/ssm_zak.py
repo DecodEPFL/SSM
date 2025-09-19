@@ -25,7 +25,7 @@ class LRUZ(jit.ScriptModule):
         self.theta_log = nn.Parameter(torch.log(max_phase * u2))
 
         if gamma is not None:  # in this case the l2 gain of the system is fixed
-            self.gamma = gamma
+            self.gamma = torch.tensor(gamma)
         else:  # in this case the l2 gain is learnable (default)
             self.gamma = nn.Parameter(torch.tensor(22.2))
         # initialize the internal state (will be resized per-batch at first forward)
@@ -40,6 +40,36 @@ class LRUZ(jit.ScriptModule):
         # Learnable parameters
         self.X2b = nn.Parameter(torch.randn(2 * state_features, input_features + output_features))
         self.D = nn.Parameter(torch.randn(output_features, input_features))
+
+
+    def ss_real_matrices(self, to_numpy=True):
+        A, B, C, D = self.set_param()
+        lambdas = torch.diagonal(A)
+        device, dtype = lambdas.device, lambdas.dtype
+        state_features_2 = 2 * self.state_features
+
+        lambdas_conjugate = torch.stack([lambdas, lambdas.conj()], dim=1).flatten()
+        A_full = torch.diag(lambdas_conjugate)
+        B_conjugate = torch.stack([B, B.conj()], dim=1).view(state_features_2, self.input_features)
+        C_half = 0.5 * C
+        C_conjugate = torch.stack([C_half, C_half.conj()], dim=2).view(self.output_features, state_features_2)
+
+        # build small 2x2 transform on the current device / dtype (do NOT cache to self)
+        T_block = torch.tensor([[1, 1], [1j, -1j]], device=device, dtype=dtype)
+        T_block_inv = torch.linalg.inv(T_block)
+
+        T_full = torch.block_diag(*([T_block] * self.state_features))
+        T_full_inv = torch.block_diag(*([T_block_inv] * self.state_features))
+
+        A_real = (T_full @ A_full @ T_full_inv).real
+        B_real = (T_full @ B_conjugate).real
+        C_real = (C_conjugate @ T_full_inv).real
+        D_real = D
+
+        ss_real_params = [A_real, B_real, C_real, D_real]
+        if to_numpy:
+            ss_real_params = [param.detach().cpu().numpy() for param in ss_real_params]
+        return tuple(ss_real_params)
 
     def set_param(self):
         nx = self.state_features
@@ -59,9 +89,9 @@ class LRUZ(jit.ScriptModule):
         X1 = torch.cat((X11, X12), dim=0)
 
         X4_row1 = torch.cat(
-            (self.gamma * self.IDu, self.gamma * self.D.T / torch.linalg.matrix_norm(self.D + epsilon, 2)), dim=1)
+            (self.gamma * self.IDu, (1/self.gamma) * self.D.T / torch.linalg.matrix_norm(self.D + epsilon, 2)), dim=1)
         X4_row2 = torch.cat(
-            ((self.gamma * self.D.T / torch.linalg.matrix_norm(self.D + epsilon, 2)).T, self.gamma * self.IDy),
+            (((1/self.gamma) * self.D.T / torch.linalg.matrix_norm(self.D + epsilon, 2)).T, self.gamma * self.IDy),
             dim=1)
         X4 = torch.cat((X4_row1, X4_row2), dim=0)
 
@@ -72,9 +102,9 @@ class LRUZ(jit.ScriptModule):
         X2t = self.X2b * M
 
         eta = torch.maximum(torch.tensor(1.0), torch.maximum(torch.linalg.matrix_norm(torch.linalg.inv(X1) @ X2t.to(torch.complex64), 2),
-                                                             torch.linalg.matrix_norm(torch.linalg.inv(X4) @ X2t.T, 2)))
+                                                             torch.linalg.matrix_norm( X2t @ torch.linalg.inv(X4), 2)))
 
-        X2 = eta * X2t
+        X2 = (1/eta) * X2t
 
         B = torch.linalg.inv(Q) @ X2[:nx, :nu].to(torch.complex64)
         C = torch.conj(X2[-nx:, -ny:]).T.to(torch.complex64)
