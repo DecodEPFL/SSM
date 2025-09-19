@@ -53,7 +53,8 @@ cfg = {
     "r_min": 0.7,
     "r_max": 0.98,
     "robust": 'l2ru',
-    "gamma": None
+    "gamma": None,
+    "init": 'eye'
 }
 cfg = Namespace(**cfg)
 
@@ -61,7 +62,7 @@ cfg = Namespace(**cfg)
 
 # Build model
 config = SSMConfig(d_model=cfg.d_model, d_state=cfg.d_state, n_layers=cfg.n_layers, ff=cfg.ff, rmin=cfg.r_min,
-                   rmax=cfg.r_max, max_phase=cfg.max_phase, param=cfg.robust, gamma=cfg.gamma)
+                   rmax=cfg.r_max, max_phase=cfg.max_phase, param=cfg.robust, gamma=cfg.gamma, init=cfg.init)
 model = DeepSSM(cfg.n_u, cfg.n_y, config)
 #model.cuda()
 

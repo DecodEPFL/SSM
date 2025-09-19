@@ -211,7 +211,7 @@ class LRU(nn.Module):
 class LRU_Robust(jit.ScriptModule):
     """ Implements a Linear Recurrent Unit (LRU) with trainable or prescribed l2 gain gamma. """
 
-    def __init__(self, state_features: int, gamma: float = None):
+    def __init__(self, state_features: int, gamma: float = None, init='eye', eye_scale=0.01, rand_scale=1):
         super().__init__()
         self.state_features = state_features
         if gamma is not None:  # in this case the l2 gain of the system is fixed
@@ -224,10 +224,23 @@ class LRU_Robust(jit.ScriptModule):
         self.alpha = nn.Parameter(torch.tensor(4.1))  # controls the initialization of the matrix A:
         self.epsilon = nn.Parameter(torch.tensor(-99.9))  # Regularization
         self.Skew = nn.Parameter(0.01 * torch.randn(state_features, state_features))
-        # Trainable parameters
-        self.X11 = nn.Parameter(.01 * torch.eye(state_features))
-        self.X22 = nn.Parameter(.01 * torch.eye(state_features))
-        self.X21 = nn.Parameter(.1 * torch.eye(state_features))
+        # Trainable parameters (depending on initalization)
+        n = state_features
+        if init == 'eye':
+            X11_init = eye_scale * torch.eye(n)
+            X22_init = eye_scale * torch.eye(n)
+            X21_init = 0.1 * torch.eye(n)
+        elif init == 'rand':
+            X11_init = rand_scale * torch.randn(n, n)
+            X22_init = rand_scale * torch.randn(n, n)
+            X21_init = rand_scale * torch.randn(n, n)
+        else:
+            raise ValueError(init)
+
+        # create parameters once with chosen init
+        self.X11 = nn.Parameter(X11_init)
+        self.X22 = nn.Parameter(X22_init)
+        self.X21 = nn.Parameter(X21_init)
         self.C = nn.Parameter(torch.eye(state_features))
         self.Dt = nn.Parameter(torch.eye(state_features))
 
@@ -349,6 +362,7 @@ class SSMConfig:
     # the complex diagonal parametrization of the LRU will be used instead.
     gamma: float = None  # set the overall l2 gain value in case you want to keep it fixed and not trainable, if set to
     # None, the gain will be trainable.
+    init: str = 'eye' # controls the initialization of the parameters when the L2RU param is chosen.
 
     # Parallel scan must be selected in the forward call of the SSM.
 
@@ -436,7 +450,7 @@ class SSL(nn.Module):
             self.lru = LRU(in_features=config.d_model, out_features=config.d_model, state_features=config.d_state,
                             rmin=config.rmin, rmax=config.rmax, max_phase=config.max_phase)
         elif config.param == "l2ru":
-            self.lru = LRU_Robust(state_features=config.d_model, gamma = config.gamma)
+            self.lru = LRU_Robust(state_features=config.d_model, gamma = config.gamma, init=config.init)
         elif config.param == "zak":
             self.lru = LRUZ(input_features=config.d_model, output_features=config.d_model, state_features=config.d_state, gamma=config.gamma,
                             rmin=config.rmin, rmax=config.rmax, max_phase=config.max_phase)
