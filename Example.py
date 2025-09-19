@@ -9,6 +9,7 @@ from argparse import Namespace
 import torch
 from tqdm import tqdm
 from SSM.ssm import DeepSSM, SSMConfig
+import control
 
 seed = 9
 torch.manual_seed(seed)
@@ -52,7 +53,7 @@ cfg = {
     "r_min": 0.7,
     "r_max": 0.98,
     "robust": 'l2ru',
-    "gamma": 1
+    "gamma": None
 }
 cfg = Namespace(**cfg)
 
@@ -60,9 +61,21 @@ cfg = Namespace(**cfg)
 
 # Build model
 config = SSMConfig(d_model=cfg.d_model, d_state=cfg.d_state, n_layers=cfg.n_layers, ff=cfg.ff, rmin=cfg.r_min,
-                   rmax=cfg.r_max, max_phase=cfg.max_phase, robust=cfg.robust, gamma=cfg.gamma)
+                   rmax=cfg.r_max, max_phase=cfg.max_phase, param=cfg.robust, gamma=cfg.gamma)
 model = DeepSSM(cfg.n_u, cfg.n_y, config)
 #model.cuda()
+
+lru = model.blocks[0].lru
+A, B, C, D = lru.set_param()
+# real = lru.ss_real_matrices()
+# A = real[0]
+# B = real[1]
+# C = real[2]
+# D = real[3]
+# sys = control.ss(A, B, C, D, dt=1.0)
+# # Compute the H∞ norm (L2 gain) and the peak frequency ω_peak
+# gamma = control.norm(sys, p='inf')
+
 
 # Configure optimizer
 opt = torch.optim.AdamW(model.parameters(), lr=2e-3)
@@ -194,5 +207,12 @@ plt.tight_layout(rect=[0, 0, 1, 0.95])  # Leave space for the legend
 # Save as PDF for LaTeX
 plt.savefig('comparison_figure.pdf', format='pdf', bbox_inches='tight')
 plt.show()
+
+A,B,C,D= model.blocks[0].lru.set_param()
+A = A.cpu().detach().numpy()
+B = B.cpu().detach().numpy()
+C = C.data.cpu().detach().numpy()
+D = D.cpu().detach().numpy()
+sys = control.ss(A, B, C, D, dt=1.0)
 
 plt
