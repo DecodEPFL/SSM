@@ -27,7 +27,7 @@ class LRUZ(jit.ScriptModule):
         if gamma is not None:  # in this case the l2 gain of the system is fixed
             self.gamma = torch.tensor(gamma)
         else:  # in this case the l2 gain is learnable (default)
-            self.gamma = nn.Parameter(torch.tensor(22.2))
+            self.gamma = nn.Parameter(torch.tensor(3.2))
         # initialize the internal state (will be resized per-batch at first forward)
         self.state = torch.tensor(0.0)
         self.register_buffer('ID', torch.eye(state_features))
@@ -54,7 +54,7 @@ class LRUZ(jit.ScriptModule):
         C_half = 0.5 * C
         C_conjugate = torch.stack([C_half, C_half.conj()], dim=2).view(self.output_features, state_features_2)
 
-        # build small 2x2 transform on the current device / dtype (do NOT cache to self)
+        # build a small 2x2 transform on the current device / dtype (do NOT cache to self)
         T_block = torch.tensor([[1, 1], [1j, -1j]], device=device, dtype=dtype)
         T_block_inv = torch.linalg.inv(T_block)
 

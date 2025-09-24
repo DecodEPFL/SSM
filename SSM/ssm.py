@@ -450,9 +450,9 @@ class SSL(nn.Module):
             self.lru = LRU(in_features=config.d_model, out_features=config.d_model, state_features=config.d_state,
                             rmin=config.rmin, rmax=config.rmax, max_phase=config.max_phase)
         elif config.param == "l2ru":
-            self.lru = LRU_Robust(state_features=config.d_model, gamma = config.gamma, init=config.init)
+            self.lru = LRU_Robust(state_features=config.d_model, init=config.init)
         elif config.param == "zak":
-            self.lru = LRUZ(input_features=config.d_model, output_features=config.d_model, state_features=config.d_state, gamma=config.gamma,
+            self.lru = LRUZ(input_features=config.d_model, output_features=config.d_model, state_features=config.d_state,
                             rmin=config.rmin, rmax=config.rmax, max_phase=config.max_phase)
 
         # Dictionary for layer selection
@@ -546,8 +546,8 @@ class DeepSSM(nn.Module):
             gamma_t = torch.abs(self.gamma_t) if gamma is None else gamma
             gammaLRU = [torch.abs(block.lru.gamma) for block in self.blocks]
             gammaLRU_tensor = torch.stack(gammaLRU)
-            encoder_norm = torch.norm(self.encoder, 2)
-            decoder_norm = torch.norm(self.decoder, 2)
+            encoder_norm = torch.linalg.matrix_norm(self.encoder, 2)
+            decoder_norm = torch.linalg.matrix_norm(self.decoder, 2)
             gamma_prod = torch.prod(gammaLRU_tensor) + 1
             decoder_scaled = (gamma_t * self.decoder) / (encoder_norm * decoder_norm * gamma_prod)
             outputs = x @ decoder_scaled.T
@@ -570,9 +570,9 @@ class DeepSSM(nn.Module):
 class PureLRUR(nn.Module):
     """ Just LRUR """
 
-    def __init__(self, n: int, gamma: float = None, mode: str ="loop"):
+    def __init__(self, n: int, gamma: float = None, init: str ="eye"):
         super().__init__()
-        self.lru = LRU_Robust(n, gamma=gamma)
+        self.lru = LRU_Robust(n, gamma=gamma, init=init)
 
     def forward(self, x, mode: str = "scan"):
         y, st = self.lru(x, mode=mode)
