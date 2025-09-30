@@ -53,7 +53,7 @@ cfg = {
     "r_min": 0.7,
     "r_max": 0.98,
     "param": 'l2ru',
-    "gamma": None,
+    "gamma": 1,
     "init": 'eye'
 }
 cfg = Namespace(**cfg)

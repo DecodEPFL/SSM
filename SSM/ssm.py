@@ -358,8 +358,7 @@ class SSMConfig:
     ff: str = "MLP"  # non-linear block used in the scaffolding
     scale: float = 1  # Lipschitz constant of the Lipschitz bounded MLP (LMLP)
     dim_amp: int = 4  # controls the hidden layer's dimension of the MLP
-    param: str = None   # set this to true if you want to use the L2RU parametrization for the SSM. If set to false,
-    # the complex diagonal parametrization of the LRU will be used instead.
+    param: str = None   # Choose the desired LRU parametrization (between lru, l2ru and zak).
     gamma: float = None  # set the overall l2 gain value in case you want to keep it fixed and not trainable, if set to
     # None, the gain will be trainable.
     init: str = 'eye' # controls the initialization of the parameters when the L2RU param is chosen.
@@ -534,7 +533,7 @@ class DeepSSM(nn.Module):
             x, st = block(x, state=layer_states[layer_idx], mode=mode)
             layer_states[layer_idx] = st
 
-        # Final decoding step: handle fixed gamma case if needed (decoder rescaling)
+        # Final decoding step: handle a fixed gamma case if needed (decoder rescaling)
 
         if self.config.param is not None and self.config.gamma is not None:
             """
@@ -548,7 +547,7 @@ class DeepSSM(nn.Module):
             gammaLRU_tensor = torch.stack(gammaLRU)
             encoder_norm = torch.linalg.matrix_norm(self.encoder, 2)
             decoder_norm = torch.linalg.matrix_norm(self.decoder, 2)
-            gamma_prod = torch.prod(gammaLRU_tensor) + 1
+            gamma_prod = torch.prod(gammaLRU_tensor+1)
             decoder_scaled = (gamma_t * self.decoder) / (encoder_norm * decoder_norm * gamma_prod)
             outputs = x @ decoder_scaled.T
         else:
