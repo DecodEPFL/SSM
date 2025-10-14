@@ -106,25 +106,37 @@ if __name__ == "__main__":
         # Configs
 
 
-    cfg_robust = {
-        "n_u": 3, "n_y": 3, "d_model": 5, "d_state": 6, "n_layers": 1,
-        "ff": "LMLP", "max_phase": math.pi / 50, "r_min": 0.7, "r_max": 0.98,
-        "robust": True, "gamma": 20
+    cfg = {
+        "n_u": 3,
+        "n_y": 3,
+        "d_model": 5,
+        "d_state": 6,
+        "n_layers": 1,
+        "ff": "LMLP",  # GLU | MLP | LMLP
+        "max_phase": math.pi / 50,
+        "r_min": 0.7,
+        "r_max": 0.98,
+        "param": 'zak',
+        "gamma": 10,
+        "init": 'eye'
     }
-    cfg_robust = Namespace(**cfg_robust)
+    cfg_robust = Namespace(**cfg)
 
-    LRUR = PureLRUR(3, 1.0)
+    LRUR = PureLRUR(10, param=cfg_robust.param, gamma=cfg_robust.gamma, init=cfg_robust.init)
 
-    # Build models
-    config_robust = SSMConfig(d_model=cfg_robust.d_model, d_state=cfg_robust.d_state, n_layers=cfg_robust.n_layers,
-                              ff=cfg_robust.ff,
-                              rmin=cfg_robust.r_min, rmax=cfg_robust.r_max, max_phase=cfg_robust.max_phase,
-                              param=cfg_robust.robust, gamma=cfg_robust.gamma)
-    model_robust = DeepSSM(cfg_robust.n_u, cfg_robust.n_y, config_robust)
+    # # Build models
+    # config_robust = SSMConfig(d_model=cfg_robust.d_model, d_state=cfg_robust.d_state, n_layers=cfg_robust.n_layers,
+    #                           ff=cfg_robust.ff,
+    #                           rmin=cfg_robust.r_min, rmax=cfg_robust.r_max, max_phase=cfg_robust.max_phase,
+    #                           param=cfg_robust.param, gamma=cfg_robust.gamma, init=cfg_robust.init)
+    # model_robust = DeepSSM(cfg_robust.n_u, cfg_robust.n_y, config_robust)
+    #
+    # identity_model = IdentityModel(input_dim_N)
+    # estimated_gain_identity = estimate_l2_gain(model_robust, (100, 3), num_batches=15, num_iterations=220)
+    # print(f"Estimated L2 Gain of the robust model: {estimated_gain_identity:.4f}")
 
-    identity_model = IdentityModel(input_dim_N)
-    estimated_gain_identity = estimate_l2_gain(model_robust, (100, 3), num_batches=15, num_iterations=220)
-    print(f"Estimated L2 Gain of the robust model: {estimated_gain_identity:.4f}")
+    total_params = sum(p.numel() for p in LRUR.parameters())
+    print(f"Number of parameters: {total_params}")
 
     A, B, C, D = LRUR.lru.set_param()
 

@@ -163,16 +163,34 @@ if __name__ == "__main__":
 
     # Configs
     cfg_robust = {
-        "n_u": 3, "n_y": 3, "d_model": 5, "d_state": 6, "n_layers": 1,
-        "ff": "LMLP", "max_phase": math.pi / 50, "r_min": 0.7, "r_max": 0.98,
-        "robust": True, "gamma": 26
+        "n_u": 3,
+        "n_y": 3,
+        "d_model": 5,
+        "d_state": 6,
+        "n_layers": 1,
+        "ff": "LMLP",  # GLU | MLP | LMLP
+        "max_phase": math.pi / 50,
+        "r_min": 0.7,
+        "r_max": 0.98,
+        "param": 'l2ru',
+        "gamma": 6,
+        "init": 'eye'
     }
     cfg_robust = Namespace(**cfg_robust)
 
     cfg_vanilla = {
-        "n_u": 3, "n_y": 3, "d_model": 5, "d_state": 6, "n_layers": 1,
-        "ff": "LMLP", "max_phase": math.pi / 50, "r_min": 0.7, "r_max": 0.98,
-        "robust": False, "gamma": None
+        "n_u": 3,
+        "n_y": 3,
+        "d_model": 5,
+        "d_state": 6,
+        "n_layers": 1,
+        "ff": "LMLP",  # GLU | MLP | LMLP
+        "max_phase": math.pi / 50,
+        "r_min": 0.7,
+        "r_max": 0.98,
+        "param": None,
+        "gamma": 6,
+        "init": 'eye'
     }
     cfg_vanilla = Namespace(**cfg_vanilla)
 
@@ -180,13 +198,13 @@ if __name__ == "__main__":
     config_robust = SSMConfig(d_model=cfg_robust.d_model, d_state=cfg_robust.d_state, n_layers=cfg_robust.n_layers,
                               ff=cfg_robust.ff,
                               rmin=cfg_robust.r_min, rmax=cfg_robust.r_max, max_phase=cfg_robust.max_phase,
-                              param=cfg_robust.robust, gamma=cfg_robust.gamma)
+                              param=cfg_robust.param, gamma=cfg_robust.gamma, init=cfg_robust.init)
     model_robust = DeepSSM(cfg_robust.n_u, cfg_robust.n_y, config_robust)
 
     config_vanilla = SSMConfig(d_model=cfg_vanilla.d_model, d_state=cfg_vanilla.d_state, n_layers=cfg_vanilla.n_layers,
                                ff=cfg_vanilla.ff,
                                rmin=cfg_vanilla.r_min, rmax=cfg_vanilla.r_max, max_phase=cfg_vanilla.max_phase,
-                               param=cfg_vanilla.robust, gamma=cfg_vanilla.gamma)
+                               param=cfg_vanilla.param, gamma=cfg_vanilla.gamma)
     model_vanilla = DeepSSM(cfg_vanilla.n_u, cfg_vanilla.n_y, config_vanilla)
 
     # Simulate functions (torch in/out for grads)

@@ -45,7 +45,7 @@ for j in range(nExp):
 cfg = {
     "n_u": 1,
     "n_y": 3,
-    "d_model":5,
+    "d_model": 5,
     "d_state": 6,
     "n_layers": 1,
     "ff": "LMLP",  # GLU | MLP | LMLP
@@ -79,7 +79,7 @@ model = DeepSSM(cfg.n_u, cfg.n_y, config)
 
 
 # Configure optimizer
-opt = torch.optim.AdamW(model.parameters(), lr=2e-3)
+opt = torch.optim.Adam(model.parameters(), lr=2e-3)
 opt.zero_grad()
 
 total_params = sum(p.numel() for p in model.parameters())
@@ -92,8 +92,9 @@ MSE = nn.MSELoss()
 lowest_loss = float('inf')  # Initialize with a very large value
 best_model_path = "best_model.pth"
 LOSS = []
-# Train loop
-for itr in tqdm(range(1500)):
+
+epochs = 3590  # Train loop
+for itr in tqdm(range(epochs)):
     yRNN, _ = model(u, mode="scan")
     yRNN = torch.squeeze(yRNN)
     loss = MSE(yRNN, y)
@@ -158,7 +159,7 @@ plt.figure('8')
 fig, ax = plt.subplots(figsize=(5.25, 1.75))
 
 # Plot losses with logarithmic y-axis
-ax.plot(range(1500), LOSS, label='Approach 1', color='blue', linestyle='-')
+ax.plot(range(epochs), LOSS, label='Approach 1', color='blue', linestyle='-')
 
 # Set logarithmic scale for y-axis
 ax.set_yscale('log')
@@ -209,7 +210,7 @@ plt.tight_layout(rect=[0, 0, 1, 0.95])  # Leave space for the legend
 plt.savefig('comparison_figure.pdf', format='pdf', bbox_inches='tight')
 plt.show()
 
-A,B,C,D= model.blocks[0].lru.set_param()
+A, B, C, D = model.blocks[0].lru.set_param()
 A = A.cpu().detach().numpy()
 B = B.cpu().detach().numpy()
 C = C.data.cpu().detach().numpy()
