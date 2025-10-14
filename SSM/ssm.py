@@ -358,10 +358,11 @@ class SSMConfig:
     ff: str = "MLP"  # non-linear block used in the scaffolding
     scale: float = 1  # Lipschitz constant of the Lipschitz bounded MLP (LMLP)
     dim_amp: int = 4  # controls the hidden layer's dimension of the MLP
-    param: str = None   # Choose the desired LRU parametrization (between lru, l2ru and zak).
+    param: str = None  # set this to true if you want to use the L2RU parametrization for the SSM. If set to false,
+    # the complex diagonal parametrization of the LRU will be used instead.
     gamma: float = None  # set the overall l2 gain value in case you want to keep it fixed and not trainable, if set to
     # None, the gain will be trainable.
-    init: str = 'eye' # controls the initialization of the parameters when the L2RU param is chosen.
+    init: str = 'eye'  # controls the initialization of the parameters when the L2RU param is chosen.
 
     # Parallel scan must be selected in the forward call of the SSM.
 
@@ -447,11 +448,12 @@ class SSL(nn.Module):
         # LRU initialization depending on the chosen architecture
         if config.param is None:
             self.lru = LRU(in_features=config.d_model, out_features=config.d_model, state_features=config.d_state,
-                            rmin=config.rmin, rmax=config.rmax, max_phase=config.max_phase)
+                           rmin=config.rmin, rmax=config.rmax, max_phase=config.max_phase)
         elif config.param == "l2ru":
             self.lru = LRU_Robust(state_features=config.d_model, init=config.init)
         elif config.param == "zak":
-            self.lru = LRUZ(input_features=config.d_model, output_features=config.d_model, state_features=config.d_state,
+            self.lru = LRUZ(input_features=config.d_model, output_features=config.d_model,
+                            state_features=config.d_state,
                             rmin=config.rmin, rmax=config.rmax, max_phase=config.max_phase)
 
         # Dictionary for layer selection
@@ -473,7 +475,7 @@ class SSL(nn.Module):
 
         z, st = self.lru(z, state=state, mode=mode)
         z = self.ff(z)  # MLP, GLU or LMLP
-        z = self.dropout(z) # inactive by default
+        z = self.dropout(z)  # inactive by default
 
         # Residual connection
         return z + x, st
@@ -533,7 +535,7 @@ class DeepSSM(nn.Module):
             x, st = block(x, state=layer_states[layer_idx], mode=mode)
             layer_states[layer_idx] = st
 
-        # Final decoding step: handle a fixed gamma case if needed (decoder rescaling)
+        # Final decoding step: handle fixed gamma case if needed (decoder rescaling)
 
         if self.config.param is not None and self.config.gamma is not None:
             """
@@ -547,7 +549,7 @@ class DeepSSM(nn.Module):
             gammaLRU_tensor = torch.stack(gammaLRU)
             encoder_norm = torch.linalg.matrix_norm(self.encoder, 2)
             decoder_norm = torch.linalg.matrix_norm(self.decoder, 2)
-            gamma_prod = torch.prod(gammaLRU_tensor+1)
+            gamma_prod = torch.prod(gammaLRU_tensor) + 1
             decoder_scaled = (gamma_t * self.decoder) / (encoder_norm * decoder_norm * gamma_prod)
             outputs = x @ decoder_scaled.T
         else:
@@ -567,11 +569,14 @@ class DeepSSM(nn.Module):
 # Pure LRU blocks -----------------------------------------------
 
 class PureLRUR(nn.Module):
-    """ Just LRUR """
+    """ A pure robust LRU block without any scaffolding. """
 
-    def __init__(self, n: int, gamma: float = None, init: str ="eye"):
+    def __init__(self, n: int, gamma: float = None, param: str = 'l2ru', init: str = "eye"):
         super().__init__()
-        self.lru = LRU_Robust(n, gamma=gamma, init=init)
+        if param == 'l2ru':  # In this case the LTI system is necessarily square
+            self.lru = LRU_Robust(state_features=n, gamma=gamma, init=init)
+        elif param == 'zak':  # Can handle non-square LTI systems
+            self.lru = LRUZ(input_features=n, output_features=n, state_features=n, gamma=gamma)
 
     def forward(self, x, mode: str = "scan"):
         y, st = self.lru(x, mode=mode)

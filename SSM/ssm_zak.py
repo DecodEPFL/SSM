@@ -27,7 +27,7 @@ class LRUZ(jit.ScriptModule):
         if gamma is not None:  # in this case the l2 gain of the system is fixed
             self.gamma = torch.tensor(gamma)
         else:  # in this case the l2 gain is learnable (default)
-            self.gamma = nn.Parameter(torch.tensor(3.2))
+            self.gamma = nn.Parameter(torch.tensor(1.6))
         # initialize the internal state (will be resized per-batch at first forward)
         self.state = torch.tensor(0.0)
         self.register_buffer('ID', torch.eye(state_features))
@@ -40,7 +40,6 @@ class LRUZ(jit.ScriptModule):
         # Learnable parameters
         self.X2b = nn.Parameter(torch.randn(2 * state_features, input_features + output_features))
         self.D = nn.Parameter(torch.randn(output_features, input_features))
-
 
     def ss_real_matrices(self, to_numpy=True):
         A, B, C, D = self.set_param()
@@ -76,6 +75,7 @@ class LRUZ(jit.ScriptModule):
         nu = self.input_features
         ny = self.output_features
         epsilon = 0.01
+        alpha = 1 - epsilon
 
         # Create A
         lambda_abs = torch.exp(-torch.exp(self.nu_log))
@@ -88,10 +88,13 @@ class LRUZ(jit.ScriptModule):
         X12 = torch.cat((torch.conj(A).T @ Q, Q), dim=1)
         X1 = torch.cat((X11, X12), dim=0)
 
+        X4_offdiagonal = self.gamma * alpha * self.D.T / torch.linalg.matrix_norm(self.D, 2)
+
         X4_row1 = torch.cat(
-            (self.gamma * self.IDu, (1/self.gamma) * self.D.T / torch.linalg.matrix_norm(self.D + epsilon, 2)), dim=1)
+            (self.gamma * self.IDu, X4_offdiagonal), dim=1)
         X4_row2 = torch.cat(
-            (((1/self.gamma) * self.D.T / torch.linalg.matrix_norm(self.D + epsilon, 2)).T, self.gamma * self.IDy),
+            (X4_offdiagonal.T,
+             self.gamma * self.IDy),
             dim=1)
         X4 = torch.cat((X4_row1, X4_row2), dim=0)
 
@@ -101,14 +104,16 @@ class LRUZ(jit.ScriptModule):
 
         X2t = self.X2b * M
 
-        eta = torch.maximum(torch.tensor(1.0), torch.maximum(torch.linalg.matrix_norm(torch.linalg.inv(X1) @ X2t.to(torch.complex64), 2),
-                                                             torch.linalg.matrix_norm( X2t @ torch.linalg.inv(X4), 2)))
+        eta_1 = torch.linalg.matrix_norm(torch.linalg.inv(X1) @ X2t.to(torch.complex64), ord=2)
+        eta_2 = torch.linalg.matrix_norm(X2t @ torch.linalg.inv(X4), ord=2)
 
-        X2 = (1/eta) * X2t
+        eta = torch.maximum(torch.maximum(eta_1, eta_2), torch.tensor(1.0))
+
+        X2 = X2t/eta
 
         B = torch.linalg.inv(Q) @ X2[:nx, :nu].to(torch.complex64)
         C = torch.conj(X2[-nx:, -ny:]).T.to(torch.complex64)
-        D = self.D
+        D = X4_offdiagonal.T
 
         return A, B, C, D
 
