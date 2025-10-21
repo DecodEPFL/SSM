@@ -358,8 +358,7 @@ class SSMConfig:
     ff: str = "MLP"  # non-linear block used in the scaffolding
     scale: float = 1  # Lipschitz constant of the Lipschitz bounded MLP (LMLP)
     dim_amp: int = 4  # controls the hidden layer's dimension of the MLP
-    param: str = None  # set this to true if you want to use the L2RU parametrization for the SSM. If set to false,
-    # the complex diagonal parametrization of the LRU will be used instead.
+    param: str = None  # pick the parametrization you want to use for the LRU
     gamma: float = None  # set the overall l2 gain value in case you want to keep it fixed and not trainable, if set to
     # None, the gain will be trainable.
     init: str = 'eye'  # controls the initialization of the parameters when the L2RU param is chosen.
