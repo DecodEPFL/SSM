@@ -52,7 +52,7 @@ cfg = {
     "max_phase": math.pi / 50,
     "r_min": 0.7,
     "r_max": 0.98,
-    "d_amp": 1,
+    "d_amp": 8,
     "param": 'l2ru',
     "gamma": None,
     "init": 'rand'
