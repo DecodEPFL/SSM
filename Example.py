@@ -11,7 +11,7 @@ from tqdm import tqdm
 from SSM.ssm import DeepSSM, SSMConfig
 import control
 
-seed = 9
+seed = 55
 torch.manual_seed(seed)
 
 dtype = torch.float
@@ -52,10 +52,10 @@ cfg = {
     "max_phase": math.pi / 50,
     "r_min": 0.7,
     "r_max": 0.98,
-    "d_amp": 7,
-    "param": 'zak',
+    "d_amp": 1,
+    "param": 'l2ru',
     "gamma": None,
-    "init": 'eye'
+    "init": 'rand'
 }
 cfg = Namespace(**cfg)
 
@@ -80,7 +80,7 @@ model = DeepSSM(cfg.n_u, cfg.n_y, config)
 
 
 # Configure optimizer
-opt = torch.optim.Adam(model.parameters(), lr=2e-3)
+opt = torch.optim.Adam(model.parameters(), lr=1e-3)
 opt.zero_grad()
 
 total_params = sum(p.numel() for p in model.parameters())
@@ -94,7 +94,7 @@ lowest_loss = float('inf')  # Initialize with a very large value
 best_model_path = "best_model.pth"
 LOSS = []
 
-epochs = 3590  # Train loop
+epochs = 4590  # Train loop
 for itr in tqdm(range(epochs)):
     yRNN, _ = model(u, mode="scan")
     yRNN = torch.squeeze(yRNN)
