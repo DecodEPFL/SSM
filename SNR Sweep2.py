@@ -116,7 +116,7 @@ if __name__ == "__main__":
         "max_phase": math.pi / 50,
         "r_min": 0.7,
         "r_max": 0.98,
-        "param": 'zak',
+        "param": 'l2ru',
         "gamma": 10,
         "init": 'eye'
     }

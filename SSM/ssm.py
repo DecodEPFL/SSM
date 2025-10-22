@@ -211,53 +211,93 @@ class LRU(nn.Module):
 class LRU_Robust(jit.ScriptModule):
     """ Implements a Linear Recurrent Unit (LRU) with trainable or prescribed l2 gain gamma. """
 
-    def __init__(self, state_features: int, gamma: float = None, init='eye', eye_scale=0.01, rand_scale=1):
+    def __init__(self, state_features: int, gamma: float = None, init='eye', q: int = 1, eye_scale=0.01, rand_scale=1):
         super().__init__()
         self.state_features = state_features
-        if gamma is not None:  # in this case the l2 gain of the system is fixed
+        if gamma is not None:
             self.gamma = torch.tensor(gamma)
-        else:  # in this case the l2 gain is learnable (default)
+        else:
             self.gamma = nn.Parameter(torch.tensor(2.2))
-        # initialize the internal state (will be resized per-batch at first forward)
+
         self.state = torch.zeros(state_features)
         self.register_buffer('ID', torch.eye(state_features))
-        self.alpha = nn.Parameter(torch.tensor(4.1))  # controls the initialization of the matrix A:
-        self.epsilon = nn.Parameter(torch.tensor(-99.9))  # Regularization
-        self.Skew = nn.Parameter(0.01 * torch.randn(state_features, state_features))
-        # Trainable parameters (depending on initalization)
+        self.alpha = nn.Parameter(torch.tensor(4.1))
+        self.epsilon = nn.Parameter(torch.tensor(-3.9))
+        self.q = q
+
+        # Store upper triangular indices for efficient computation
+        self.register_buffer('triu_indices', torch.triu_indices(state_features, state_features, offset=1))
+        self.register_buffer('tril_indices', torch.tril_indices(state_features, state_features, offset=0))
+
         n = state_features
+
         if init == 'eye':
-            X11_init = eye_scale * torch.eye(n)
-            X22_init = eye_scale * torch.eye(n)
+            # Initialize with identity-like structure
+            X11_full = eye_scale * torch.eye(n)
+            X22_full = eye_scale * torch.eye(n)
             X21_init = 0.1 * torch.eye(n)
         elif init == 'rand':
-            X11_init = rand_scale * torch.randn(n, n)
-            X22_init = rand_scale * torch.randn(n, n)
+            X11_full = rand_scale * torch.randn(n, n)
+            X22_full = rand_scale * torch.randn(n, n)
             X21_init = rand_scale * torch.randn(n, n)
         else:
             raise ValueError(init)
 
-        # create parameters once with chosen init
-        self.X11 = nn.Parameter(X11_init)
-        self.X22 = nn.Parameter(X22_init)
+        # Extract lower triangular elements as parameters
+        X11_params = X11_full[self.tril_indices[0], self.tril_indices[1]]
+        X22_params = X22_full[self.tril_indices[0], self.tril_indices[1]]
+
+        self.X11_params = nn.Parameter(X11_params)
+        self.X22_params = nn.Parameter(X22_params)
+
+        # For Skew: store only upper triangular parameters (excluding diagonal)
+        if q == 1:
+            Skew_init = 0.01 * torch.randn(n, n)
+            Skew_init = Skew_init - Skew_init.T  # Make it skew-symmetric
+            Skew_params = Skew_init[self.triu_indices[0], self.triu_indices[1]]
+            self.Skew_params = nn.Parameter(Skew_params)
+
+        # Other parameters
         self.X21 = nn.Parameter(X21_init)
         self.C = nn.Parameter(torch.eye(state_features))
         self.Dt = nn.Parameter(torch.eye(state_features))
 
         # Initialize remaining LTI matrices
-        self.A = torch.zeros(state_features)
-        self.B = torch.zeros(state_features)
-        self.D = torch.zeros(state_features)
+        self.A = torch.zeros(state_features, state_features)
+        self.B = torch.zeros(state_features, state_features)
+        self.D = torch.zeros(state_features, state_features)
 
-    #@jit.script_method
+    def _get_lower_triangular(self, params: torch.Tensor) -> torch.Tensor:
+        """Reconstruct lower triangular matrix from parameters"""
+        L = torch.zeros(self.state_features, self.state_features,
+                        device=params.device, dtype=params.dtype)
+        L[self.tril_indices[0], self.tril_indices[1]] = params
+        return L
+
+    def _get_skew_symmetric(self, params: torch.Tensor) -> torch.Tensor:
+        """Reconstruct skew-symmetric matrix from parameters"""
+        Sk = torch.zeros(self.state_features, self.state_features,
+                         device=params.device, dtype=params.dtype)
+        Sk[self.triu_indices[0], self.triu_indices[1]] = params
+        Sk[self.triu_indices[1], self.triu_indices[0]] = -params
+        return Sk
+
+    # @jit.script_method
     def set_param(self):
+        # Reconstruct parametrized matrices
+        X11 = self._get_lower_triangular(self.X11_params)
+        X22 = self._get_lower_triangular(self.X22_params)
+
+        if self.q == 1:
+            Sk = self._get_skew_symmetric(self.Skew_params)
+            Q = (self.ID - Sk) @ torch.linalg.inv(self.ID + Sk)
+        else:
+            Q = self.ID  # No skew-symmetric part
+
         # Parameter update for l2 gain (free param)
         gamma = self.gamma
+
         # Auxiliary Parameters
-        X11 = self.X11
-        X22 = self.X22
-        Sk = self.Skew - self.Skew.T
-        Q = (self.ID - Sk) @ torch.linalg.inv(self.ID + Sk)
         Z = self.X21 @ self.X21.T + X22 @ X22.T + self.Dt.T @ self.Dt + torch.exp(self.epsilon) * self.ID
         beta = gamma ** 2 * torch.sigmoid(self.alpha) / torch.linalg.matrix_norm(Z, 2)
         H11 = X11 @ X11.T + self.C.T @ self.C + beta * torch.exp(self.epsilon) * self.ID
@@ -279,62 +319,41 @@ class LRU_Robust(jit.ScriptModule):
 
         return A, B, C, D
 
-    def forward(self, input: torch.Tensor, state=None, mode: str = "loop") -> tuple[torch.Tensor, torch.Tensor]:
-        """ Forward for LRU_Robust.
-        Args:
-            input: (B, L, H) inputs where H == state_features
-            state: optional initial state of shape (B, N). If not provided, self.state is used.
-            mode: "loop" (sequential, TorchScript-safe) or "scan" (use compute_linear_recurrence_parallel)
-        Returns:
-            output: (B, L, H)
-            states: (B, L, H) (states after each input, i.e., x_{1..L})
-        """
-        # Normalize input shape
+    def forward(self, input: torch.Tensor, state=None, mode: str = "loop") -> tuple:
         if input.dim() == 1:
-            input = input.unsqueeze(0).unsqueeze(0)  # (1,1,H)
+            input = input.unsqueeze(0).unsqueeze(0)
         elif input.dim() == 2:
-            input = input.unsqueeze(0)  # (1, L, H)
+            input = input.unsqueeze(0)
         batch_size = input.shape[0]
         L = input.shape[1]
         N = self.state_features
-        # Ensure stored state has a batch dimension and correct device/dtype
-        # Initialize state if needed
+
         if self.state.shape[0] != batch_size:
             self.state = torch.zeros(batch_size, self.state_features, device=input.device)
         x0 = self.state
         A, B, C, D = self.set_param()
+
         if mode == "scan":
-            # Use the parallel scan implementation
-            # Adjust input to (L, B, N)
             u = input.permute(1, 0, 2)
-            states = compute_linear_recurrence_parallel(A, B, u, x0)  # (L, B, N)
-            states = states.permute(1, 0, 2)  # (B, L, N)
-            # update stored state to last state (detach to avoid retaining history)
+            states = compute_linear_recurrence_parallel(A, B, u, x0)
+            states = states.permute(1, 0, 2)
             last_state = states[:, -1, :].detach()
             self.state = last_state
-            # outputs: y_t = C x_t + D u_t
             outputs = torch.matmul(states, C.transpose(-1, -2)) + torch.matmul(input, D.transpose(-1, -2))
             return outputs, states
         else:
-            # fallback sequential loop (TorchScript-safe)
-            # ensure x is (B, N)
             x = x0
             states_list = []
-            for u_step in input.split(1, dim=1):  # iterate over time steps
-                u = u_step.squeeze(1)  # (B, N)
-                # x_{k+1} = A x_k + B u_k
+            for u_step in input.split(1, dim=1):
+                u = u_step.squeeze(1)
                 x = torch.matmul(x, A.transpose(-1, -2)) + torch.matmul(u, B.transpose(-1, -2))
                 states_list.append(x)
-            states = torch.stack(states_list, dim=1)  # (B, L, N)
-            # update stored state (detach)
+            states = torch.stack(states_list, dim=1)
             self.state = states[:, -1, :].detach()
             outputs = torch.matmul(states, C.transpose(-1, -2)) + torch.matmul(input, D.transpose(-1, -2))
             return outputs, states
 
     def reset(self, batch_size: int = 1, device: torch.device = None):
-        """ Reset the internal state. By default resets to a single zero state vector.
-        If you need per-batch reset, pass batch_size and device.
-        """
         if device is None:
             device = torch.device('cpu')
         self.state = torch.zeros(batch_size, self.state_features, device=device)
