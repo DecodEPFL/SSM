@@ -55,7 +55,7 @@ cfg = {
     "d_amp": 8,
     "param": 'l2ru',
     "gamma": None,
-    "init": 'rand'
+    "init": 'eye'
 }
 cfg = Namespace(**cfg)
 
