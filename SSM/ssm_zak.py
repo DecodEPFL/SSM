@@ -27,7 +27,7 @@ class LRUZ(jit.ScriptModule):
         if gamma is not None:  # in this case the l2 gain of the system is fixed
             self.gamma = torch.tensor(gamma)
         else:  # in this case the l2 gain is learnable (default)
-            self.gamma = nn.Parameter(torch.tensor(1.6))
+            self.gamma = nn.Parameter(torch.tensor(2.2))
         # initialize the internal state (will be resized per-batch at first forward)
         self.state = torch.tensor(0.0)
         self.register_buffer('ID', torch.eye(state_features))
@@ -118,6 +118,12 @@ class LRUZ(jit.ScriptModule):
         return A, B, C, D
 
     def forward_loop(self, input, state=None):
+
+        if input.dim() == 1:
+            input = input.unsqueeze(0).unsqueeze(0)
+        elif input.dim() == 2:
+            input = input.unsqueeze(0)
+
         batch_size, seq_len, _ = input.shape
 
         # State management
@@ -163,6 +169,12 @@ class LRUZ(jit.ScriptModule):
                 - (B, L, H_out) output sequence.
                 - (B, L, N) sequence of internal states.
         """
+
+        if input.dim() == 1:
+            input = input.unsqueeze(0).unsqueeze(0)
+        elif input.dim() == 2:
+            input = input.unsqueeze(0)
+
         batch_size, seq_len, _ = input.shape
         A, B, C, D = self.set_param()
         lambdas = torch.diagonal(A)
@@ -197,7 +209,7 @@ class LRUZ(jit.ScriptModule):
         output = (inner_states @ C.mT).real + input @ D.T
         return output, inner_states
 
-    def forward(self, input, gamma=None, state=None, mode="loop"):
+    def forward(self, input, gamma=None, state=None, mode="scan"):
         if mode == "scan":
             return self.forward_scan(input, self.state)
         elif mode in ["loop", "loop_efficient"]:
