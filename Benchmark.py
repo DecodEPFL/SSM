@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from tqdm import tqdm
 import logging
 import math
+from SSM.utility import SimpleLSTM
 
 from SSM.ssm import DeepSSM, SSMConfig
 
@@ -23,8 +24,8 @@ class TrainingConfig:
     """Configuration for training parameters."""
     learning_rate: float = 1e-3
     batch_size: int = 32
-    num_epochs: int = 22590
-    seed: int = 66
+    num_epochs: int = 8590
+    seed: int = 9
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     num_workers: int = 4
     pin_memory: bool = True
@@ -46,13 +47,13 @@ class ModelConfig:
     d_model: int = 16
     d_state: int = 11
     n_layers: int = 1
-    ff: str = "MLP"  # GLU | MLP | LMLP
+    ff: str = "LMLP"  # GLU | MLP | LMLP
     max_phase: float = math.pi / 50
     r_min: float = 0.7
     r_max: float = 0.98
     d_amp: int = 8
-    param: str = 'zak'
-    gamma: Optional[float] = None
+    param: str = 'l2ru'
+    gamma: Optional[float] = 2
     init: str = 'rand'
 
     def to_ssm_config(self) -> SSMConfig:
@@ -223,7 +224,7 @@ class SystemIDTrainer:
         y = y.to(self.device)
 
         # Forward pass
-        y_pred, _ = self.model(u, mode="scan")
+        y_pred, _ = self.model(u)
         y_pred = y_pred.squeeze()
         y = y.squeeze()
 
@@ -565,7 +566,7 @@ def main():
     """Main training function."""
 
     # Set random seeds for reproducibility
-    seed = 66
+    seed = 9
     torch.manual_seed(seed)
     np.random.seed(seed)
     if torch.cuda.is_available():
@@ -573,8 +574,8 @@ def main():
         torch.backends.cudnn.deterministic = True
 
     # Initialize configurations
-    model_config = ModelConfig()
-    train_config = TrainingConfig()
+    model_config = ModelConfig(param='l2ru', d_model=6, d_state=7, gamma=None, ff='MLP', init='eye', n_layers=1, d_amp=19)
+    train_config = TrainingConfig(num_epochs=5000)
 
     # Load data
     print("Loading data...")
@@ -584,6 +585,12 @@ def main():
     print("Building model...")
     ssm_config = model_config.to_ssm_config()
     model = DeepSSM(model_config.n_u, model_config.n_y, ssm_config)
+
+    # Try RNN
+    #model = SimpleLSTM(hidden_dim=32)
+
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Number of parameters: {total_params}")
 
     # Initialize trainer
     trainer = SystemIDTrainer(model, train_config)

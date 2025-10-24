@@ -228,7 +228,7 @@ class LRU_Robust(jit.ScriptModule):
         self.state = torch.zeros(state_features)
         self.register_buffer('ID', torch.eye(state_features))
         self.alpha = nn.Parameter(torch.tensor(4.1))
-        self.epsilon = torch.tensor(-3.0)
+        self.epsilon = torch.tensor(-.0)
         self.q = q
 
         # Store upper triangular indices for efficient computation
@@ -421,7 +421,7 @@ class LMLP(nn.Module):
         # Pre-compute hidden dimension for efficiency
         hidden_dim = config.dim_amp * config.d_model
 
-        # More efficient layer construction using list comprehension
+        # Layer construction using list comprehension
         layers = [
             FirstChannel(config.d_model, scale=config.scale),
             SandwichFc(config.d_model, hidden_dim, bias=False, scale=config.scale),
@@ -527,7 +527,7 @@ class DeepSSM(nn.Module):
 
         self.blocks = nn.ModuleList([SSL(config) for _ in range(config.n_layers)])
 
-    def forward(self, u, state=None, gamma=None, mode="loop"):
+    def forward(self, u, state=None, gamma=None, mode="scan"):
         """
             Initial pre-processing common to all methods.
         """
