@@ -7,6 +7,7 @@ from SSM.scan_utils import associative_scan, binary_operator_diag, compute_linea
 import torch.jit as jit
 from SSM.L_bounded_MLPs import FirstChannel, SandwichFc, SandwichLin
 from .ssm_zak import LRUZ
+from deel import torchlip
 
 """ Linear Recurrent Units ----------------------------------------- """
 
@@ -411,6 +412,34 @@ class MLP(nn.Module):
         x = self.c_proj(x)
         return self.dropout(x)
 
+class TLIP(nn.Module):
+    """ Standard MLP with Lipschitz-bounded layers """
+
+    def __init__(self, config: SSMConfig):
+        super().__init__()
+        # Pre-compute hidden dimension for efficiency
+        self.hidden_dim = config.dim_amp * config.d_model
+        layers = torchlip.Sequential(
+    # First layer: input_dim -> hidden_dims[0]
+    torchlip.SpectralLinear(config.d_model, self.hidden_dim ),
+    torchlip.GroupSort2(2),  # GroupSort activation (more expressive than ReLU)
+
+    # Hidden layers
+    torchlip.SpectralLinear(self.hidden_dim , self.hidden_dim ),
+    torchlip.GroupSort2(2),
+
+    torchlip.SpectralLinear(self.hidden_dim , self.hidden_dim ),
+    torchlip.GroupSort2(2),
+
+    # Output layer: hidden_dims[-1] -> output_dim
+    torchlip.SpectralLinear(self.hidden_dim , config.d_model)
+)
+        self.model = nn.Sequential(*layers)
+
+    def forward(self, x):
+        x = self.model(x)
+        return x
+
 
 class LMLP(nn.Module):
     """ Implements a Lipschitz.-bounded MLP with sandwich layers. The square root
@@ -485,7 +514,8 @@ class SSL(nn.Module):
         ff_layers = {
             "GLU": lambda: GLU(config),
             "MLP": lambda: MLP(config),
-            "LMLP": lambda: LMLP(config)
+            "LMLP": lambda: LMLP(config),
+            "TLIP": lambda: TLIP(config)
         }
 
         if config.ff not in ff_layers:

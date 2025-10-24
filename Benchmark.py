@@ -12,6 +12,7 @@ import logging
 import math
 from SSM.utility import SimpleLSTM
 
+
 from SSM.ssm import DeepSSM, SSMConfig
 
 
@@ -574,8 +575,8 @@ def main():
         torch.backends.cudnn.deterministic = True
 
     # Initialize configurations
-    model_config = ModelConfig(param='l2ru', d_model=6, d_state=7, gamma=None, ff='MLP', init='eye', n_layers=1, d_amp=19)
-    train_config = TrainingConfig(num_epochs=5000)
+    model_config = ModelConfig(param='l2ru', d_model=6, d_state=7, gamma=None, ff='TLIP', init='eye', n_layers=2, d_amp=1)
+    train_config = TrainingConfig(num_epochs=5000, learning_rate=1e-4)
 
     # Load data
     print("Loading data...")
