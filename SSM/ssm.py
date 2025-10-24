@@ -195,6 +195,12 @@ class LRU(nn.Module):
         return output, inner_states
 
     def forward(self, input, gamma=None, state=None, mode="loop"):
+
+        if input.dim() == 1:
+            input = input.unsqueeze(0).unsqueeze(0)
+        elif input.dim() == 2:
+            input = input.unsqueeze(0)
+
         if mode == "scan":
             return self.forward_scan(input, self.state)
         elif mode in ["loop", "loop_efficient"]:
@@ -222,7 +228,7 @@ class LRU_Robust(jit.ScriptModule):
         self.state = torch.zeros(state_features)
         self.register_buffer('ID', torch.eye(state_features))
         self.alpha = nn.Parameter(torch.tensor(4.1))
-        self.epsilon = nn.Parameter(torch.tensor(-3.9))
+        self.epsilon = torch.tensor(-3.0)
         self.q = q
 
         # Store upper triangular indices for efficient computation
@@ -292,7 +298,7 @@ class LRU_Robust(jit.ScriptModule):
             Sk = self._get_skew_symmetric(self.Skew_params)
             Q = (self.ID - Sk) @ torch.linalg.inv(self.ID + Sk)
         else:
-            Q = self.ID  # No skew-symmetric part
+            Q = self.ID  # just the identity
 
         # Parameter update for l2 gain (free param)
         gamma = self.gamma
@@ -325,8 +331,6 @@ class LRU_Robust(jit.ScriptModule):
         elif input.dim() == 2:
             input = input.unsqueeze(0)
         batch_size = input.shape[0]
-        L = input.shape[1]
-        N = self.state_features
 
         if self.state.shape[0] != batch_size:
             self.state = torch.zeros(batch_size, self.state_features, device=input.device)
@@ -377,7 +381,8 @@ class SSMConfig:
     ff: str = "MLP"  # non-linear block used in the scaffolding
     scale: float = 1  # Lipschitz constant of the Lipschitz bounded MLP (LMLP)
     dim_amp: int = 4  # controls the hidden layer's dimension of the MLP
-    param: str = None  # pick the parametrization you want to use for the LRU
+    param: str = None  # pick the parametrization you want to use for the LRU. Default = LRU, other options are L2RU
+    # and ZAK
     gamma: float = None  # set the overall l2 gain value in case you want to keep it fixed and not trainable, if set to
     # None, the gain will be trainable.
     init: str = 'eye'  # controls the initialization of the parameters when the L2RU param is chosen.
@@ -464,7 +469,7 @@ class SSL(nn.Module):
         self.ln = nn.LayerNorm(config.d_model, bias=config.bias)
 
         # LRU initialization depending on the chosen architecture
-        if config.param is None:
+        if config.param is None or config.param == "lru":
             self.lru = LRU(in_features=config.d_model, out_features=config.d_model, state_features=config.d_state,
                            rmin=config.rmin, rmax=config.rmax, max_phase=config.max_phase)
         elif config.param == "l2ru":
@@ -473,6 +478,8 @@ class SSL(nn.Module):
             self.lru = LRUZ(input_features=config.d_model, output_features=config.d_model,
                             state_features=config.d_state,
                             rmin=config.rmin, rmax=config.rmax, max_phase=config.max_phase)
+        else:
+            raise ValueError(f"Invalid parametrization")
 
         # Dictionary for layer selection
         ff_layers = {
@@ -524,7 +531,6 @@ class DeepSSM(nn.Module):
         """
             Initial pre-processing common to all methods.
         """
-        batch_size, seq_len, input_dim = u.shape
 
         # Initialize states for all layers if not provided
         if state is None:
@@ -538,8 +544,6 @@ class DeepSSM(nn.Module):
         else:
             output_dim = self.decoder.shape[0]
 
-        # Pre-allocate outputs for better memory efficiency
-        outputs = torch.empty(batch_size, seq_len, output_dim, device=u.device, dtype=u.dtype)
 
         # Process encoder once for the entire input sequence
         if isinstance(self.encoder, nn.Linear):
