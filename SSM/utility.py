@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 
 class SimpleLSTM(nn.Module):
-    def __init__(self, hidden_dim: int):
+    def __init__(self, hidden_dim: int, num_layers: int = 1, bidirectional: bool = False):
         super(SimpleLSTM, self).__init__()
         input_dim = 1   # single input feature
         output_dim = 1  # single output feature
@@ -12,7 +12,8 @@ class SimpleLSTM(nn.Module):
         self.lstm = nn.LSTM(
             input_size=input_dim,
             hidden_size=hidden_dim,
-            num_layers=1,
+            num_layers=num_layers,
+            bidirectional = bidirectional,
             batch_first=True
         )
 
