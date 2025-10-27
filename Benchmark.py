@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from tqdm import tqdm
 import logging
 import math
+import nonlinear_benchmarks
+from nonlinear_benchmarks.error_metrics import RMSE, NRMSE, R_squared, MAE, fit_index
 from SSM.utility import SimpleLSTM
 
 
@@ -240,11 +242,12 @@ class SystemIDTrainer:
         return loss.item()
 
     @torch.no_grad()
-    def validate(self, u: torch.Tensor, y: torch.Tensor) -> float:
+    def validate(self, u: torch.Tensor, y: torch.Tensor, n: int = 50) -> float:
         """
         Validate the model.
 
         Args:
+            n: Initialization window length
             u: Input tensor
             y: Target tensor
 
@@ -263,7 +266,7 @@ class SystemIDTrainer:
         y = y.squeeze()
 
         # Compute loss
-        loss = self.criterion(y_pred, y)
+        loss = self.criterion(y_pred[n:], y[n:])
 
         return loss.item()
 
@@ -575,12 +578,24 @@ def main():
         torch.backends.cudnn.deterministic = True
 
     # Initialize configurations
-    model_config = ModelConfig(param='l2ru', d_model=6, d_state=7, gamma=None, ff='TLIP', init='eye', n_layers=2, d_amp=1)
-    train_config = TrainingConfig(num_epochs=5000, learning_rate=1e-4)
+    model_config = ModelConfig(param='l2ru', d_model=12, d_state=11, gamma=None, ff='GLU', init='eye',
+                               n_layers=3, d_amp=3)
+    train_config = TrainingConfig(num_epochs=10000, learning_rate=1e-4)
 
     # Load data
     print("Loading data...")
-    u_train, y_train, u_val, y_val = load_mat_data('dataBenchmark.mat')
+
+    train_val, test = nonlinear_benchmarks.Cascaded_Tanks()
+    print(test.state_initialization_window_length)  # = 50
+    u_train, y_train = train_val
+    u_val, y_val = test
+    # Convert to torch tensors and reshape to (N, 1)
+    u_train = torch.tensor(u_train, dtype=torch.float32).unsqueeze(-1)
+    y_train = torch.tensor(y_train, dtype=torch.float32).unsqueeze(-1)
+    u_val = torch.tensor(u_val, dtype=torch.float32).unsqueeze(-1)
+    y_val = torch.tensor(y_val, dtype=torch.float32).unsqueeze(-1)
+
+    #u_train, y_train, u_val, y_val = load_mat_data('dataBenchmark.mat')
 
     # Build model
     print("Building model...")
@@ -588,21 +603,35 @@ def main():
     model = DeepSSM(model_config.n_u, model_config.n_y, ssm_config)
 
     # Try RNN
-    #model = SimpleLSTM(hidden_dim=32)
+    #model = SimpleLSTM(hidden_dim=32, bidirectional=False, num_layers=2)
 
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Number of parameters: {total_params}")
 
     # Initialize trainer
-    trainer = SystemIDTrainer(model, train_config)
+    trainer = SystemIDTrainer(model, train_config, criterion=nn.MSELoss())
 
     # Train model
     history = trainer.fit(u_train, y_train, u_val, y_val, use_early_stopping=False)
 
+    # load best model if available
+    best_path = train_config.save_dir / "best_model.pth"
+    if best_path.exists():
+        print(f"Loading best checkpoint from {best_path}")
+        trainer.load_checkpoint(str(best_path))
+    else:
+        print("No best_model.pth found — using final model")
+
     # Generate predictions
-    print("Generating predictions...")
+    print("Generating predictions and print best RMSE...")
     y_train_pred = trainer.predict(u_train)
     y_val_pred = trainer.predict(u_val)
+    n = test.state_initialization_window_length
+
+    RMSE_result = RMSE(test.y[n:], y_val_pred[n:].cpu().detach().numpy())  # skip the first n
+    print(RMSE_result)  # report this number
+
+
 
     # Visualize results
     print("Creating visualizations...")
@@ -626,6 +655,8 @@ def main():
     loss_file = train_config.save_dir / "loss_history.npy"
     np.save(loss_file, np.array(history['train_losses']))
     print(f"Saved loss history to {loss_file}\n")
+
+
 
 
 if __name__ == "__main__":
