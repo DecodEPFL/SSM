@@ -577,11 +577,6 @@ def main():
         torch.cuda.manual_seed(seed)
         torch.backends.cudnn.deterministic = True
 
-    # Initialize configurations
-    model_config = ModelConfig(param='l2ru', d_model=12, d_state=11, gamma=None, ff='GLU', init='eye',
-                               n_layers=3, d_amp=3)
-    train_config = TrainingConfig(num_epochs=10000, learning_rate=1e-4)
-
     # Load data
     print("Loading data...")
 
@@ -595,7 +590,11 @@ def main():
     u_val = torch.tensor(u_val, dtype=torch.float32).unsqueeze(-1)
     y_val = torch.tensor(y_val, dtype=torch.float32).unsqueeze(-1)
 
-    #u_train, y_train, u_val, y_val = load_mat_data('dataBenchmark.mat')
+
+    # Initialize configurations
+    model_config = ModelConfig(n_u= u_train.shape[1], n_y= y_train.shape[1], param='zak', d_model=12, d_state=11, gamma=None, ff='GLU', init='eye',
+                               n_layers=3, d_amp=3)
+    train_config = TrainingConfig(num_epochs=50000, learning_rate=1e-4)
 
     # Build model
     print("Building model...")
@@ -604,6 +603,7 @@ def main():
 
     # Try RNN
     #model = SimpleLSTM(hidden_dim=32, bidirectional=False, num_layers=2)
+
 
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Number of parameters: {total_params}")

@@ -178,15 +178,15 @@ def parallel_scan_affine(M: torch.Tensor, v: torch.Tensor):
     while offset < n:
         # slice left = M_p[offset:]  (length n-offset)
         # slice right = M_p[:n-offset] (length n-offset)
-        left = M_p[offset:].clone()   # shape (n-offset, batch, D, D)
+        left = M_p[offset:].clone()  # shape (n-offset, batch, D, D)
         right = M_p[: n - offset].clone()
         # new_M[i] for i >= offset equals left[i-offset] @ right[i-offset]
         new_M_tail = torch.matmul(left, right)  # (n-offset, batch, D, D)
 
         # For v: new_v[i] = left[i-offset] @ v_p[i-offset] + v_p[i]
-        right_v = v_p[: n - offset].unsqueeze(-1).clone()   # (n-offset, batch, D, 1)
-        transformed = torch.matmul(left, right_v).squeeze(-1)   # (n-offset, batch, D)
-        new_v_tail = transformed + v_p[offset:].clone()        # (n-offset, batch, D)
+        right_v = v_p[: n - offset].unsqueeze(-1).clone()  # (n-offset, batch, D, 1)
+        transformed = torch.matmul(left, right_v).squeeze(-1)  # (n-offset, batch, D)
+        new_v_tail = transformed + v_p[offset:].clone()  # (n-offset, batch, D)
 
         # Reconstruct full arrays without in-place overlapping writes
         if offset == 0:

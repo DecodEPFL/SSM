@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 class SimpleLSTM(nn.Module):
     def __init__(self, hidden_dim: int, num_layers: int = 1, bidirectional: bool = False):
@@ -26,3 +27,6 @@ class SimpleLSTM(nn.Module):
         out, (h_n, c_n) = self.lstm(x, hidden)
         y = self.fc(out)  # shape: (batch_size, seq_len, output_dim)
         return y, (h_n, c_n)
+
+
+
