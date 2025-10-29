@@ -2,11 +2,10 @@ import math
 from dataclasses import dataclass
 import torch
 import torch.nn as nn
-from collections import OrderedDict
 from SSM.scan_utils import associative_scan, binary_operator_diag, compute_linear_recurrence_parallel
 import torch.jit as jit
 from SSM.L_bounded_MLPs import FirstChannel, SandwichFc, SandwichLin
-from .ssm_zak import LRUZ
+from .ssm_zak import lruz
 from deel import torchlip
 
 """ Linear Recurrent Units ----------------------------------------- """
@@ -117,13 +116,8 @@ class LRU(nn.Module):
 
         return tuple(ss_real_params)
 
-    def forward_loop(self, input, state=None):
+    def forward_loop(self, input, state):
         batch_size, seq_len, _ = input.shape
-
-        # State management
-        if self.state is None or self.state.shape[0] != batch_size:
-            self.state = torch.zeros(batch_size, self.state_features,
-                                     device=input.device, dtype=torch.complex64)
 
         lambdas, B, C, D = self.ss_params()
 
@@ -136,7 +130,7 @@ class LRU(nn.Module):
                                    device=input.device, dtype=torch.complex64)
 
         # Vectorized state updates
-        current_state = self.state
+        current_state = state
         for t, u_step in enumerate(input_B_dtype.unbind(dim=1)):
             inner_states[:, t] = current_state
             current_state = lambdas * current_state + u_step @ B_T
@@ -149,7 +143,7 @@ class LRU(nn.Module):
         return output, inner_states
 
     @torch.compiler.disable
-    def forward_scan(self, input, state=None):
+    def forward_scan(self, input, state = None):
         """
         Computes the LRU output using a parallel scan.
 
@@ -164,11 +158,6 @@ class LRU(nn.Module):
         """
         batch_size, seq_len, _ = input.shape
         lambdas, B, C, D = self.ss_params()
-
-        # If no initial state is provided, initialize it to zeros.
-        if self.state is None or self.state.shape[0] != batch_size:
-            self.state = torch.zeros(batch_size, self.state_features,
-                                     device=input.device, dtype=torch.complex64)
 
         # Pre-compute input transformation
         Bu_elements = input.to(B.dtype) @ B.mT
@@ -201,6 +190,15 @@ class LRU(nn.Module):
             input = input.unsqueeze(0).unsqueeze(0)
         elif input.dim() == 2:
             input = input.unsqueeze(0)
+        elif input.dim() > 3:
+            raise ValueError(f"Invalid input dimensions {input.dim()}, expected 1, 2, or 3.")
+
+        if state is not None:
+            self.state = state
+        else:
+            self.state = torch.zeros(input.shape[0], self.state_features, device=input.device, dtype=torch.complex64)
+
+        # forward pass
 
         if mode == "scan":
             return self.forward_scan(input, self.state)
@@ -210,7 +208,7 @@ class LRU(nn.Module):
             raise ValueError(f"Unknown mode: {mode}. Expected 'scan', 'loop', or 'loop_efficient'.")
 
     def reset(self):
-        self.state = None  # reset the SSM state to the initial value
+        self.state = None
 
     """ L2RU parametrization: Implements a Linear Recurrent Unit (LRU) with trainable or prescribed l2 gain gamma. """
 
@@ -326,42 +324,47 @@ class LRU_Robust(jit.ScriptModule):
 
         return A, B, C, D
 
-    def forward(self, input: torch.Tensor, state=None, mode: str = "loop") -> tuple:
+    def forward(self, input: torch.Tensor, state = None, set_param: bool = True, mode: str = "scan") -> tuple:
         if input.dim() == 1:
             input = input.unsqueeze(0).unsqueeze(0)
         elif input.dim() == 2:
             input = input.unsqueeze(0)
-        batch_size = input.shape[0]
+        elif input.dim() > 3:
+            raise ValueError(f"Invalid input dimensions {input.dim()}, expected 1, 2, or 3.")
 
-        if self.state.shape[0] != batch_size:
-            self.state = torch.zeros(batch_size, self.state_features, device=input.device)
+        if state is not None:
+            self.state = state
+        else:
+            self.state = torch.zeros(input.shape[0], self.state_features, device=input.device)
+
         x0 = self.state
-        A, B, C, D = self.set_param()
+        if set_param: # update parameters call, it can be disabled when doing step call to the forward and put
+            # in the training script instead
+             self.set_param()
 
         if mode == "scan":
             u = input.permute(1, 0, 2)
-            states = compute_linear_recurrence_parallel(A, B, u, x0)
+            states = compute_linear_recurrence_parallel(self.A, self.B, u, x0)
             states = states.permute(1, 0, 2)
             last_state = states[:, -1, :].detach()
             self.state = last_state
-            outputs = torch.matmul(states, C.transpose(-1, -2)) + torch.matmul(input, D.transpose(-1, -2))
+            outputs = torch.matmul(states, self.C.transpose(-1, -2)) + torch.matmul(input, self.D.transpose(-1, -2))
             return outputs, states
         else:
             x = x0
             states_list = []
             for u_step in input.split(1, dim=1):
                 u = u_step.squeeze(1)
-                x = torch.matmul(x, A.transpose(-1, -2)) + torch.matmul(u, B.transpose(-1, -2))
+                x = torch.matmul(x, self.self.A.transpose(-1, -2)) + torch.matmul(u, self.B.transpose(-1, -2))
                 states_list.append(x)
             states = torch.stack(states_list, dim=1)
             self.state = states[:, -1, :].detach()
-            outputs = torch.matmul(states, C.transpose(-1, -2)) + torch.matmul(input, D.transpose(-1, -2))
+            outputs = torch.matmul(states, self.C.transpose(-1, -2)) + torch.matmul(input, self.D.transpose(-1, -2))
             return outputs, states
 
-    def reset(self, batch_size: int = 1, device: torch.device = None):
-        if device is None:
-            device = torch.device('cpu')
-        self.state = torch.zeros(batch_size, self.state_features, device=device)
+    def reset(self):
+        self.state = None
+
 
 
 """ SSM models ----------------------------------------- """
@@ -504,7 +507,7 @@ class SSL(nn.Module):
         elif config.param == "l2ru":
             self.lru = LRU_Robust(state_features=config.d_model, init=config.init)
         elif config.param == "zak":
-            self.lru = LRUZ(input_features=config.d_model, output_features=config.d_model,
+            self.lru = lruz(input_features=config.d_model, output_features=config.d_model,
                             state_features=config.d_state,
                             rmin=config.rmin, rmax=config.rmax, max_phase=config.max_phase)
         else:
@@ -568,13 +571,6 @@ class DeepSSM(nn.Module):
         else:
             layer_states = state if isinstance(state, list) else [state] * len(self.blocks)
 
-        # Pre-allocate output tensor with correct dimensions
-        if isinstance(self.decoder, nn.Linear):
-            output_dim = self.decoder.out_features
-        else:
-            output_dim = self.decoder.shape[0]
-
-
         # Process encoder once for the entire input sequence
         if isinstance(self.encoder, nn.Linear):
             x = self.encoder(u)  # (B, L, d_model)
@@ -628,7 +624,7 @@ class PureLRUR(nn.Module):
         if param == 'l2ru':  # In this case the LTI system is necessarily square
             self.lru = LRU_Robust(state_features=n, gamma=gamma, init=init)
         elif param == 'zak':  # Can handle non-square LTI systems
-            self.lru = LRUZ(input_features=n, output_features=n, state_features=n, gamma=gamma)
+            self.lru = lruz(input_features=n, output_features=n, state_features=n, gamma=gamma)
 
     def forward(self, x, mode: str = "scan"):
         y, st = self.lru(x, mode=mode)
