@@ -592,7 +592,7 @@ def main():
 
 
     # Initialize configurations
-    model_config = ModelConfig(n_u= u_train.shape[1], n_y= y_train.shape[1], param='zak', d_model=12, d_state=11, gamma=None, ff='GLU', init='eye',
+    model_config = ModelConfig(n_u= u_train.shape[1], n_y= y_train.shape[1], param='l2ru', d_model=12, d_state=11, gamma=None, ff='GLU', init='eye',
                                n_layers=3, d_amp=3)
     train_config = TrainingConfig(num_epochs=6000, learning_rate=1e-4)
 
