@@ -29,4 +29,3 @@ class SimpleLSTM(nn.Module):
         return y, (h_n, c_n)
 
 
-

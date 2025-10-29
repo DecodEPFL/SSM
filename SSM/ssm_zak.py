@@ -4,12 +4,15 @@ import torch.jit as jit
 from SSM.scan_utils import associative_scan, binary_operator_diag, compute_linear_recurrence_parallel
 
 
-class LRUZ(jit.ScriptModule):
+class lruz(jit.ScriptModule):
     """ Implements a Linear Recurrent Unit (LRU) with trainable or prescribed l2 gain gamma. """
 
     def __init__(self, input_features: int, output_features: int, state_features: int, rmin=0.9,
                  rmax=1.0, max_phase=6.283, gamma: float = None):
         super().__init__()
+        self.A = torch.empty(2)
+        self.C = torch.empty(2)
+        self.B = torch.empty(2)
         self.state_features = state_features
         self.input_features = input_features
         self.output_features = output_features
@@ -115,28 +118,24 @@ class LRUZ(jit.ScriptModule):
         C = torch.conj(X2[-nx:, -ny:]).T.to(torch.complex64)
         D = X4_offdiagonal.T
 
+        self.A = A
+        self.B = B
+        self.C = C
+        self.D = D
+
         return A, B, C, D
 
-    def forward_loop(self, input, state=None):
-
-        if input.dim() == 1:
-            input = input.unsqueeze(0).unsqueeze(0)
-        elif input.dim() == 2:
-            input = input.unsqueeze(0)
+    def forward_loop(self, input, state=None, set_param: bool = True):
 
         batch_size, seq_len, _ = input.shape
 
-        # State management
-        if self.state is None or self.state.shape[0] != batch_size:
-            self.state = torch.zeros(batch_size, self.state_features,
-                                     device=input.device, dtype=torch.complex64)
-
-        A, B, C, D = self.set_param()
-        lambdas = torch.diagonal(A)
+        if set_param:
+            self.set_param()
+        lambdas = torch.diagonal(self.A)
 
         # State computation using pre-converted input
-        input_B_dtype = input.to(B.dtype)
-        B_T = B.mT  # Cache transpose
+        input_B_dtype = input.to(self.B.dtype)
+        B_T = self.B.mT  # Cache transpose
 
         # Optimized loop with pre-allocated tensor for states
         inner_states = torch.empty(batch_size, seq_len, self.state_features,
@@ -151,12 +150,12 @@ class LRUZ(jit.ScriptModule):
         self.state = current_state.detach()  # Update the internal state
 
         # Output computation using all inner states
-        output = (inner_states @ C.mT).real + input @ D.T
+        output = (inner_states @ self.C.mT).real + input @ self.D.T
 
         return output, inner_states
 
     @torch.compiler.disable
-    def forward_scan(self, input, state=None):
+    def forward_scan(self, input, state=None, set_param: bool = True):
         """
         Computes the LRU output using a parallel scan.
 
@@ -170,19 +169,9 @@ class LRUZ(jit.ScriptModule):
                 - (B, L, N) sequence of internal states.
         """
 
-        if input.dim() == 1:
-            input = input.unsqueeze(0).unsqueeze(0)
-        elif input.dim() == 2:
-            input = input.unsqueeze(0)
-
         batch_size, seq_len, _ = input.shape
         A, B, C, D = self.set_param()
         lambdas = torch.diagonal(A)
-
-        # If no initial state is provided, initialize it to zeros.
-        if self.state is None or len(self.state.shape) != 3:
-            self.state = torch.zeros(batch_size, self.state_features,
-                                     device=input.device, dtype=torch.complex64)
 
         # Pre-compute input transformation
         Bu_elements = input.to(B.dtype) @ B.mT
@@ -209,13 +198,26 @@ class LRUZ(jit.ScriptModule):
         output = (inner_states @ C.mT).real + input @ D.T
         return output, inner_states
 
-    def forward(self, input, gamma=None, state=None, mode="scan"):
+    def forward(self, input, gamma=None, state=None, set_param: bool = True, mode="scan"):
+
+        if input.dim() == 1:
+            input = input.unsqueeze(0).unsqueeze(0)
+        elif input.dim() == 2:
+            input = input.unsqueeze(0)
+        elif input.dim() > 3:
+            raise ValueError(f"Invalid input dimensions {input.dim()}, expected 1, 2, or 3.")
+
+        if state is not None:
+            self.state = state
+        else:
+            self.state = torch.zeros(input.shape[0], self.state_features, device=input.device, dtype=torch.complex64)
+        # forward pass
         if mode == "scan":
-            return self.forward_scan(input, self.state)
+            return self.forward_scan(input, self.state, set_param)
         elif mode in ["loop", "loop_efficient"]:
-            return self.forward_loop(input, self.state)
+            return self.forward_loop(input, self.state, set_param)
         else:
             raise ValueError(f"Unknown mode: {mode}. Expected 'scan', 'loop', or 'loop_efficient'.")
 
     def reset(self):
-        self.state = None  # reset the SSM state to the initial value
+        self.state = None
