@@ -39,7 +39,7 @@ class ControllerModule(nn.Module):
     def __init__(self):
         super().__init__()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
         raise NotImplementedError("Implement forward(x) -> u")
 
 
