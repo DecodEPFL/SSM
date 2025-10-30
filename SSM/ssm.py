@@ -143,7 +143,7 @@ class LRU(nn.Module):
         return output, inner_states
 
     @torch.compiler.disable
-    def forward_scan(self, input, state = None):
+    def forward_scan(self, input, state=None):
         """
         Computes the LRU output using a parallel scan.
 
@@ -213,7 +213,7 @@ class LRU(nn.Module):
     """ L2RU parametrization: Implements a Linear Recurrent Unit (LRU) with trainable or prescribed l2 gain gamma. """
 
 
-class LRU_Robust(jit.ScriptModule):
+class L2RU(jit.ScriptModule):
     """ Implements a Linear Recurrent Unit (LRU) with trainable or prescribed l2 gain gamma. """
 
     def __init__(self, state_features: int, gamma: float = None, init='eye', q: int = 1, eye_scale=0.01, rand_scale=1):
@@ -324,7 +324,7 @@ class LRU_Robust(jit.ScriptModule):
 
         return A, B, C, D
 
-    def forward(self, input: torch.Tensor, state = None, set_param: bool = True, mode: str = "scan") -> tuple:
+    def forward(self, input: torch.Tensor, state=None, set_param: bool = True, mode: str = "scan") -> tuple:
         if input.dim() == 1:
             input = input.unsqueeze(0).unsqueeze(0)
         elif input.dim() == 2:
@@ -338,9 +338,9 @@ class LRU_Robust(jit.ScriptModule):
             self.state = torch.zeros(input.shape[0], self.state_features, device=input.device)
 
         x0 = self.state
-        if set_param: # update parameters call, it can be disabled when doing step call to the forward and put
+        if set_param:  # update parameters call, it can be disabled when doing step call to the forward and put
             # in the training script instead
-             self.set_param()
+            self.set_param()
 
         if mode == "scan":
             u = input.permute(1, 0, 2)
@@ -364,7 +364,6 @@ class LRU_Robust(jit.ScriptModule):
 
     def reset(self):
         self.state = None
-
 
 
 """ SSM models ----------------------------------------- """
@@ -415,6 +414,7 @@ class MLP(nn.Module):
         x = self.c_proj(x)
         return self.dropout(x)
 
+
 class TLIP(nn.Module):
     """ Standard MLP with Lipschitz-bounded layers """
 
@@ -423,20 +423,20 @@ class TLIP(nn.Module):
         # Pre-compute hidden dimension for efficiency
         self.hidden_dim = config.dim_amp * config.d_model
         layers = torchlip.Sequential(
-    # First layer: input_dim -> hidden_dims[0]
-    torchlip.SpectralLinear(config.d_model, self.hidden_dim ),
-    torchlip.GroupSort2(2),  # GroupSort activation (more expressive than ReLU)
+            # First layer: input_dim -> hidden_dims[0]
+            torchlip.SpectralLinear(config.d_model, self.hidden_dim),
+            torchlip.GroupSort2(2),  # GroupSort activation (more expressive than ReLU)
 
-    # Hidden layers
-    torchlip.SpectralLinear(self.hidden_dim , self.hidden_dim ),
-    torchlip.GroupSort2(2),
+            # Hidden layers
+            torchlip.SpectralLinear(self.hidden_dim, self.hidden_dim),
+            torchlip.GroupSort2(2),
 
-    torchlip.SpectralLinear(self.hidden_dim , self.hidden_dim ),
-    torchlip.GroupSort2(2),
+            torchlip.SpectralLinear(self.hidden_dim, self.hidden_dim),
+            torchlip.GroupSort2(2),
 
-    # Output layer: hidden_dims[-1] -> output_dim
-    torchlip.SpectralLinear(self.hidden_dim , config.d_model)
-)
+            # Output layer: hidden_dims[-1] -> output_dim
+            torchlip.SpectralLinear(self.hidden_dim, config.d_model)
+        )
         self.model = nn.Sequential(*layers)
 
     def forward(self, x):
@@ -505,7 +505,7 @@ class SSL(nn.Module):
             self.lru = LRU(in_features=config.d_model, out_features=config.d_model, state_features=config.d_state,
                            rmin=config.rmin, rmax=config.rmax, max_phase=config.max_phase)
         elif config.param == "l2ru":
-            self.lru = LRU_Robust(state_features=config.d_model, init=config.init)
+            self.lru = L2RU(state_features=config.d_model, init=config.init)
         elif config.param == "zak":
             self.lru = lruz(input_features=config.d_model, output_features=config.d_model,
                             state_features=config.d_state,
@@ -531,8 +531,8 @@ class SSL(nn.Module):
         z = x
         # z = self.ln(z)  # pre-norm
 
-        z, st = self.lru(z, state=state, mode=mode)
-        z = self.ff(z)  # MLP, GLU or LMLP
+        z, st = self.lru(z, state=state, mode=mode)  # LTI system
+        z = self.ff(z)  # static non-linearity
         z = self.dropout(z)  # inactive by default
 
         # Residual connection
@@ -622,11 +622,11 @@ class PureLRUR(nn.Module):
     def __init__(self, n: int, gamma: float = None, param: str = 'l2ru', init: str = "eye"):
         super().__init__()
         if param == 'l2ru':  # In this case the LTI system is necessarily square
-            self.lru = LRU_Robust(state_features=n, gamma=gamma, init=init)
+            self.lru = L2RU(state_features=n, gamma=gamma, init=init)
         elif param == 'zak':  # Can handle non-square LTI systems
             self.lru = lruz(input_features=n, output_features=n, state_features=n, gamma=gamma)
 
-    def forward(self, x, mode: str = "scan"):
-        y, st = self.lru(x, mode=mode)
+    def forward(self, x, state=None, mode: str = "scan"):
+        y, st = self.lru(x, state=state, mode=mode)
 
         return y, st

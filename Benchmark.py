@@ -14,7 +14,6 @@ import nonlinear_benchmarks
 from nonlinear_benchmarks.error_metrics import RMSE, NRMSE, R_squared, MAE, fit_index
 from SSM.utility import SimpleLSTM
 
-
 from SSM.ssm import DeepSSM, SSMConfig
 
 
@@ -590,9 +589,9 @@ def main():
     u_val = torch.tensor(u_val, dtype=torch.float32).unsqueeze(-1)
     y_val = torch.tensor(y_val, dtype=torch.float32).unsqueeze(-1)
 
-
     # Initialize configurations
-    model_config = ModelConfig(n_u= u_train.shape[1], n_y= y_train.shape[1], param='l2ru', d_model=12, d_state=11, gamma=None, ff='GLU', init='eye',
+    model_config = ModelConfig(n_u=u_train.shape[1], n_y=y_train.shape[1], param='l2ru', d_model=12, d_state=11,
+                               gamma=None, ff='GLU', init='eye',
                                n_layers=3, d_amp=3)
     train_config = TrainingConfig(num_epochs=6000, learning_rate=1e-4)
 
@@ -603,7 +602,6 @@ def main():
 
     # Try RNN
     #model = SimpleLSTM(hidden_dim=32, bidirectional=False, num_layers=2)
-
 
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Number of parameters: {total_params}")
@@ -631,8 +629,6 @@ def main():
     RMSE_result = RMSE(test.y[n:], y_val_pred[n:].cpu().detach().numpy())  # skip the first n
     print(RMSE_result)  # report this number
 
-
-
     # Visualize results
     print("Creating visualizations...")
     visualizer = Visualizer(
@@ -655,8 +651,6 @@ def main():
     loss_file = train_config.save_dir / "loss_history.npy"
     np.save(loss_file, np.array(history['train_losses']))
     print(f"Saved loss history to {loss_file}\n")
-
-
 
 
 if __name__ == "__main__":
