@@ -1,9 +1,10 @@
 # python
 import math
 from typing import Optional, Tuple, List, Dict
-from src.neural_ssm.ssm.scan_utils import *
-from src.neural_ssm.static_layers.generic_layers import *
-from src.neural_ssm.static_layers.lipschitz_mlps import *
+from .scan_utils import *
+from ..static_layers.generic_layers import *
+from ..static_layers.lipschitz_mlps import *
+
 
 
 # --------- Small utilities (DRY helpers) ---------

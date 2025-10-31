@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from deel import torchlip
-from src.neural_ssm.static_layers.generic_layers import LayerConfig
+from ..static_layers.generic_layers import LayerConfig
 
 
 class TLIP(nn.Module):
