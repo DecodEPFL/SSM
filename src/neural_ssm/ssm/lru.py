@@ -1,27 +1,91 @@
+# python
 import math
-import torch
-from SSM.scan_utils import associative_scan, binary_operator_diag, compute_linear_recurrence_parallel
-import torch.jit as jit
-from src.neural_ssm.layers.generic_layers import *
-from src.neural_ssm.layers.lipschitz_mlps import *
+from typing import Optional, Tuple, List, Dict
+from src.neural_ssm.ssm.scan_utils import *
+from src.neural_ssm.static_layers.generic_layers import *
+from src.neural_ssm.static_layers.lipschitz_mlps import *
+
+
+# --------- Small utilities (DRY helpers) ---------
+
+def _normalize_to_3d(x: torch.Tensor) -> torch.Tensor:
+    # Returns (B, L, H)
+    if x.dim() == 1:
+        return x[None, None, :]
+    if x.dim() == 2:
+        return x[None, :, :]
+    if x.dim() == 3:
+        return x
+    raise ValueError(f"Invalid input dimensions {x.dim()}, expected 1, 2, or 3.")
+
+
+def _init_or_cast_state(
+    state: Optional[torch.Tensor],
+    batch_size: int,
+    n_state: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    if state is not None:
+        return state.to(device=device, dtype=dtype)
+    return torch.zeros(batch_size, n_state, device=device, dtype=dtype)
+
+
+def _scan_diag_linear(lambdas: torch.Tensor, Bu: torch.Tensor, x0: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    # Bu: (B, L, N) already includes the input * B^T. We seed first step with lambdas * x0.
+    B, L, N = Bu.shape
+    Bu = Bu.clone()
+    Bu[:, 0, :] += lambdas * x0
+    lam_seq = lambdas.expand(L, -1)
+
+    def _scan_fn(bu_seq):
+        return associative_scan(binary_operator_diag, (lam_seq, bu_seq))[1]
+
+    scanned = torch.vmap(_scan_fn)(Bu)             # (B, L, N)
+    inner = torch.cat([x0.unsqueeze(1), scanned[:, :-1, :]], dim=1)  # (B, L, N)
+    return scanned, inner
+
+
+def _complex_real_transform_blocks(
+    n: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    cache: Dict[str, torch.Tensor],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    # Cache 2x2 block and its inverse per dtype/device to avoid reallocation
+    key = f"{str(dtype)}@{device.type}:{device.index}"
+    T_key, Ti_key = f"T_{key}", f"Tinv_{key}"
+    if T_key not in cache or Ti_key not in cache:
+        T = torch.tensor([[1, 1], [1j, -1j]], device=device, dtype=dtype)
+        cache[T_key] = T
+        cache[Ti_key] = torch.linalg.inv(T)
+    Tblk = torch.block_diag(*([cache[T_key]] * n))
+    Tiblk = torch.block_diag(*([cache[Ti_key]] * n))
+    return Tblk, Tiblk
+
 
 """ Linear Recurrent Units ----------------------------------------- """
 
 
+# python
 class LRU(nn.Module):
-    """ Linear Recurrent Unit. The LRU is simulated using Parallel Scan (fast!) when
-     "scan" is set to True (default) in the forward pass, otherwise recursively (slow)."""
-
+    """Linear Recurrent Unit with loop or parallel-scan simulation."""
     def __init__(
-            self, in_features: int, out_features: int, state_features: int, internal_state_init=None, rmin=0.9,
-            rmax=1.0, max_phase=6.283
+        self,
+        in_features: int,
+        out_features: int,
+        state_features: int,
+        internal_state_init=None,
+        rmin: float = 0.9,
+        rmax: float = 1.0,
+        max_phase: float = 6.283,
     ):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.state_features = state_features
 
-        # Pre-compute constants for efficiency
+        # Pre-compute scalars
         self._sqrt_in_features = math.sqrt(in_features)
         self._sqrt_2_in_features = math.sqrt(2 * in_features)
         self._sqrt_state_features = math.sqrt(state_features)
@@ -29,10 +93,10 @@ class LRU(nn.Module):
         self._rmin_rmax_sum = rmax + rmin
         self._rmin_squared = rmin ** 2
 
-        self.D = nn.Parameter(
-            torch.randn([out_features, in_features]) / self._sqrt_in_features
-        )
+        # Real output projection
+        self.D = nn.Parameter(torch.randn(out_features, in_features) / self._sqrt_in_features)
 
+        # Complex SSM params (diagonal A via magnitudes+phases)
         u1 = torch.rand(state_features)
         u2 = torch.rand(state_features)
         self.nu_log = nn.Parameter(
@@ -41,337 +105,240 @@ class LRU(nn.Module):
         self.theta_log = nn.Parameter(torch.log(max_phase * u2))
 
         lambda_abs = torch.exp(-torch.exp(self.nu_log))
-        self.gamma_log = nn.Parameter(
-            torch.log(torch.sqrt(1.0 - lambda_abs.square()))  # More efficient than torch.ones_like and torch.square
-        )
+        self.gamma_log = nn.Parameter(torch.log(torch.sqrt(1.0 - lambda_abs.square())))
 
-        # More efficient initialization using a single complex tensor creation
         B_complex = torch.complex(
-            torch.randn([state_features, in_features]) / self._sqrt_2_in_features,
-            torch.randn([state_features, in_features]) / self._sqrt_2_in_features
+            torch.randn(state_features, in_features) / self._sqrt_2_in_features,
+            torch.randn(state_features, in_features) / self._sqrt_2_in_features,
         )
-        self.B = nn.Parameter(B_complex)  # N, U
+        self.B = nn.Parameter(B_complex)  # (N, U)
 
         C_complex = torch.complex(
-            torch.randn([out_features, state_features]) / self._sqrt_state_features,
-            torch.randn([out_features, state_features]) / self._sqrt_state_features
+            torch.randn(out_features, state_features) / self._sqrt_state_features,
+            torch.randn(out_features, state_features) / self._sqrt_state_features,
         )
-        self.C = nn.Parameter(C_complex)  # H, N
+        self.C = nn.Parameter(C_complex)  # (H, N)
 
-        # initialize internal state
-        self.state = None
+        # Runtime state
+        self.state: Optional[torch.Tensor] = None
 
-        # Pre-compute transformation matrices for ss_real_matrices method
-        self._T_block = None
-        self._T_block_inv = None
+        # Small cache for complex->real transform 2x2 blocks
+        self._T_cache: Dict[str, torch.Tensor] = {}
 
-    def ss_params(self):
+    def ss_params(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         lambda_abs = torch.exp(-torch.exp(self.nu_log))
         lambda_phase = torch.exp(self.theta_log)
-
-        # More efficient complex number creation
-        lambdas = lambda_abs * torch.exp(1j * lambda_phase)
-        gammas = torch.exp(self.gamma_log).unsqueeze(-1)
-        B = gammas * self.B
+        lambdas = lambda_abs * torch.exp(1j * lambda_phase)  # (N,) complex
+        gammas = torch.exp(self.gamma_log).unsqueeze(-1)     # (N,1) real
+        B = gammas * self.B                                  # (N,U) complex
         return lambdas, B, self.C, self.D
 
-    def ss_real_matrices(self, to_numpy=True):
+    def ss_real_matrices(self, to_numpy: bool = True):
         lambdas, B, C, D = self.ss_params()
-
-        # Pre-allocate with the correct dtype and device
         device, dtype = lambdas.device, lambdas.dtype
-        state_features_2 = 2 * self.state_features
+        n2 = 2 * self.state_features
 
-        # More efficient tensor creation using stack instead of manual indexing
-        lambdas_conjugate = torch.stack([lambdas, lambdas.conj()], dim=1).flatten()
-        A_full = torch.diag(lambdas_conjugate)
-
-        # More efficient B_full creation
-        B_conjugate = torch.stack([B, B.conj()], dim=1).view(state_features_2, self.in_features)
-
-        # More efficient C_full creation
+        lambdas_conj = torch.stack([lambdas, lambdas.conj()], dim=1).flatten()
+        A_full = torch.diag(lambdas_conj)                                # (2N,2N)
+        B_full = torch.stack([B, B.conj()], dim=1).view(n2, self.in_features)
         C_half = 0.5 * C
-        C_conjugate = torch.stack([C_half, C_half.conj()], dim=2).view(self.out_features, state_features_2)
+        C_full = torch.stack([C_half, C_half.conj()], dim=2).view(self.out_features, n2)
 
-        # Cache transformation matrices
-        if self._T_block is None or self._T_block.device != device:
-            self._T_block = torch.tensor([[1, 1], [1j, -1j]], device=device, dtype=dtype)
-            self._T_block_inv = torch.linalg.inv(self._T_block)
-
-        T_full = torch.block_diag(*([self._T_block] * self.state_features))
-        T_full_inv = torch.block_diag(*([self._T_block_inv] * self.state_features))
-
-        # More efficient matrix operations using @ operator consistently
-        A_real = (T_full @ A_full @ T_full_inv).real
-        B_real = (T_full @ B_conjugate).real
-        C_real = (C_conjugate @ T_full_inv).real
+        T, Tinv = _complex_real_transform_blocks(self.state_features, dtype, device, self._T_cache)
+        A_real = (T @ A_full @ Tinv).real
+        B_real = (T @ B_full).real
+        C_real = (C_full @ Tinv).real
         D_real = D
 
-        ss_real_params = [A_real, B_real, C_real, D_real]
+        mats = [A_real, B_real, C_real, D_real]
         if to_numpy:
-            ss_real_params = [param.detach().cpu().numpy() for param in ss_real_params]
+            mats = [m.detach().cpu().numpy() for m in mats]
+        return tuple(mats)
 
-        return tuple(ss_real_params)
-
-    def forward_loop(self, input, state):
-        batch_size, seq_len, _ = input.shape
-
+    def forward_loop(self, input: torch.Tensor, state: torch.Tensor):
+        BATCH, SEQ, _ = input.shape
         lambdas, B, C, D = self.ss_params()
 
-        # State computation using pre-converted input
-        input_B_dtype = input.to(B.dtype)
-        B_T = B.mT  # Cache transpose
+        x = state.to(B.dtype)
+        uB = input.to(B.dtype)
+        BT = B.mT
 
-        # Optimized loop with pre-allocated tensor for states
-        inner_states = torch.empty(batch_size, seq_len, self.state_features,
-                                   device=input.device, dtype=torch.complex64)
+        inner = torch.empty(BATCH, SEQ, self.state_features, device=input.device, dtype=B.dtype)
+        for t, u_t in enumerate(uB.unbind(dim=1)):
+            inner[:, t] = x
+            x = lambdas * x + u_t @ BT
 
-        # Vectorized state updates
-        current_state = state
-        for t, u_step in enumerate(input_B_dtype.unbind(dim=1)):
-            inner_states[:, t] = current_state
-            current_state = lambdas * current_state + u_step @ B_T
-
-        self.state = current_state.detach()  # Update the internal state
-
-        # Output computation using all inner states
-        output = (inner_states @ C.mT).real + input @ D.T
-
-        return output, inner_states
+        self.state = x.detach()
+        output = (inner @ C.mT).real + input @ D.T
+        return output, inner
 
     @torch.compiler.disable
-    def forward_scan(self, input, state=None):
-        """
-        Computes the LRU output using a parallel scan.
-
-        Args:
-            input (torch.Tensor): (B, L, H) input sequence.
-            state (torch.Tensor, optional): (B, N) initial state. If None, a zero state is used.
-
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor]:
-                - (B, L, H_out) output sequence.
-                - (B, L, N) sequence of internal states.
-        """
-        batch_size, seq_len, _ = input.shape
+    def forward_scan(self, input: torch.Tensor, state: Optional[torch.Tensor] = None):
+        BATCH, SEQ, _ = input.shape
         lambdas, B, C, D = self.ss_params()
 
-        # Pre-compute input transformation
-        Bu_elements = input.to(B.dtype) @ B.mT
+        x0 = state.to(B.dtype)
+        Bu = input.to(B.dtype) @ B.mT
+        scanned, inner = _scan_diag_linear(lambdas, Bu, x0)
 
-        # Incorporate the initial state into the first element of the sequence
-        Bu_elements[:, 0, :] += lambdas * self.state
+        self.state = scanned[:, -1, :].detach()
+        output = (inner @ C.mT).real + input @ D.T
+        return output, inner
 
-        # Define the scan function for vmap
-        lambda_elements = lambdas.expand(seq_len, -1)
-
-        def scan_fn(Bu_seq):
-            return associative_scan(binary_operator_diag, (lambda_elements, Bu_seq))[1]
-
-        # Apply the scan over the batch dimension
-        scanned_states = torch.vmap(scan_fn)(Bu_elements)
-
-        # Prepend the initial state to get the full state sequence
-        inner_states = torch.cat([self.state.unsqueeze(1), scanned_states[:, :-1, :]], dim=1)
-
-        # Update the internal state of the LRU module to the last state
-        self.state = scanned_states[:, -1, :].detach()
-
-        # Compute the final output
-        output = (inner_states @ C.mT).real + input @ D.T
-        return output, inner_states
-
-    def forward(self, input, gamma=None, state=None, mode="loop"):
-
-        if input.dim() == 1:
-            input = input.unsqueeze(0).unsqueeze(0)
-        elif input.dim() == 2:
-            input = input.unsqueeze(0)
-        elif input.dim() > 3:
-            raise ValueError(f"Invalid input dimensions {input.dim()}, expected 1, 2, or 3.")
-
-        if state is not None:
-            self.state = state
-        else:
-            self.state = torch.zeros(input.shape[0], self.state_features, device=input.device, dtype=torch.complex64)
-
-        # forward pass
-
+    def forward(self, input: torch.Tensor, gamma: Optional[float] = None, state: Optional[torch.Tensor] = None, mode: str = "loop"):
+        input = _normalize_to_3d(input)
+        self.state = _init_or_cast_state(state, input.shape[0], self.state_features, input.device, self.B.dtype)
         if mode == "scan":
             return self.forward_scan(input, self.state)
-        elif mode in ["loop", "loop_efficient"]:
+        if mode in ("loop", "loop_efficient"):
             return self.forward_loop(input, self.state)
-        else:
-            raise ValueError(f"Unknown mode: {mode}. Expected 'scan', 'loop', or 'loop_efficient'.")
+        raise ValueError(f"Unknown mode: {mode}. Expected 'scan', 'loop', or 'loop_efficient'.")
 
     def reset(self):
         self.state = None
 
-    """ L2RU parametrization: Implements a Linear Recurrent Unit (LRU) with trainable or prescribed l2 gain gamma. """
 
-
-class L2RU(jit.ScriptModule):
-    """ Implements a Linear Recurrent Unit (LRU) with trainable or prescribed l2 gain gamma. """
-
-    def __init__(self, state_features: int, gamma: float = None, init='eye', q: int = 1, eye_scale=0.01, rand_scale=1):
+# python
+class L2RU(nn.Module):
+    """LRU with learnable or fixed l2 gain gamma."""
+    def __init__(self, state_features: int, gamma: float = None, init: str = "eye", q: int = 1, eye_scale=0.01, rand_scale=1):
         super().__init__()
         self.state_features = state_features
         if gamma is not None:
-            self.gamma = torch.tensor(gamma)
+            self.register_buffer("gamma", torch.tensor(float(gamma)))
         else:
             self.gamma = nn.Parameter(torch.tensor(2.2))
 
-        self.state = torch.zeros(state_features)
-        self.register_buffer('ID', torch.eye(state_features))
+        self.register_buffer("ID", torch.eye(state_features))
         self.alpha = nn.Parameter(torch.tensor(4.1))
-        self.epsilon = torch.tensor(-.0)
+        self.register_buffer("epsilon", torch.tensor(-0.0))
         self.q = q
 
-        # Store upper triangular indices for efficient computation
-        self.register_buffer('triu_indices', torch.triu_indices(state_features, state_features, offset=1))
-        self.register_buffer('tril_indices', torch.tril_indices(state_features, state_features, offset=0))
+        # Precompute triangle indices
+        self.register_buffer("triu_indices", torch.triu_indices(state_features, state_features, offset=1))
+        self.register_buffer("tril_indices", torch.tril_indices(state_features, state_features, offset=0))
 
         n = state_features
-
-        if init == 'eye':
-            # Initialize with identity-like structure
+        if init == "eye":
             X11_full = eye_scale * torch.eye(n)
             X22_full = eye_scale * torch.eye(n)
             X21_init = 0.1 * torch.eye(n)
-        elif init == 'rand':
+        elif init == "rand":
             X11_full = rand_scale * torch.randn(n, n)
             X22_full = rand_scale * torch.randn(n, n)
             X21_init = rand_scale * torch.randn(n, n)
         else:
             raise ValueError(init)
 
-        # Extract lower triangular elements as parameters
-        X11_params = X11_full[self.tril_indices[0], self.tril_indices[1]]
-        X22_params = X22_full[self.tril_indices[0], self.tril_indices[1]]
+        self.X11_params = nn.Parameter(X11_full[self.tril_indices[0], self.tril_indices[1]])
+        self.X22_params = nn.Parameter(X22_full[self.tril_indices[0], self.tril_indices[1]])
 
-        self.X11_params = nn.Parameter(X11_params)
-        self.X22_params = nn.Parameter(X22_params)
-
-        # For Skew: store only upper triangular parameters (excluding diagonal)
         if q == 1:
             Skew_init = 0.01 * torch.randn(n, n)
-            Skew_init = Skew_init - Skew_init.T  # Make it skew-symmetric
+            Skew_init = Skew_init - Skew_init.T
             Skew_params = Skew_init[self.triu_indices[0], self.triu_indices[1]]
             self.Skew_params = nn.Parameter(Skew_params)
 
-        # Other parameters
         self.X21 = nn.Parameter(X21_init)
         self.C = nn.Parameter(torch.eye(state_features))
         self.Dt = nn.Parameter(torch.eye(state_features))
 
-        # Initialize remaining LTI matrices
+        # Runtime LTI
         self.A = torch.zeros(state_features, state_features)
         self.B = torch.zeros(state_features, state_features)
         self.D = torch.zeros(state_features, state_features)
+        self.state: Optional[torch.Tensor] = None
 
     def _get_lower_triangular(self, params: torch.Tensor) -> torch.Tensor:
-        """Reconstruct lower triangular matrix from parameters"""
-        L = torch.zeros(self.state_features, self.state_features,
-                        device=params.device, dtype=params.dtype)
+        L = torch.zeros(self.state_features, self.state_features, device=params.device, dtype=params.dtype)
         L[self.tril_indices[0], self.tril_indices[1]] = params
         return L
 
     def _get_skew_symmetric(self, params: torch.Tensor) -> torch.Tensor:
-        """Reconstruct skew-symmetric matrix from parameters"""
-        Sk = torch.zeros(self.state_features, self.state_features,
-                         device=params.device, dtype=params.dtype)
+        Sk = torch.zeros(self.state_features, self.state_features, device=params.device, dtype=params.dtype)
         Sk[self.triu_indices[0], self.triu_indices[1]] = params
         Sk[self.triu_indices[1], self.triu_indices[0]] = -params
         return Sk
 
-    # @jit.script_method
     def set_param(self):
-        # Reconstruct parametrized matrices
+        ID = self.ID
+        n = self.state_features
+
         X11 = self._get_lower_triangular(self.X11_params)
         X22 = self._get_lower_triangular(self.X22_params)
 
         if self.q == 1:
             Sk = self._get_skew_symmetric(self.Skew_params)
-            Q = (self.ID - Sk) @ torch.linalg.inv(self.ID + Sk)
+            Qm = (ID - Sk) @ torch.linalg.inv(ID + Sk)
         else:
-            Q = self.ID  # just the identity
+            Qm = ID
 
-        # Parameter update for l2 gain (free param)
         gamma = self.gamma
-
-        # Auxiliary Parameters
-        Z = self.X21 @ self.X21.T + X22 @ X22.T + self.Dt.T @ self.Dt + torch.exp(self.epsilon) * self.ID
+        Z = self.X21 @ self.X21.T + X22 @ X22.T + self.Dt.T @ self.Dt + torch.exp(self.epsilon) * ID
         beta = gamma ** 2 * torch.sigmoid(self.alpha) / torch.linalg.matrix_norm(Z, 2)
-        H11 = X11 @ X11.T + self.C.T @ self.C + beta * torch.exp(self.epsilon) * self.ID
-        H12 = torch.sqrt(beta) * (X11 @ self.X21.T + self.C.T @ self.Dt)
-        V = Z * beta - gamma ** 2 * self.ID
-        R = H12 @ torch.linalg.inv(V.T) @ H12.T
-        CR = torch.linalg.cholesky(-R)
-        CRH = torch.linalg.cholesky(-R + H11)
 
-        # LTI system matrices
-        A = torch.linalg.inv(CRH).T @ Q @ CR.T
-        B = A @ torch.linalg.inv(H12.T) @ V.T
+        H11 = X11 @ X11.T + self.C.T @ self.C + beta * torch.exp(self.epsilon) * ID
+        H12 = torch.sqrt(beta) * (X11 @ self.X21.T + self.C.T @ self.Dt)
+        V = Z * beta - gamma ** 2 * ID
+
+        # Safer solves and light symmetrization
+        S = torch.linalg.solve(V.T, H12.T)  # solves V^T X = H12^T
+        R = H12 @ S
+        R = 0.5 * (R + R.T)
+
+        negR = -R + 1e-6 * ID
+        CR = torch.linalg.cholesky(negR)
+        CRH = torch.linalg.cholesky(negR + H11)
+
+        A = torch.linalg.inv(CRH).T @ Qm @ CR.T
+        Xsolve = torch.linalg.solve(H12.T, V.T)  # (H12^T) X = V^T
+        B = A @ Xsolve
         C = self.C
         D = torch.sqrt(beta) * self.Dt
 
-        self.A = A
-        self.B = B
-        self.D = D
-
+        self.A, self.B, self.D = A, B, D
         return A, B, C, D
 
-    def forward(self, input: torch.Tensor, state=None, set_param: bool = True, mode: str = "scan") -> tuple:
-        if input.dim() == 1:
-            input = input.unsqueeze(0).unsqueeze(0)
-        elif input.dim() == 2:
-            input = input.unsqueeze(0)
-        elif input.dim() > 3:
-            raise ValueError(f"Invalid input dimensions {input.dim()}, expected 1, 2, or 3.")
-
-        if state is not None:
-            self.state = state
-        else:
-            self.state = torch.zeros(input.shape[0], self.state_features, device=input.device)
+    def forward(self, input: torch.Tensor, state: Optional[torch.Tensor] = None, set_param: bool = True, mode: str = "scan"):
+        input = _normalize_to_3d(input)
+        # real-valued state for L2RU
+        self.state = _init_or_cast_state(state, input.shape[0], self.state_features, input.device, input.dtype)
 
         x0 = self.state
-        if set_param:  # update parameters call, it can be disabled when doing step call to the forward and put
-            # in the training script instead
+        if set_param:
             self.set_param()
 
         if mode == "scan":
-            u = input.permute(1, 0, 2)
-            states = compute_linear_recurrence_parallel(self.A, self.B, u, x0)
-            states = states.permute(1, 0, 2)
-            last_state = states[:, -1, :].detach()
-            self.state = last_state
-            outputs = torch.matmul(states, self.C.transpose(-1, -2)) + torch.matmul(input, self.D.transpose(-1, -2))
+            u = input.permute(1, 0, 2)  # (L,B,H)
+            states = compute_linear_recurrence_parallel(self.A, self.B, u, x0).permute(1, 0, 2)
+            self.state = states[:, -1, :].detach()
+            outputs = states @ self.C.transpose(-1, -2) + input @ self.D.transpose(-1, -2)
+            return outputs, states
+        elif mode in ("loop", "loop_efficient"):
+            BT = self.B.transpose(-1, -2)
+            AT = self.A.transpose(-1, -2)
+            x = x0
+            inner = []
+            for u_t in input.unbind(dim=1):
+                x = x @ AT + u_t @ BT
+                inner.append(x)
+            states = torch.stack(inner, dim=1)
+            self.state = states[:, -1, :].detach()
+            outputs = states @ self.C.transpose(-1, -2) + input @ self.D.transpose(-1, -2)
             return outputs, states
         else:
-            x = x0
-            states_list = []
-            for u_step in input.split(1, dim=1):
-                u = u_step.squeeze(1)
-                x = torch.matmul(x, self.self.A.transpose(-1, -2)) + torch.matmul(u, self.B.transpose(-1, -2))
-                states_list.append(x)
-            states = torch.stack(states_list, dim=1)
-            self.state = states[:, -1, :].detach()
-            outputs = torch.matmul(states, self.C.transpose(-1, -2)) + torch.matmul(input, self.D.transpose(-1, -2))
-            return outputs, states
+            raise ValueError(f"Unknown mode: {mode}. Expected 'scan', 'loop', or 'loop_efficient'.")
 
     def reset(self):
         self.state = None
 
 
-class lruz(jit.ScriptModule):
-    """ Implements a Linear Recurrent Unit (LRU) with trainable or prescribed l2 gain gamma. """
 
-    def __init__(self, input_features: int, output_features: int, state_features: int, rmin=0.9,
-                 rmax=1.0, max_phase=6.283, gamma: float = None):
+# python
+class lruz(nn.Module):
+    """LRU (ZAK parametrization) with learnable or fixed l2 gain gamma."""
+    def __init__(self, input_features: int, output_features: int, state_features: int, rmin=0.9, rmax=1.0, max_phase=6.283, gamma: float = None):
         super().__init__()
-        self.A = torch.empty(2)
-        self.C = torch.empty(2)
-        self.B = torch.empty(2)
         self.state_features = state_features
         self.input_features = input_features
         self.output_features = output_features
@@ -386,60 +353,57 @@ class lruz(jit.ScriptModule):
         )
         self.theta_log = nn.Parameter(torch.log(max_phase * u2))
 
-        if gamma is not None:  # in this case the l2 gain of the system is fixed
-            self.gamma = torch.tensor(gamma)
-        else:  # in this case the l2 gain is learnable (default)
+        if gamma is not None:
+            self.register_buffer("gamma", torch.tensor(float(gamma)))
+        else:
             self.gamma = nn.Parameter(torch.tensor(2.2))
-        # initialize the internal state (will be resized per-batch at first forward)
-        self.state = torch.tensor(0.0)
-        self.register_buffer('ID', torch.eye(state_features))
-        self.register_buffer('IDu', torch.eye(input_features))
-        self.register_buffer('IDy', torch.eye(output_features))
-        self.register_buffer('Inu', torch.ones((state_features, input_features)))
-        self.register_buffer('Iny', torch.ones((state_features, output_features)))
-        self.register_buffer('Znu', torch.zeros((state_features, input_features)))
-        self.register_buffer('Zny', torch.zeros((state_features, output_features)))
-        # Learnable parameters
-        self.X2b = nn.Parameter(torch.randn(2 * state_features, input_features + output_features))
-        self.D = nn.Parameter(torch.randn(output_features, input_features))
 
-    def ss_real_matrices(self, to_numpy=True):
+        self.state: Optional[torch.Tensor] = None
+        self.register_buffer("ID", torch.eye(state_features))
+        self.register_buffer("IDu", torch.eye(input_features))
+        self.register_buffer("IDy", torch.eye(output_features))
+        self.register_buffer("Inu", torch.ones((state_features, input_features)))
+        self.register_buffer("Iny", torch.ones((state_features, output_features)))
+        self.register_buffer("Znu", torch.zeros((state_features, input_features)))
+        self.register_buffer("Zny", torch.zeros((state_features, output_features)))
+
+        self.X2b = nn.Parameter(torch.randn(2 * state_features, input_features + output_features))
+        self.Dp = nn.Parameter(torch.randn(output_features, input_features))
+
+        # Runtime SSM params initialization
+        self.set_param()
+
+        # Small 2x2 transform cache like LRU for reuse
+        self._T_cache: Dict[str, torch.Tensor] = {}
+
+    def ss_real_matrices(self, to_numpy: bool = True):
         A, B, C, D = self.set_param()
         lambdas = torch.diagonal(A)
         device, dtype = lambdas.device, lambdas.dtype
-        state_features_2 = 2 * self.state_features
+        n2 = 2 * self.state_features
 
-        lambdas_conjugate = torch.stack([lambdas, lambdas.conj()], dim=1).flatten()
-        A_full = torch.diag(lambdas_conjugate)
-        B_conjugate = torch.stack([B, B.conj()], dim=1).view(state_features_2, self.input_features)
+        lambdas_conj = torch.stack([lambdas, lambdas.conj()], dim=1).flatten()
+        A_full = torch.diag(lambdas_conj)
+        B_full = torch.stack([B, B.conj()], dim=1).view(n2, self.input_features)
         C_half = 0.5 * C
-        C_conjugate = torch.stack([C_half, C_half.conj()], dim=2).view(self.output_features, state_features_2)
+        C_full = torch.stack([C_half, C_half.conj()], dim=2).view(self.output_features, n2)
 
-        # build a small 2x2 transform on the current device / dtype (do NOT cache to self)
-        T_block = torch.tensor([[1, 1], [1j, -1j]], device=device, dtype=dtype)
-        T_block_inv = torch.linalg.inv(T_block)
-
-        T_full = torch.block_diag(*([T_block] * self.state_features))
-        T_full_inv = torch.block_diag(*([T_block_inv] * self.state_features))
-
-        A_real = (T_full @ A_full @ T_full_inv).real
-        B_real = (T_full @ B_conjugate).real
-        C_real = (C_conjugate @ T_full_inv).real
+        T, Tinv = _complex_real_transform_blocks(self.state_features, dtype, device, self._T_cache)
+        A_real = (T @ A_full @ Tinv).real
+        B_real = (T @ B_full).real
+        C_real = (C_full @ Tinv).real
         D_real = D
 
-        ss_real_params = [A_real, B_real, C_real, D_real]
+        mats = [A_real, B_real, C_real, D_real]
         if to_numpy:
-            ss_real_params = [param.detach().cpu().numpy() for param in ss_real_params]
-        return tuple(ss_real_params)
+            mats = [m.detach().cpu().numpy() for m in mats]
+        return tuple(mats)
 
     def set_param(self):
-        nx = self.state_features
-        nu = self.input_features
-        ny = self.output_features
+        nx, nu, ny = self.state_features, self.input_features, self.output_features
         epsilon = 0.01
         alpha = 1 - epsilon
 
-        # Create A
         lambda_abs = torch.exp(-torch.exp(self.nu_log))
         lambda_phase = torch.exp(self.theta_log)
         A = torch.diag(lambda_abs * torch.exp(1j * lambda_phase))
@@ -450,15 +414,11 @@ class lruz(jit.ScriptModule):
         X12 = torch.cat((torch.conj(A).T @ Q, Q), dim=1)
         X1 = torch.cat((X11, X12), dim=0)
 
-        X4_offdiagonal = self.gamma * alpha * self.D.T / torch.linalg.matrix_norm(self.D, 2)
+        X4_off = self.gamma * alpha * self.Dp.T / torch.linalg.matrix_norm(self.Dp, 2)
 
-        X4_row1 = torch.cat(
-            (self.gamma * self.IDu, X4_offdiagonal), dim=1)
-        X4_row2 = torch.cat(
-            (X4_offdiagonal.T,
-             self.gamma * self.IDy),
-            dim=1)
-        X4 = torch.cat((X4_row1, X4_row2), dim=0)
+        X4_r1 = torch.cat((self.gamma * self.IDu, X4_off), dim=1)
+        X4_r2 = torch.cat((X4_off.T, self.gamma * self.IDy), dim=1)
+        X4 = torch.cat((X4_r1, X4_r2), dim=0)
 
         M1 = torch.cat((self.Inu, self.Zny), dim=1)
         M2 = torch.cat((self.Znu, self.Iny), dim=1)
@@ -466,120 +426,67 @@ class lruz(jit.ScriptModule):
 
         X2t = self.X2b * M
 
+        # Norm-based scaling (move complex ops where needed)
         eta_1 = torch.linalg.matrix_norm(torch.linalg.inv(X1) @ X2t.to(torch.complex64), ord=2)
         eta_2 = torch.linalg.matrix_norm(X2t @ torch.linalg.inv(X4), ord=2)
-
-        eta = torch.maximum(torch.maximum(eta_1, eta_2), torch.tensor(1.0))
+        eta = torch.maximum(torch.maximum(eta_1, eta_2), torch.tensor(1.0, device=X2t.device))
 
         X2 = X2t / eta
 
         B = torch.linalg.inv(Q) @ X2[:nx, :nu].to(torch.complex64)
         C = torch.conj(X2[-nx:, -ny:]).T.to(torch.complex64)
-        D = X4_offdiagonal.T
+        D = X4_off.T
 
-        self.A = A
-        self.B = B
-        self.C = C
-        self.D = D
-
+        self.A, self.B, self.C, self.D = A, B, C, D
         return A, B, C, D
 
-    def forward_loop(self, input, state=None, set_param: bool = True):
-
-        batch_size, seq_len, _ = input.shape
-
+    def forward_loop(self, input: torch.Tensor, state: Optional[torch.Tensor] = None, set_param: bool = True):
+        BATCH, SEQ, _ = input.shape
         if set_param:
             self.set_param()
         lambdas = torch.diagonal(self.A)
 
-        # State computation using pre-converted input
-        input_B_dtype = input.to(self.B.dtype)
-        B_T = self.B.mT  # Cache transpose
+        x = state.to(self.B.dtype)
+        uB = input.to(self.B.dtype)
+        BT = self.B.mT
 
-        # Optimized loop with pre-allocated tensor for states
-        inner_states = torch.empty(batch_size, seq_len, self.state_features,
-                                   device=input.device, dtype=torch.complex64)
+        inner = torch.empty(BATCH, SEQ, self.state_features, device=input.device, dtype=self.B.dtype)
+        for t, u_t in enumerate(uB.unbind(dim=1)):
+            inner[:, t] = x
+            x = lambdas * x + u_t @ BT
 
-        # Vectorized state updates
-        current_state = self.state
-        for t, u_step in enumerate(input_B_dtype.unbind(dim=1)):
-            inner_states[:, t] = current_state
-            current_state = lambdas * current_state + u_step @ B_T
-
-        self.state = current_state.detach()  # Update the internal state
-
-        # Output computation using all inner states
-        output = (inner_states @ self.C.mT).real + input @ self.D.T
-
-        return output, inner_states
+        self.state = x.detach()
+        output = (inner @ self.C.mT).real + input @ self.D.T
+        return output, inner
 
     @torch.compiler.disable
-    def forward_scan(self, input, state=None, set_param: bool = True):
-        """
-        Computes the LRU output using a parallel scan.
-
-        Args:
-            input (torch.Tensor): (B, L, H) input sequence.
-            state (torch.Tensor, optional): (B, N) initial state. If None, a zero state is used.
-
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor]:
-                - (B, L, H_out) output sequence.
-                - (B, L, N) sequence of internal states.
-        """
-
-        batch_size, seq_len, _ = input.shape
-        A, B, C, D = self.set_param()
+    def forward_scan(self, input: torch.Tensor, state: Optional[torch.Tensor] = None, set_param: bool = True):
+        BATCH, SEQ, _ = input.shape
+        A, B, C, D = self.set_param() if set_param else (self.A, self.B, self.C, self.D)
         lambdas = torch.diagonal(A)
 
-        # Pre-compute input transformation
-        Bu_elements = input.to(B.dtype) @ B.mT
+        x0 = state.to(B.dtype)
+        Bu = input.to(B.dtype) @ B.mT
+        scanned, inner = _scan_diag_linear(lambdas, Bu, x0)
 
-        # Incorporate the initial state into the first element of the sequence
-        Bu_elements[:, 0, :] += lambdas * self.state
+        self.state = scanned[:, -1, :].detach()
+        output = (inner @ C.mT).real + input @ D.T
+        return output, inner
 
-        # Define the scan function for vmap
-        lambda_elements = lambdas.expand(seq_len, -1)
+    def forward(self, input: torch.Tensor, gamma=None, state: Optional[torch.Tensor] = None, set_param: bool = True, mode: str = "scan"):
+        input = _normalize_to_3d(input)
+        # complex-valued state for ZAK
+        self.state = _init_or_cast_state(state, input.shape[0], self.state_features, input.device, torch.complex64)
 
-        def scan_fn(Bu_seq):
-            return associative_scan(binary_operator_diag, (lambda_elements, Bu_seq))[1]
-
-        # Apply the scan over the batch dimension
-        scanned_states = torch.vmap(scan_fn)(Bu_elements)
-
-        # Prepend the initial state to get the full state sequence
-        inner_states = torch.cat([self.state.unsqueeze(1), scanned_states[:, :-1, :]], dim=1)
-
-        # Update the internal state of the LRU module to the last state
-        self.state = scanned_states[:, -1, :].detach()
-
-        # Compute the final output
-        output = (inner_states @ C.mT).real + input @ D.T
-        return output, inner_states
-
-    def forward(self, input, gamma=None, state=None, set_param: bool = True, mode="scan"):
-
-        if input.dim() == 1:
-            input = input.unsqueeze(0).unsqueeze(0)
-        elif input.dim() == 2:
-            input = input.unsqueeze(0)
-        elif input.dim() > 3:
-            raise ValueError(f"Invalid input dimensions {input.dim()}, expected 1, 2, or 3.")
-
-        if state is not None:
-            self.state = state
-        else:
-            self.state = torch.zeros(input.shape[0], self.state_features, device=input.device, dtype=torch.complex64)
-        # forward pass
         if mode == "scan":
             return self.forward_scan(input, self.state, set_param)
-        elif mode in ["loop", "loop_efficient"]:
+        if mode in ("loop", "loop_efficient"):
             return self.forward_loop(input, self.state, set_param)
-        else:
-            raise ValueError(f"Unknown mode: {mode}. Expected 'scan', 'loop', or 'loop_efficient'.")
+        raise ValueError(f"Unknown mode: {mode}. Expected 'scan', 'loop', or 'loop_efficient'.")
 
     def reset(self):
         self.state = None
+
 
 
 """ SSM models ----------------------------------------- """
@@ -593,7 +500,7 @@ class SSMConfig:
     d_state: int = 32  # state size of the LRU (n_x)
     n_layers: int = 2  # number of SSMs blocks in cascade for deep structures
     dropout: float = 0.0  # set it different from 0 if you want to introduce dropout regularization
-    bias: bool = False  # bias of MLP layers
+    bias: bool = False  # bias of MLP static_layers
     rmin: float = 0.0  # min. magnitude of the eigenvalues at initialization in the complex parametrization
     rmax: float = 1.0  # max. magnitude of the eigenvalues at initialization in the complex parametrization
     max_phase: float = 2 * math.pi  # maximum phase of the eigenvalues at initialization in the complex parametrization
@@ -612,145 +519,135 @@ class SSMConfig:
     """ SSMs blocks ----------------------------------------- """
 
 
+# python
 class SSL(nn.Module):
-    """ State Space Layer: LRU --> MLP + skip connection """
-
+    """State Space Layer: LRU --> FF --> residual"""
     def __init__(self, config: SSMConfig):
         super().__init__()
         self.ln = nn.LayerNorm(config.d_model, bias=config.bias)
 
-        # LRU initialization depending on the chosen architecture
         if config.param is None or config.param == "lru":
-            self.lru = LRU(in_features=config.d_model, out_features=config.d_model, state_features=config.d_state,
-                           rmin=config.rmin, rmax=config.rmax, max_phase=config.max_phase)
+            self.lru = LRU(
+                in_features=config.d_model,
+                out_features=config.d_model,
+                state_features=config.d_state,
+                rmin=config.rmin,
+                rmax=config.rmax,
+                max_phase=config.max_phase,
+            )
         elif config.param == "l2ru":
             self.lru = L2RU(state_features=config.d_model, init=config.init)
         elif config.param == "zak":
-            self.lru = lruz(input_features=config.d_model, output_features=config.d_model,
-                            state_features=config.d_state,
-                            rmin=config.rmin, rmax=config.rmax, max_phase=config.max_phase)
+            self.lru = lruz(
+                input_features=config.d_model,
+                output_features=config.d_model,
+                state_features=config.d_state,
+                rmin=config.rmin,
+                rmax=config.rmax,
+                max_phase=config.max_phase,
+            )
         else:
-            raise ValueError(f"Invalid parametrization")
+            raise ValueError("Invalid parametrization")
 
-        # config data for the non-linear static layer
         l_config = LayerConfig()
         l_config.d_input = config.d_model
         l_config.d_output = config.d_model
         l_config.d_hidden = config.d_hidden
-        # Dictionary for layer selection
+
         ff_layers = {
             "GLU": lambda: GLU(l_config),
             "MLP": lambda: MLP(l_config),
             "LMLP": lambda: LMLP(l_config),
-            "TLIP": lambda: TLIP(l_config)
+            "TLIP": lambda: TLIP(l_config),
         }
-
         if config.ff not in ff_layers:
             raise ValueError(f"Unknown feedforward type: {config.ff}")
 
         self.ff = ff_layers[config.ff]()
         self.dropout = nn.Dropout(config.dropout)
 
-    def forward(self, x, state=None, mode: str = "loop"):
-        z = x
-        # z = self.ln(z)  # pre-norm
-
-        z, st = self.lru(z, state=state, mode=mode)  # LTI system
-        z = self.ff(z)  # static non-linearity
-        z = self.dropout(z)  # inactive by default
-
-        # Residual connection
+    def forward(self, x: torch.Tensor, state: Optional[torch.Tensor] = None, mode: str = "loop"):
+        z, st = self.lru(_normalize_to_3d(x), state=state, mode=mode)  # LTI
+        z = self.ff(z)                                # nonlinearity
+        z = self.dropout(z)
         return z + x, st
 
 
-class DeepSSM(nn.Module):
-    """ Deep SSM: encoder --> cascade of n SSM blocks --> decoder  """
 
+# python
+class DeepSSM(nn.Module):
+    """Deep SSM: encoder -> n blocks -> decoder."""
     def __init__(self, n_u: int, n_y: int, config: SSMConfig):
         super().__init__()
-
         self.config = config
 
-        # Simplified initialization - only handle trainable gamma for LRU_Robust
         if config.param is not None and config.gamma is not None:
-            # Fixed-γ: register buffer and use raw Parameters
-            self.register_buffer('gamma_t', torch.tensor(config.gamma))
+            self.register_buffer("gamma_t", torch.tensor(config.gamma))
             self.encoder = nn.Parameter(torch.randn(config.d_model, n_u))
             self.decoder = nn.Parameter(torch.randn(n_y, config.d_model))
         else:
-            # All other cases (no γ or trainable γ): simple Linear layers
             self.encoder = nn.Linear(n_u, config.d_model, bias=False)
             self.decoder = nn.Linear(config.d_model, n_y, bias=False)
 
         self.blocks = nn.ModuleList([SSL(config) for _ in range(config.n_layers)])
 
-    def forward(self, u, state=None, gamma=None, mode="scan"):
-        """
-            Initial pre-processing common to all methods.
-        """
-
-        # Initialize states for all layers if not provided
+    def forward(self, u: torch.Tensor, state: Optional[List[torch.Tensor]] = None, gamma=None, mode: str = "scan"):
+        # Initialize per-layer states
+        layer_states: List[Optional[torch.Tensor]]
         if state is None:
             layer_states = [None] * len(self.blocks)
         else:
             layer_states = state if isinstance(state, list) else [state] * len(self.blocks)
 
-        # Process encoder once for the entire input sequence
+        # Encode
         if isinstance(self.encoder, nn.Linear):
-            x = self.encoder(u)  # (B, L, d_model)
+            x = self.encoder(_normalize_to_3d(u))
         else:
-            x = u @ self.encoder.T
+            x = _normalize_to_3d(u) @ self.encoder.T
 
-        # Layer processing (Deep LRU cascade)
-        for layer_idx, block in enumerate(self.blocks):
-            # Pass through the SSL block
-            x, st = block(x, state=layer_states[layer_idx], mode=mode)
-            layer_states[layer_idx] = st
+        # Cascade blocks
+        for i, block in enumerate(self.blocks):
+            x, st = block(x, state=layer_states[i], mode=mode)
+            layer_states[i] = st
 
-        # Final decoding step: handle fixed gamma case if needed (decoder rescaling)
-
+        # Decode
         if self.config.param is not None and self.config.gamma is not None:
-            """
-            This is the case where we use a fixed gamma for LRU_Robust: need to rescale the decoder
-            according to the product of the individual LRU gammas to ensure the overall gain is gamma_t.
-            Note that this is only valid when using LRU_Robust blocks, otherwise the gamma values are not defined.
-            """
-            # Handle the fixed gamma case for LRU_Robust
             gamma_t = torch.abs(self.gamma_t) if gamma is None else gamma
-            gammaLRU = [torch.abs(block.lru.gamma) for block in self.blocks]
-            gammaLRU_tensor = torch.stack(gammaLRU)
-            encoder_norm = torch.linalg.matrix_norm(self.encoder, 2)
-            decoder_norm = torch.linalg.matrix_norm(self.decoder, 2)
-            gamma_prod = torch.prod(gammaLRU_tensor) + 1
-            decoder_scaled = (gamma_t * self.decoder) / (encoder_norm * decoder_norm * gamma_prod)
-            outputs = x @ decoder_scaled.T
-        else:
-            if isinstance(self.decoder, nn.Linear):
-                outputs = self.decoder(x)
+            gammaLRU = [torch.abs(block.lru.gamma) for block in self.blocks if hasattr(block.lru, "gamma")]
+            if len(gammaLRU) > 0:
+                gammaLRU_tensor = torch.stack(gammaLRU)
+                enc_norm = torch.linalg.matrix_norm(self.encoder, 2)
+                dec_norm = torch.linalg.matrix_norm(self.decoder, 2)
+                gamma_prod = torch.prod(gammaLRU_tensor) + 1  # kept as in original
+                decoder_scaled = (gamma_t * self.decoder) / (enc_norm * dec_norm * gamma_prod)
+                outputs = x @ decoder_scaled.T
             else:
                 outputs = x @ self.decoder.T
+        else:
+            outputs = self.decoder(x) if isinstance(self.decoder, nn.Linear) else x @ self.decoder.T
 
         return outputs, layer_states
 
     def reset(self):
-        # Reset initial states of LTI systems in the LRU blocks
         for block in self.blocks:
             block.lru.reset()
 
 
 # Pure LRU blocks -----------------------------------------------
 
+# python
 class PureLRUR(nn.Module):
-    """ A pure robust LRU block without any scaffolding. """
-
-    def __init__(self, n: int, gamma: float = None, param: str = 'l2ru', init: str = "eye"):
+    """Pure LRU block without scaffolding."""
+    def __init__(self, n: int, gamma: float = None, param: str = "l2ru", init: str = "eye"):
         super().__init__()
-        if param == 'l2ru':  # In this case the LTI system is necessarily square
+        if param == "l2ru":
             self.lru = L2RU(state_features=n, gamma=gamma, init=init)
-        elif param == 'zak':  # Can handle non-square LTI systems
+        elif param == "zak":
             self.lru = lruz(input_features=n, output_features=n, state_features=n, gamma=gamma)
+        else:
+            raise ValueError("Unsupported param")
 
-    def forward(self, x, state=None, mode: str = "scan"):
-        y, st = self.lru(x, state=state, mode=mode)
-
+    def forward(self, x: torch.Tensor, state: Optional[torch.Tensor] = None, mode: str = "scan"):
+        y, st = self.lru(_normalize_to_3d(x), state=state, mode=mode)
         return y, st
+

@@ -1,0 +1,103 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "neural-ssm"
+version = "0.1.0"
+description = "Neural state space models and LRU variants in PyTorch"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [
+  { name = "Leo Massai" }
+]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Intended Audience :: Science/Research",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+  # Core
+  "torch>=2.2",
+  "numpy>=1.23",
+  # SciPy for linear algebra and scipy.io.loadmat (MAT files in Test_files)
+  "scipy>=1.10",
+  # Optional MAT v7.3 support via HDF5 (some .mat files may require it)
+  "h5py>=3.9",
+  # Utilities commonly used in training/eval and plotting
+  "tqdm>=4.66",
+  "matplotlib>=3.7",
+  # Tensor/array rearrangements if used in layers
+  "einops>=0.6",
+  # Backport typing if running older Python or for PyTorch type hints
+  "typing-extensions>=4.5",
+]
+
+[project.optional-dependencies]
+dev = [
+  "black>=24.3.0",
+  "ruff>=0.3.0",
+  "mypy>=1.6.0",
+  "pytest>=7.4",
+  "pytest-cov>=4.1",
+  "ipykernel>=6.29",
+  "jupyter>=1.0",
+]
+examples = [
+  "seaborn>=0.13",
+  "pandas>=2.1",
+]
+docs = [
+  "mkdocs>=1.5",
+  "mkdocs-material>=9.5",
+]
+
+[project.urls]
+Homepage = "https://github.com/LeoMassai"
+Repository = "https://github.com/LeoMassai/neural-ssm"
+Issues = "https://github.com/LeoMassai/neural-ssm/issues"
+
+[tool.setuptools]
+include-package-data = true
+license-files = ["LICEN[CS]E*"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["neural_ssm*"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests", "Test_files"]
+
+[tool.black]
+line-length = 100
+target-version = ["py39", "py310", "py311", "py312"]
+include = "\\.pyi?$"
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+src = ["src", "tests", "Test_files"]
+extend-exclude = ["build", "dist", ".venv", ".mypy_cache", ".ruff_cache"]
+select = ["E", "F", "I", "UP", "B"]
+ignore = []
+
+[tool.mypy]
+python_version = "3.9"
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_return_any = true
+warn_unused_configs = true
+no_implicit_optional = true
+strict_equality = true
+show_error_codes = true
+pretty = true
+mypy_path = ["src"]

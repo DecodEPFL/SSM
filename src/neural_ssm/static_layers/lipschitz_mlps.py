@@ -1,6 +1,40 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from deel import torchlip
+from src.neural_ssm.static_layers.generic_layers import LayerConfig
+
+
+class TLIP(nn.Module):
+    """ Standard MLP with Lipschitz-bounded static_layers """
+
+    def __init__(self, config: LayerConfig):
+        super().__init__()
+        # Pre-compute hidden dimension for efficiency
+        self.hidden_dim = config.d_hidden
+        layers = torchlip.Sequential(
+            # First layer: input_dim -> hidden_dims[0]
+            torchlip.SpectralLinear(config.d_input, self.hidden_dim),
+            torchlip.GroupSort2(2),  # GroupSort activation (more expressive than ReLU)
+
+            # Hidden static_layers
+            torchlip.SpectralLinear(self.hidden_dim, self.hidden_dim),
+            torchlip.GroupSort2(2),
+
+            torchlip.SpectralLinear(self.hidden_dim, self.hidden_dim),
+            torchlip.GroupSort2(2),
+
+            # Output layer: hidden_dims[-1] -> output_dim
+            torchlip.SpectralLinear(self.hidden_dim, config.d_output)
+        )
+        self.model = nn.Sequential(*layers)
+
+    def forward(self, x):
+        x = self.model(x)
+        return x
+
+
+# Manchester lipschitz bounded MLPs
 
 
 def cayley(W):
@@ -76,3 +110,31 @@ class SandwichFc(nn.Linear):
         x = F.relu(x) * torch.exp(self.psi)  # \Psi z
         x = 2 ** 0.5 * F.linear(x, Q[:, :fout].T)  # sqrt(2) A^top \Psi z
         return x
+
+
+class LMLP(nn.Module):
+    """ Implements a Lipschitz.-bounded MLP with sandwich static_layers. The square root
+    # of the Lipschitz bound is given by the scale parameter, by default, set to 1. """
+
+    def __init__(self, config: LayerConfig):
+        super().__init__()
+        # Pre-compute hidden dimension for efficiency
+        hidden_dim = config.d_hidden
+
+        # Layer construction using list comprehension
+        layers = nn.ModuleList()
+        layers.append(FirstChannel(config.d_input, scale=config.lip))
+        for i in range(config.n_layers):
+            layers.append(SandwichFc(hidden_dim, hidden_dim, bias=False, scale=config.lip))
+        layers.append(SandwichLin(hidden_dim, config.d_output, bias=False, scale=config.lip))
+
+        # Only add dropout if needed
+        if config.dropout > 0:
+            layers.append(nn.Dropout(config.dropout))
+
+        self.model = nn.Sequential(*layers)
+
+    def forward(self, input):
+        return self.model(input)
+
+

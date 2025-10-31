@@ -346,7 +346,7 @@ def demo():
         val_criterion=criterion_wrapper,
         scheduler=scheduler,
         grad_clip=1.0,
-        checkpoint_dir="./checkpoints_demo",
+        checkpoint_dir="../checkpoints_demo",
     )
 
     results = trainer.train(
