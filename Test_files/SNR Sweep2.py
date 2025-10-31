@@ -74,7 +74,7 @@ if __name__ == "__main__":
         def forward(self, x):
             # x shape: (B, T, N)
             B, T, N = x.shape
-            x_reshaped = x.view(B * T, N)  # Reshape for linear layers
+            x_reshaped = x.view(B * T, N)  # Reshape for linear static_layers
             out = self.linear1(x_reshaped)
             out = self.relu(out)
             out = self.linear2(out)

@@ -1,0 +1,72 @@
+Metadata-Version: 2.4
+Name: neural-ssm
+Version: 0.1.0
+Summary: Neural state space models and LRU variants in PyTorch
+Author: Leo Massai
+License: MIT
+Project-URL: Homepage, https://github.com/LeoMassai
+Project-URL: Repository, https://github.com/LeoMassai/neural-ssm
+Project-URL: Issues, https://github.com/LeoMassai/neural-ssm/issues
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3 :: Only
+Classifier: Programming Language :: Python :: 3.9
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: OS Independent
+Classifier: Intended Audience :: Science/Research
+Classifier: Topic :: Scientific/Engineering :: Artificial Intelligence
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+Requires-Dist: torch>=2.2
+Requires-Dist: numpy>=1.23
+Requires-Dist: scipy>=1.10
+Requires-Dist: h5py>=3.9
+Requires-Dist: tqdm>=4.66
+Requires-Dist: matplotlib>=3.7
+Requires-Dist: einops>=0.6
+Requires-Dist: typing-extensions>=4.5
+Provides-Extra: dev
+Requires-Dist: black>=24.3.0; extra == "dev"
+Requires-Dist: ruff>=0.3.0; extra == "dev"
+Requires-Dist: mypy>=1.6.0; extra == "dev"
+Requires-Dist: pytest>=7.4; extra == "dev"
+Requires-Dist: pytest-cov>=4.1; extra == "dev"
+Requires-Dist: ipykernel>=6.29; extra == "dev"
+Requires-Dist: jupyter>=1.0; extra == "dev"
+Provides-Extra: examples
+Requires-Dist: seaborn>=0.13; extra == "examples"
+Requires-Dist: pandas>=2.1; extra == "examples"
+Provides-Extra: docs
+Requires-Dist: mkdocs>=1.5; extra == "docs"
+Requires-Dist: mkdocs-material>=9.5; extra == "docs"
+
+# Pytorch L2RU Architecture: LRU with l2 stability guarantees and prescribed bound
+
+A PyTorch implementation of the L2RU architecture introduced in the paper Free Parametrization of L2-bounded State Space Models. https://arxiv.org/abs/2503.23818. Application in System Identification is included as an example.
+
+## L2RU block
+The L2RU block is a discrete-time linear time-invariant system implemented in state-space form as:
+```math
+\begin{align}
+x_{k+1} = Ax_{x} + B u_k\\
+y_k = C x_k + D u_k,
+\end{align}
+```
+A parametrization is provided for the matrices ```(A, B, C, D)```, guaranteeing a prescribed l2 bound for the overall SSM.
+Moreover, the use of [parallel scan algorithms](https://en.wikipedia.org/wiki/Prefix_sum) makes execution extremely fast on modern hardware in non-core-bound scenarios.
+
+## Deep L2RU Architecture
+
+L2RU units are typically organized in a deep LRU architecture like:
+
+<div align="center">
+  <img src="architecture/L2RU.png" alt="Description of image" width="800">
+</div>
+
+
+
+
+
+
