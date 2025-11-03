@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: neural-ssm
-Version: 0.1.6
+Version: 0.1.7
 Summary: Neural state space models and LRU variants in PyTorch
 Author: Leo Massai
 License: MIT
