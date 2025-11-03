@@ -1,10 +1,10 @@
 # python
 import math
-from typing import Optional, Tuple, List, Dict
+from typing import TypedDict, Optional, get_type_hints, Dict
+from dataclasses import fields
 from .scan_utils import *
 from ..static_layers.generic_layers import *
 from ..static_layers.lipschitz_mlps import *
-
 
 
 # --------- Small utilities (DRY helpers) ---------
@@ -21,11 +21,11 @@ def _normalize_to_3d(x: torch.Tensor) -> torch.Tensor:
 
 
 def _init_or_cast_state(
-    state: Optional[torch.Tensor],
-    batch_size: int,
-    n_state: int,
-    device: torch.device,
-    dtype: torch.dtype,
+        state: Optional[torch.Tensor],
+        batch_size: int,
+        n_state: int,
+        device: torch.device,
+        dtype: torch.dtype,
 ) -> torch.Tensor:
     if state is not None:
         return state.to(device=device, dtype=dtype)
@@ -42,16 +42,16 @@ def _scan_diag_linear(lambdas: torch.Tensor, Bu: torch.Tensor, x0: torch.Tensor)
     def _scan_fn(bu_seq):
         return associative_scan(binary_operator_diag, (lam_seq, bu_seq))[1]
 
-    scanned = torch.vmap(_scan_fn)(Bu)             # (B, L, N)
+    scanned = torch.vmap(_scan_fn)(Bu)  # (B, L, N)
     inner = torch.cat([x0.unsqueeze(1), scanned[:, :-1, :]], dim=1)  # (B, L, N)
     return scanned, inner
 
 
 def _complex_real_transform_blocks(
-    n: int,
-    dtype: torch.dtype,
-    device: torch.device,
-    cache: Dict[str, torch.Tensor],
+        n: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        cache: Dict[str, torch.Tensor],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     # Cache 2x2 block and its inverse per dtype/device to avoid reallocation
     key = f"{str(dtype)}@{device.type}:{device.index}"
@@ -71,15 +71,16 @@ def _complex_real_transform_blocks(
 # python
 class LRU(nn.Module):
     """Linear Recurrent Unit with loop or parallel-scan simulation."""
+
     def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        state_features: int,
-        internal_state_init=None,
-        rmin: float = 0.9,
-        rmax: float = 1.0,
-        max_phase: float = 6.283,
+            self,
+            in_features: int,
+            out_features: int,
+            state_features: int,
+            internal_state_init=None,
+            rmin: float = 0.9,
+            rmax: float = 1.0,
+            max_phase: float = 6.283,
     ):
         super().__init__()
         self.in_features = in_features
@@ -130,8 +131,8 @@ class LRU(nn.Module):
         lambda_abs = torch.exp(-torch.exp(self.nu_log))
         lambda_phase = torch.exp(self.theta_log)
         lambdas = lambda_abs * torch.exp(1j * lambda_phase)  # (N,) complex
-        gammas = torch.exp(self.gamma_log).unsqueeze(-1)     # (N,1) real
-        B = gammas * self.B                                  # (N,U) complex
+        gammas = torch.exp(self.gamma_log).unsqueeze(-1)  # (N,1) real
+        B = gammas * self.B  # (N,U) complex
         return lambdas, B, self.C, self.D
 
     def ss_real_matrices(self, to_numpy: bool = True):
@@ -140,7 +141,7 @@ class LRU(nn.Module):
         n2 = 2 * self.state_features
 
         lambdas_conj = torch.stack([lambdas, lambdas.conj()], dim=1).flatten()
-        A_full = torch.diag(lambdas_conj)                                # (2N,2N)
+        A_full = torch.diag(lambdas_conj)  # (2N,2N)
         B_full = torch.stack([B, B.conj()], dim=1).view(n2, self.in_features)
         C_half = 0.5 * C
         C_full = torch.stack([C_half, C_half.conj()], dim=2).view(self.out_features, n2)
@@ -186,7 +187,8 @@ class LRU(nn.Module):
         output = (inner @ C.mT).real + input @ D.T
         return output, inner
 
-    def forward(self, input: torch.Tensor, gamma: Optional[float] = None, state: Optional[torch.Tensor] = None, mode: str = "loop"):
+    def forward(self, input: torch.Tensor, gamma: Optional[float] = None, state: Optional[torch.Tensor] = None,
+                mode: str = "loop"):
         input = _normalize_to_3d(input)
         self.state = _init_or_cast_state(state, input.shape[0], self.state_features, input.device, self.B.dtype)
         if mode == "scan":
@@ -202,7 +204,9 @@ class LRU(nn.Module):
 # python
 class L2RU(nn.Module):
     """LRU with learnable or fixed l2 gain gamma."""
-    def __init__(self, state_features: int, gamma: float = None, init: str = "eye", q: int = 1, eye_scale=0.01, rand_scale=1):
+
+    def __init__(self, state_features: int, gamma: float = None, init: str = "eye", q: int = 1, eye_scale=0.01,
+                 rand_scale=1):
         super().__init__()
         self.state_features = state_features
         if gamma is not None:
@@ -300,7 +304,8 @@ class L2RU(nn.Module):
         self.A, self.B, self.D = A, B, D
         return A, B, C, D
 
-    def forward(self, input: torch.Tensor, state: Optional[torch.Tensor] = None, set_param: bool = True, mode: str = "scan"):
+    def forward(self, input: torch.Tensor, state: Optional[torch.Tensor] = None, set_param: bool = True,
+                mode: str = "scan"):
         input = _normalize_to_3d(input)
         # real-valued state for L2RU
         self.state = _init_or_cast_state(state, input.shape[0], self.state_features, input.device, input.dtype)
@@ -334,11 +339,12 @@ class L2RU(nn.Module):
         self.state = None
 
 
-
 # python
 class lruz(nn.Module):
     """LRU (ZAK parametrization) with learnable or fixed l2 gain gamma."""
-    def __init__(self, input_features: int, output_features: int, state_features: int, rmin=0.9, rmax=1.0, max_phase=6.283, gamma: float = None):
+
+    def __init__(self, input_features: int, output_features: int, state_features: int, rmin=0.9, rmax=1.0,
+                 max_phase=6.283, gamma: float = None):
         super().__init__()
         self.state_features = state_features
         self.input_features = input_features
@@ -474,7 +480,8 @@ class lruz(nn.Module):
         output = (inner @ C.mT).real + input @ D.T
         return output, inner
 
-    def forward(self, input: torch.Tensor, gamma=None, state: Optional[torch.Tensor] = None, set_param: bool = True, mode: str = "scan"):
+    def forward(self, input: torch.Tensor, gamma=None, state: Optional[torch.Tensor] = None, set_param: bool = True,
+                mode: str = "scan"):
         input = _normalize_to_3d(input)
         # complex-valued state for ZAK
         self.state = _init_or_cast_state(state, input.shape[0], self.state_features, input.device, torch.complex64)
@@ -487,7 +494,6 @@ class lruz(nn.Module):
 
     def reset(self):
         self.state = None
-
 
 
 """ SSM models ----------------------------------------- """
@@ -517,12 +523,20 @@ class SSMConfig:
 
     # Parallel scan must be selected in the forward call of the SSM.
 
-    """ SSMs blocks ----------------------------------------- """
+    # Generate TypedDict automatically
+
+
+SSMConfigDict = TypedDict('SSMConfigDict',
+                          {f.name: f.type for f in fields(SSMConfig)},
+                          total=False)
+
+""" SSMs blocks ----------------------------------------- """
 
 
 # python
 class SSL(nn.Module):
     """State Space Layer: LRU --> FF --> residual"""
+
     def __init__(self, config: SSMConfig):
         super().__init__()
         self.ln = nn.LayerNorm(config.d_model, bias=config.bias)
@@ -569,28 +583,73 @@ class SSL(nn.Module):
 
     def forward(self, x: torch.Tensor, state: Optional[torch.Tensor] = None, mode: str = "loop"):
         z, st = self.lru(_normalize_to_3d(x), state=state, mode=mode)  # LTI
-        z = self.ff(z)                                # nonlinearity
+        z = self.ff(z)  # nonlinearity
         z = self.dropout(z)
         return z + x, st
-
 
 
 # python
 class DeepSSM(nn.Module):
     """Deep SSM: encoder -> n blocks -> decoder."""
-    def __init__(self, n_u: int, n_y: int, config: SSMConfig):
+
+    def __init__(
+            self,
+            d_input: int,
+            d_output: int,
+            *,
+            # explicit keyword-only params mirroring SSMConfig
+            d_model: int = 10,
+            d_state: int = 32,
+            n_layers: int = 2,
+            dropout: float = 0.0,
+            bias: bool = False,
+            rmin: float = 0.0,
+            rmax: float = 1.0,
+            max_phase: float = 2 * math.pi,
+            ff: str = "MLP",
+            scale: float = 1,
+            dim_amp: int = 4,
+            d_hidden: int = 4,
+            param: Optional[str] = None,
+            gamma: Optional[float] = None,
+            init: str = "eye",
+            config: Optional[SSMConfig] = None,
+    ):
         super().__init__()
-        self.config = config
+        self.d_input = d_input
+        self.d_output = d_output
 
-        if config.param is not None and config.gamma is not None:
-            self.register_buffer("gamma_t", torch.tensor(config.gamma))
-            self.encoder = nn.Parameter(torch.randn(config.d_model, n_u))
-            self.decoder = nn.Parameter(torch.randn(n_y, config.d_model))
+        # prefer an explicit config instance, otherwise create one from kwargs
+        if config is not None:
+            self.config = config
         else:
-            self.encoder = nn.Linear(n_u, config.d_model, bias=False)
-            self.decoder = nn.Linear(config.d_model, n_y, bias=False)
+            self.config = SSMConfig(
+                d_model=d_model,
+                d_state=d_state,
+                n_layers=n_layers,
+                dropout=dropout,
+                bias=bias,
+                rmin=rmin,
+                rmax=rmax,
+                max_phase=max_phase,
+                ff=ff,
+                scale=scale,
+                dim_amp=dim_amp,
+                d_hidden=d_hidden,
+                param=param,
+                gamma=gamma,
+                init=init,
+            )
 
-        self.blocks = nn.ModuleList([SSL(config) for _ in range(config.n_layers)])
+        if self.config.param is not None and self.config.gamma is not None:
+            self.register_buffer("gamma_t", torch.tensor(self.config.gamma))
+            self.encoder = nn.Parameter(torch.randn(self.config.d_model, self.d_input))
+            self.decoder = nn.Parameter(torch.randn(self.d_output, self.config.d_model))
+        else:
+            self.encoder = nn.Linear(d_input, self.config.d_model, bias=False)
+            self.decoder = nn.Linear(self.config.d_model, d_output, bias=False)
+
+        self.blocks = nn.ModuleList([SSL(self.config) for _ in range(self.config.n_layers)])
 
     def forward(self, u: torch.Tensor, state: Optional[List[torch.Tensor]] = None, gamma=None, mode: str = "scan"):
         # Initialize per-layer states
@@ -639,6 +698,7 @@ class DeepSSM(nn.Module):
 # python
 class PureLRUR(nn.Module):
     """Pure LRU block without scaffolding."""
+
     def __init__(self, n: int, gamma: float = None, param: str = "l2ru", init: str = "eye"):
         super().__init__()
         if param == "l2ru":
@@ -651,4 +711,3 @@ class PureLRUR(nn.Module):
     def forward(self, x: torch.Tensor, state: Optional[torch.Tensor] = None, mode: str = "scan"):
         y, st = self.lru(_normalize_to_3d(x), state=state, mode=mode)
         return y, st
-

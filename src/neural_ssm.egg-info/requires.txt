@@ -8,6 +8,7 @@ einops>=0.6
 typing-extensions>=4.5
 jax>=0.4.26
 jaxlib>=0.4.26
+deel-torchlip
 
 [dev]
 black>=24.3.0

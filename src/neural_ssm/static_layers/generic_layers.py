@@ -41,10 +41,12 @@ class MLP(nn.Module):
         self.output_dim = config.d_output
         self.n_layers = config.n_layers
         self.input_dim = config.d_input
+        self.dropout = nn.Dropout(config.dropout) if config.dropout > 0 else nn.Identity()
 
         layers = nn.ModuleList()
+        layers.append(nn.Linear(self.input_dim, self.hidden_dim, bias=False))
         for i in range(config.n_layers):
-            layers.append(nn.Linear(config.d_input, self.hidden_dim, bias=False))
+            layers.append(nn.Linear(self.hidden_dim, self.hidden_dim, bias=False))
         layers.append(nn.GELU())
         layers.append(nn.Linear(self.hidden_dim, config.d_output, bias=False))
         self.net = nn.Sequential(*layers)
