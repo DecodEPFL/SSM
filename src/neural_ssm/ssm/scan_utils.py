@@ -155,15 +155,20 @@ def binary_operator_diag(q_i: Tuple[torch.Tensor, torch.Tensor], q_j: Tuple[torc
 # -------------------------
 def parallel_scan_affine(M: torch.Tensor, v: torch.Tensor):
     """
-    Inclusive parallel prefix for affine pairs (M, v) with column-vector convention.
+    Inclusive parallel prefix for affine pairs (M, v) in the recurrence
+
+        x_{t+1} = M_t @ x_t + v_t,   t = 0..T-1
 
     Args:
-        M: (seq_len, batch, D, D)
-        v: (seq_len, batch, D)
+        M: (T, batch, D, D)
+        v: (T, batch, D)
 
     Returns:
-        M_p: (seq_len, batch, D, D)  where M_p[t] = M[t] @ M[t-1] @ ... @ M[0]
-        v_p: (seq_len, batch, D)    where v_p[t] = M[t] @ M[t-1] @ ... @ M[1] @ v[0] + ... + v[t]
+        M_p: (T, batch, D, D)
+            M_p[t] = M_t @ M_{t-1} @ ... @ M_0
+        v_p: (T, batch, D)
+            v_p[t] = sum_{k=0}^t ( M_t @ ... @ M_{k+1} @ v_k )
+                    (with empty products taken as identity)
     """
     n = M.shape[0]
     if n == 0:
@@ -176,10 +181,11 @@ def parallel_scan_affine(M: torch.Tensor, v: torch.Tensor):
     offset = 1
     # Doubling rounds
     while offset < n:
-        # slice left = M_p[offset:]  (length n-offset)
-        # slice right = M_p[:n-offset] (length n-offset)
-        left = M_p[offset:].clone()  # shape (n-offset, batch, D, D)
-        right = M_p[: n - offset].clone()
+        # left  = M_p[offset:]     (length n-offset)
+        # right = M_p[:n-offset]   (length n-offset)
+        left = M_p[offset:].clone()  # (n-offset, batch, D, D)
+        right = M_p[: n - offset].clone()  # (n-offset, batch, D, D)
+
         # new_M[i] for i >= offset equals left[i-offset] @ right[i-offset]
         new_M_tail = torch.matmul(left, right)  # (n-offset, batch, D, D)
 
@@ -189,12 +195,8 @@ def parallel_scan_affine(M: torch.Tensor, v: torch.Tensor):
         new_v_tail = transformed + v_p[offset:].clone()  # (n-offset, batch, D)
 
         # Reconstruct full arrays without in-place overlapping writes
-        if offset == 0:
-            M_p = new_M_tail
-            v_p = new_v_tail
-        else:
-            M_p = torch.cat([M_p[:offset], new_M_tail], dim=0)
-            v_p = torch.cat([v_p[:offset], new_v_tail], dim=0)
+        M_p = torch.cat([M_p[:offset], new_M_tail], dim=0)
+        v_p = torch.cat([v_p[:offset], new_v_tail], dim=0)
 
         offset <<= 1
 
@@ -206,41 +208,55 @@ def parallel_scan_affine(M: torch.Tensor, v: torch.Tensor):
 # -------------------------
 def compute_linear_recurrence_parallel(A, B, u, x0):
     """
-    Compute x_t for t=1..T where x_{t} = A_t @ x_{t-1} + B_t @ u_{t-1}
+    Parallel solution of the linear recurrence
 
-    Conventions (column-vector):
-      - A: (seq_len, D, D) or (D, D)
-      - B: (seq_len, D, D) or (D, D)
-      - u: (seq_len, batch, D)   (u_0 .. u_{T-1})
-      - x0: (batch, D)
+        x_{t+1} = A_t @ x_t + B_t @ u_t,    t = 0..T-1
+        x_0 given.
+
+    Conventions (column-vector, time-major):
+        A: (T, D, D) or (D, D)        state transition
+        B: (T, D, D) or (D, D)        input matrix
+        u: (T, batch, D)              inputs u_0 .. u_{T-1}
+        x0: (batch, D)                initial state x_0
 
     Returns:
-      x: (seq_len, batch, D)  -> x[0] = x_1, ... x[T-1] = x_T
+        states: (T+1, batch, D)
+            states[0]     = x_0
+            states[t + 1] = x_{t+1} for t = 0..T-1
     """
-    seq_len = u.shape[0]
+    seq_len = u.shape[0]  # T
     batch_size = u.shape[1]
     D = u.shape[2]
 
     # ensure A,B have time dimension
     if A.dim() == 2:
-        A = A.unsqueeze(0).expand(seq_len, -1, -1).contiguous()
+        A = A.unsqueeze(0).expand(seq_len, -1, -1).contiguous()  # (T, D, D)
     if B.dim() == 2:
-        B = B.unsqueeze(0).expand(seq_len, -1, -1).contiguous()
+        B = B.unsqueeze(0).expand(seq_len, -1, -1).contiguous()  # (T, D, D)
 
-    # shape (seq_len, batch, D, D)
+    # shape (T, batch, D, D)
     M = A.unsqueeze(1).expand(-1, batch_size, -1, -1).contiguous()
     B_exp = B.unsqueeze(1).expand(-1, batch_size, -1, -1).contiguous()
 
-    # v_t = B_t @ u_t  (u is (seq_len, batch, D) -> unsqueeze -> (seq_len, batch, D, 1))
-    v = torch.matmul(B_exp, u.unsqueeze(-1)).squeeze(-1)  # (seq_len, batch, D)
+    # v_t = B_t @ u_t
+    # u: (T, batch, D) -> (T, batch, D, 1)
+    v = torch.matmul(B_exp, u.unsqueeze(-1)).squeeze(-1)  # (T, batch, D)
 
-    # compute prefix
-    M_p, v_p = parallel_scan_affine(M, v)  # M_p: (seq_len, batch, D, D), v_p: (seq_len, batch, D)
+    # compute prefix for x_{t+1} = M_t ... M_0 x_0 + v_p[t]
+    M_p, v_p = parallel_scan_affine(M, v)  # M_p: (T, batch, D, D), v_p: (T, batch, D)
 
-    # compute x_t = M_p[t] @ x0 + v_p[t]
-    # x0.unsqueeze(-1) is (batch, D, 1) -- will broadcast across seq_len
-    x = torch.matmul(M_p, x0.unsqueeze(-1)).squeeze(-1) + v_p  # (seq_len, batch, D)
-    return x
+    # x_{t+1} = M_p[t] @ x0 + v_p[t]
+    x_next = torch.matmul(M_p, x0.unsqueeze(-1)).squeeze(-1) + v_p  # (T, batch, D)
+
+    # assemble full trajectory: [x_0, x_1, ..., x_T]
+    states = torch.empty(
+        seq_len + 1, batch_size, D,
+        device=u.device, dtype=u.dtype,
+    )
+    states[0] = x0
+    states[1:] = x_next
+
+    return states
 
 
 # -------------------------
