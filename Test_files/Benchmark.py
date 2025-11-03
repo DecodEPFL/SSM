@@ -13,8 +13,6 @@ import math
 import nonlinear_benchmarks
 from nonlinear_benchmarks.error_metrics import RMSE, NRMSE, R_squared, MAE, fit_index
 #from SSM.utility import SimpleLSTM
-
-#from SSM.ssm import DeepSSM, SSMConfig
 from src.neural_ssm.ssm.lru import DeepSSM, SSMConfig
 
 
@@ -652,6 +650,8 @@ def main():
     loss_file = train_config.save_dir / "loss_history.npy"
     np.save(loss_file, np.array(history['train_losses']))
     print(f"Saved loss history to {loss_file}\n")
+
+    x = DeepSSM(d_input=4, d_output=3, d_model=3)
 
 
 if __name__ == "__main__":
