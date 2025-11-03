@@ -32,19 +32,115 @@ def _init_or_cast_state(
     return torch.zeros(batch_size, n_state, device=device, dtype=dtype)
 
 
-def _scan_diag_linear(lambdas: torch.Tensor, Bu: torch.Tensor, x0: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    # Bu: (B, L, N) already includes the input * B^T. We seed first step with lambdas * x0.
-    B, L, N = Bu.shape
+def _scan_diag_linear(
+        lambdas: torch.Tensor,  # (N,)
+        Bu: torch.Tensor,  # (B, L, N) = B u_t already
+        x0: torch.Tensor,  # (B, N)
+) -> torch.Tensor:
+    """
+    Diagonal linear recurrence via parallel scan:
+
+        x_{t+1} = lambdas * x_t + Bu[:, t]
+
+    Args:
+        lambdas: (N,)
+        Bu:      (B, L, N)  precomputed B @ u_t
+        x0:      (B, N)     initial state x_0
+
+    Returns:
+        states:  (B, L+1, N) with
+                 states[:, 0]   = x_0
+                 states[:, t+1] = x_{t+1} for t = 0..L-1
+    """
+    Bsz, L, N = Bu.shape
     Bu = Bu.clone()
+    x0 = x0.squeeze(1)
+    # fold x0 into the first step
     Bu[:, 0, :] += lambdas * x0
-    lam_seq = lambdas.expand(L, -1)
+
+    lam_seq = lambdas.expand(L, -1)  # (L, N)
 
     def _scan_fn(bu_seq):
+        # returns sequence x_1..x_L, shape (L, N)
         return associative_scan(binary_operator_diag, (lam_seq, bu_seq))[1]
 
-    scanned = torch.vmap(_scan_fn)(Bu)  # (B, L, N)
-    inner = torch.cat([x0.unsqueeze(1), scanned[:, :-1, :]], dim=1)  # (B, L, N)
-    return scanned, inner
+    x_next = torch.vmap(_scan_fn)(Bu)  # (B, L, N): x_1..x_L
+
+    # assemble full trajectory [x_0, ..., x_L]
+    states = torch.empty(Bsz, L + 1, N, device=Bu.device, dtype=Bu.dtype)
+    states[:, 0] = x0
+    states[:, 1:] = x_next
+    return states
+
+
+def lru_forward_loop(
+        input: torch.Tensor,
+        state: torch.Tensor,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        C: torch.Tensor,
+        D: torch.Tensor,
+):
+    """
+    Sequential state-space recurrence (loop version).
+
+    Recurrence:
+        x_{t+1} = A x_t + B u_t
+        y_t     = Re(C x_t) + D u_t
+
+    Supports:
+        - A: (N,)   -> diagonal (elementwise multiplication)
+        - A: (N,N)  -> full constant matrix
+
+    Args:
+        input:  (B, L, H)
+        state:  (B, N)        initial state x_0
+        A:      (N,) or (N,N) state transition
+        B:      (N, H)
+        C:      (H_out, N)
+        D:      (H_out, H)
+
+    Returns:
+        output: (B, L, H_out)   y_t = Re(C x_t) + D u_t
+        states: (B, L+1, N)     full trajectory [x_0, ..., x_L]
+    """
+    BATCH, SEQ, H = input.shape
+    N = state.shape[-1]
+
+    assert B.shape == (N, H), f"Expected B shape (N,H), got {B.shape}"
+    assert C.shape[1] == N, f"Expected C.shape[1]={N}, got {C.shape[1]}"
+    assert D.shape[1] == H, f"Expected D.shape[1]={H}, got {D.shape[1]}"
+
+    x = state.to(B.dtype)  # (B, N)
+    uB = input.to(B.dtype)  # (B, L, H)
+    BT = B.mT  # (H, N)
+
+    # Allocate full trajectory [x_0, ..., x_L]
+    states = torch.empty(BATCH, SEQ + 1, N,
+                         device=input.device,
+                         dtype=B.dtype)
+    states[:, 0] = x
+
+    if A.dim() == 1:
+        # Diagonal A (vector of lambdas)
+        lambdas = A.to(B.dtype)
+        for t, u_t in enumerate(uB.unbind(dim=1), start=1):
+            x = lambdas * x + u_t @ BT
+            states[:, t] = x
+    elif A.dim() == 2:
+        # Full constant A
+        A_T = A.mT.to(B.dtype)
+        for t, u_t in enumerate(uB.unbind(dim=1), start=1):
+            x = x @ A_T + u_t @ BT
+            states[:, t] = x
+    else:
+        raise ValueError(f"Unsupported A.dim()={A.dim()}, expected 1 or 2")
+
+    # pre-update states for output: x_t
+    pre_states = states[:, :-1, :]
+    output = (pre_states @ C.mT).real + input @ D.T
+
+    return output, states
 
 
 def _complex_real_transform_blocks(
@@ -113,7 +209,7 @@ class LRU(nn.Module):
             torch.randn(state_features, in_features) / self._sqrt_2_in_features,
             torch.randn(state_features, in_features) / self._sqrt_2_in_features,
         )
-        self.B = nn.Parameter(B_complex)  # (N, U)
+        self.Bp = nn.Parameter(B_complex)  # (N, U)
 
         C_complex = torch.complex(
             torch.randn(out_features, state_features) / self._sqrt_state_features,
@@ -127,16 +223,18 @@ class LRU(nn.Module):
         # Small cache for complex->real transform 2x2 blocks
         self._T_cache: Dict[str, torch.Tensor] = {}
 
-    def ss_params(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        self.set_param()  # initialize SSM params
+
+    def set_param(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         lambda_abs = torch.exp(-torch.exp(self.nu_log))
         lambda_phase = torch.exp(self.theta_log)
-        lambdas = lambda_abs * torch.exp(1j * lambda_phase)  # (N,) complex
+        self.lambdas = lambda_abs * torch.exp(1j * lambda_phase)  # (N,) complex
         gammas = torch.exp(self.gamma_log).unsqueeze(-1)  # (N,1) real
-        B = gammas * self.B  # (N,U) complex
-        return lambdas, B, self.C, self.D
+        self.B = gammas * self.Bp  # (N,U) complex
+        return self.lambdas, self.B, self.C, self.D
 
     def ss_real_matrices(self, to_numpy: bool = True):
-        lambdas, B, C, D = self.ss_params()
+        lambdas, B, C, D = self.set_param()
         device, dtype = lambdas.device, lambdas.dtype
         n2 = 2 * self.state_features
 
@@ -158,34 +256,23 @@ class LRU(nn.Module):
         return tuple(mats)
 
     def forward_loop(self, input: torch.Tensor, state: torch.Tensor):
-        BATCH, SEQ, _ = input.shape
-        lambdas, B, C, D = self.ss_params()
-
-        x = state.to(B.dtype)
-        uB = input.to(B.dtype)
-        BT = B.mT
-
-        inner = torch.empty(BATCH, SEQ, self.state_features, device=input.device, dtype=B.dtype)
-        for t, u_t in enumerate(uB.unbind(dim=1)):
-            inner[:, t] = x
-            x = lambdas * x + u_t @ BT
-
-        self.state = x.detach()
-        output = (inner @ C.mT).real + input @ D.T
-        return output, inner
+        self.set_param()
+        output, states = lru_forward_loop(input, state, self.lambdas, self.B, self.C, self.D)
+        self.state = states[:, -1].detach()
+        return output, states
 
     @torch.compiler.disable
     def forward_scan(self, input: torch.Tensor, state: Optional[torch.Tensor] = None):
-        BATCH, SEQ, _ = input.shape
-        lambdas, B, C, D = self.ss_params()
+        lambdas, B, C, D = self.set_param()
 
         x0 = state.to(B.dtype)
         Bu = input.to(B.dtype) @ B.mT
-        scanned, inner = _scan_diag_linear(lambdas, Bu, x0)
+        # compute state trajectory [x_0, ..., x_L]
+        states = _scan_diag_linear(lambdas, Bu, x0)  # (B, L+1, N)
 
-        self.state = scanned[:, -1, :].detach()
-        output = (inner @ C.mT).real + input @ D.T
-        return output, inner
+        self.state = states[:, -1, :].detach()
+        output = (states[:, :-1, :] @ C.mT).real + input @ D.T
+        return output, states
 
     def forward(self, input: torch.Tensor, gamma: Optional[float] = None, state: Optional[torch.Tensor] = None,
                 mode: str = "loop"):
@@ -249,10 +336,8 @@ class L2RU(nn.Module):
         self.Dt = nn.Parameter(torch.eye(state_features))
 
         # Runtime LTI
-        self.A = torch.zeros(state_features, state_features)
-        self.B = torch.zeros(state_features, state_features)
-        self.D = torch.zeros(state_features, state_features)
         self.state: Optional[torch.Tensor] = None
+        self.set_param()
 
     def _get_lower_triangular(self, params: torch.Tensor) -> torch.Tensor:
         L = torch.zeros(self.state_features, self.state_features, device=params.device, dtype=params.dtype)
@@ -316,22 +401,14 @@ class L2RU(nn.Module):
 
         if mode == "scan":
             u = input.permute(1, 0, 2)  # (L,B,H)
-            states = compute_linear_recurrence_parallel(self.A, self.B, u, x0).permute(1, 0, 2)
+            states = compute_linear_recurrence_parallel(self.A, self.B, u, x0).transpose(0, 1)
             self.state = states[:, -1, :].detach()
-            outputs = states @ self.C.transpose(-1, -2) + input @ self.D.transpose(-1, -2)
+            outputs = states[:, :-1, :] @ self.C.transpose(-1, -2) + input @ self.D.transpose(-1, -2)
             return outputs, states
         elif mode in ("loop", "loop_efficient"):
-            BT = self.B.transpose(-1, -2)
-            AT = self.A.transpose(-1, -2)
-            x = x0
-            inner = []
-            for u_t in input.unbind(dim=1):
-                x = x @ AT + u_t @ BT
-                inner.append(x)
-            states = torch.stack(inner, dim=1)
-            self.state = states[:, -1, :].detach()
-            outputs = states @ self.C.transpose(-1, -2) + input @ self.D.transpose(-1, -2)
-            return outputs, states
+            output, states = lru_forward_loop(input, self.state, self.A, self.B, self.C, self.D)
+            self.state = states[:, -1].detach()
+            return output, states
         else:
             raise ValueError(f"Unknown mode: {mode}. Expected 'scan', 'loop', or 'loop_efficient'.")
 
@@ -448,23 +525,12 @@ class lruz(nn.Module):
         return A, B, C, D
 
     def forward_loop(self, input: torch.Tensor, state: Optional[torch.Tensor] = None, set_param: bool = True):
-        BATCH, SEQ, _ = input.shape
         if set_param:
             self.set_param()
         lambdas = torch.diagonal(self.A)
-
-        x = state.to(self.B.dtype)
-        uB = input.to(self.B.dtype)
-        BT = self.B.mT
-
-        inner = torch.empty(BATCH, SEQ, self.state_features, device=input.device, dtype=self.B.dtype)
-        for t, u_t in enumerate(uB.unbind(dim=1)):
-            inner[:, t] = x
-            x = lambdas * x + u_t @ BT
-
-        self.state = x.detach()
-        output = (inner @ self.C.mT).real + input @ self.D.T
-        return output, inner
+        output, states = lru_forward_loop(input, state, lambdas, self.B, self.C, self.D)
+        self.state = states[:, -1].detach()
+        return output, states
 
     @torch.compiler.disable
     def forward_scan(self, input: torch.Tensor, state: Optional[torch.Tensor] = None, set_param: bool = True):
@@ -474,11 +540,12 @@ class lruz(nn.Module):
 
         x0 = state.to(B.dtype)
         Bu = input.to(B.dtype) @ B.mT
-        scanned, inner = _scan_diag_linear(lambdas, Bu, x0)
+        # compute state trajectory [x_0, ..., x_L]
+        states = _scan_diag_linear(lambdas, Bu, x0)  # (B, L+1, N)
 
-        self.state = scanned[:, -1, :].detach()
-        output = (inner @ C.mT).real + input @ D.T
-        return output, inner
+        self.state = states[:, -1, :].detach()
+        output = (states[:, :-1, :] @ C.mT).real + input @ D.T
+        return output, states
 
     def forward(self, input: torch.Tensor, gamma=None, state: Optional[torch.Tensor] = None, set_param: bool = True,
                 mode: str = "scan"):
@@ -668,7 +735,7 @@ class DeepSSM(nn.Module):
         # Cascade blocks
         for i, block in enumerate(self.blocks):
             x, st = block(x, state=layer_states[i], mode=mode)
-            layer_states[i] = st
+            layer_states[i] = st[:, -1, :]  # keep only final state
 
         # Decode
         if self.config.param is not None and self.config.gamma is not None:

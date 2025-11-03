@@ -124,6 +124,7 @@ class LMLP(nn.Module):
         # Layer construction using list comprehension
         layers = nn.ModuleList()
         layers.append(FirstChannel(config.d_input, scale=config.lip))
+        layers.append(SandwichFc(config.d_input, hidden_dim, bias=False, scale=config.lip))
         for i in range(config.n_layers):
             layers.append(SandwichFc(hidden_dim, hidden_dim, bias=False, scale=config.lip))
         layers.append(SandwichLin(hidden_dim, config.d_output, bias=False, scale=config.lip))
