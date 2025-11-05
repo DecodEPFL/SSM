@@ -28,10 +28,6 @@ dependencies = [
   # Core
   "torch>=2.2",
   "numpy>=1.23",
-  # SciPy for linear algebra and scipy.io.loadmat (MAT files in Test_files)
-  "scipy>=1.10",
-  # Optional MAT v7.3 support via HDF5 (some .mat files may require it)
-  "h5py>=3.9",
   # Utilities commonly used in training/eval and plotting
   "tqdm>=4.66",
   "matplotlib>=3.7",

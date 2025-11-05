@@ -13,6 +13,7 @@ import math
 import nonlinear_benchmarks
 from nonlinear_benchmarks.error_metrics import RMSE, NRMSE, R_squared, MAE, fit_index
 #from SSM.utility import SimpleLSTM
+#from neural_ssm import DeepSSM, SSMConfig
 from src.neural_ssm.ssm.lru import DeepSSM, SSMConfig
 
 
@@ -589,10 +590,10 @@ def main():
     y_val = torch.tensor(y_val, dtype=torch.float32).unsqueeze(-1)
 
     # Initialize configurations
-    model_config = ModelConfig(n_u=u_train.shape[1], n_y=y_train.shape[1], param='lru', d_model=12, d_state=11,
+    model_config = ModelConfig(n_u=u_train.shape[1], n_y=y_train.shape[1], param='l2ru', d_model=12, d_state=11,
                                gamma=None, ff='GLU', init='eye',
                                n_layers=3, d_amp=3)
-    train_config = TrainingConfig(num_epochs=100000, learning_rate=1e-4)
+    train_config = TrainingConfig(num_epochs=5000, learning_rate=1e-4)
 
     # Build model
     print("Building model...")
