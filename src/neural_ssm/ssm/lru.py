@@ -106,53 +106,70 @@ def lru_forward_loop(
         output: (B, L, H_out)   y_t = Re(C x_t) + D u_t
         states: (B, L+1, N)     full trajectory [x_0, ..., x_L]
     """
-    BATCH = input.size(0)
-    SEQ   = input.size(1)
-    H     = input.size(2)
-    N     = state.size(1)
+    BATCH, SEQ, H = input.shape
+    N = state.size(1)
 
-    # Basic shape sanity checks (TorchScript supports assert)
+    # Basic shape sanity checks
+    assert state.size(0) == BATCH
     assert B.size(0) == N and B.size(1) == H
     assert C.size(1) == N
     assert D.size(1) == H
 
-    x = state.to(B.dtype)      # (B, N)
-    uB = input.to(B.dtype)     # (B, L, H)
-    BT = B.mT                  # (H, N)
+    # Use input's dtype/device as reference
+    dtype = input.dtype
+    device = input.device
+
+    # Cast everything once, up front (no per-step .to calls)
+    state = state.to(dtype=dtype, device=device)
+    B = B.to(dtype=dtype, device=device)
+    C = C.to(dtype=dtype, device=device)
+    D = D.to(dtype=dtype, device=device)
+
+    # A might be complex in LRU; keep dtype consistent but don't force device move
+    A = A.to(dtype=dtype)
+
+    # Precompute transposes (matrix-layout friendly)
+    BT = B.mT          # (H, N)
+    CT = C.mT          # (N, H_out)
+    DT = D.mT          # (H, H_out)
 
     # Allocate full trajectory [x_0, ..., x_L]
     states = torch.empty(
         (BATCH, SEQ + 1, N),
-        device=input.device,
-        dtype=B.dtype,
+        device=device,
+        dtype=dtype,
     )
+    x = state  # (B, N)
     states[:, 0] = x
 
     if A.dim() == 1:
         # Diagonal A (vector of lambdas)
-        lambdas = A.to(B.dtype)
-        t = 0
-        while t < SEQ:
-            u_t = uB[:, t, :]               # (B, H)
-            x = lambdas * x + u_t @ BT      # (B, N)
+        lambdas = A  # (N,)
+        for t in range(SEQ):
+            u_t = input[:, t, :]           # (B, H)
+            # x = lambdas * x + u_t @ BT
+            x = x * lambdas                # broadcasts over batch
+            x = x + u_t @ BT               # (B, N)
             states[:, t + 1] = x
-            t += 1
     elif A.dim() == 2:
         # Full constant A
-        A_T = A.mT.to(B.dtype)
-        t = 0
-        while t < SEQ:
-            u_t = uB[:, t, :]               # (B, H)
-            x = x @ A_T + u_t @ BT          # (B, N)
+        A_T = A.mT                         # (N, N)
+        for t in range(SEQ):
+            u_t = input[:, t, :]           # (B, H)
+            # x = x @ A_T + u_t @ BT
+            x = x @ A_T                    # (B, N)
+            x = x + u_t @ BT               # (B, N)
             states[:, t + 1] = x
-            t += 1
     else:
         # TorchScript only supports RuntimeError, not ValueError etc.
         raise RuntimeError("Unsupported A.dim(), expected 1 or 2")
 
     # pre-update states for output: x_t
-    pre_states = states[:, :-1, :]          # (B, L, N)
-    output = (pre_states @ C.mT).real + input @ D.T
+    pre_states = states[:, :-1, :]         # (B, L, N)
+
+    # Vectorized output computation over time
+    # (B, L, N) @ (N, H_out) --> (B, L, H_out)
+    output = (pre_states @ CT).real + input @ DT
 
     return output, states
 
@@ -731,7 +748,7 @@ class DeepSSM(nn.Module):
 
         self.blocks = nn.ModuleList([SSL(self.config) for _ in range(self.config.n_layers)])
 
-    def forward(self, u: torch.Tensor, state: Optional[List[torch.Tensor]] = None, gamma=None, mode: str = "scan"):
+    def forward(self, u: torch.Tensor, state: Optional[List[torch.Tensor]] = None, gamma=None, mode: str = "loop"):
         # Initialize per-layer states
         layer_states: List[Optional[torch.Tensor]]
         if state is None:

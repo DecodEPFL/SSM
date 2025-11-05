@@ -195,8 +195,12 @@ def parallel_scan_affine(M: torch.Tensor, v: torch.Tensor):
         new_v_tail = transformed + v_p[offset:].clone()  # (n-offset, batch, D)
 
         # Reconstruct full arrays without in-place overlapping writes
-        M_p = torch.cat([M_p[:offset], new_M_tail], dim=0)
-        v_p = torch.cat([v_p[:offset], new_v_tail], dim=0)
+        if offset == 0:
+            M_p = new_M_tail
+            v_p = new_v_tail
+        else:
+            M_p = torch.cat([M_p[:offset], new_M_tail], dim=0)
+            v_p = torch.cat([v_p[:offset], new_v_tail], dim=0)
 
         offset <<= 1
 
