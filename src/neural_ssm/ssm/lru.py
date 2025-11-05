@@ -1,6 +1,7 @@
 # python
 import math
-from typing import TypedDict, Optional, get_type_hints, Dict
+from typing import TypedDict, Dict
+from torch import Tensor
 from dataclasses import fields
 from .scan_utils import *
 from ..static_layers.generic_layers import *
@@ -73,14 +74,15 @@ def _scan_diag_linear(
     return states
 
 
+@torch.jit.script
 def lru_forward_loop(
-        input: torch.Tensor,
-        state: torch.Tensor,
-        A: torch.Tensor,
-        B: torch.Tensor,
-        C: torch.Tensor,
-        D: torch.Tensor,
-):
+    input: Tensor,
+    state: Tensor,
+    A: Tensor,
+    B: Tensor,
+    C: Tensor,
+    D: Tensor,
+) -> Tuple[Tensor, Tensor]:
     """
     Sequential state-space recurrence (loop version).
 
@@ -104,44 +106,55 @@ def lru_forward_loop(
         output: (B, L, H_out)   y_t = Re(C x_t) + D u_t
         states: (B, L+1, N)     full trajectory [x_0, ..., x_L]
     """
-    BATCH, SEQ, H = input.shape
-    N = state.shape[-1]
+    BATCH = input.size(0)
+    SEQ   = input.size(1)
+    H     = input.size(2)
+    N     = state.size(1)
 
-    assert B.shape == (N, H), f"Expected B shape (N,H), got {B.shape}"
-    assert C.shape[1] == N, f"Expected C.shape[1]={N}, got {C.shape[1]}"
-    assert D.shape[1] == H, f"Expected D.shape[1]={H}, got {D.shape[1]}"
+    # Basic shape sanity checks (TorchScript supports assert)
+    assert B.size(0) == N and B.size(1) == H
+    assert C.size(1) == N
+    assert D.size(1) == H
 
-    x = state.to(B.dtype)  # (B, N)
-    uB = input.to(B.dtype)  # (B, L, H)
-    BT = B.mT  # (H, N)
+    x = state.to(B.dtype)      # (B, N)
+    uB = input.to(B.dtype)     # (B, L, H)
+    BT = B.mT                  # (H, N)
 
     # Allocate full trajectory [x_0, ..., x_L]
-    states = torch.empty(BATCH, SEQ + 1, N,
-                         device=input.device,
-                         dtype=B.dtype)
+    states = torch.empty(
+        (BATCH, SEQ + 1, N),
+        device=input.device,
+        dtype=B.dtype,
+    )
     states[:, 0] = x
 
     if A.dim() == 1:
         # Diagonal A (vector of lambdas)
         lambdas = A.to(B.dtype)
-        for t, u_t in enumerate(uB.unbind(dim=1), start=1):
-            x = lambdas * x + u_t @ BT
-            states[:, t] = x
+        t = 0
+        while t < SEQ:
+            u_t = uB[:, t, :]               # (B, H)
+            x = lambdas * x + u_t @ BT      # (B, N)
+            states[:, t + 1] = x
+            t += 1
     elif A.dim() == 2:
         # Full constant A
         A_T = A.mT.to(B.dtype)
-        for t, u_t in enumerate(uB.unbind(dim=1), start=1):
-            x = x @ A_T + u_t @ BT
-            states[:, t] = x
+        t = 0
+        while t < SEQ:
+            u_t = uB[:, t, :]               # (B, H)
+            x = x @ A_T + u_t @ BT          # (B, N)
+            states[:, t + 1] = x
+            t += 1
     else:
-        raise ValueError(f"Unsupported A.dim()={A.dim()}, expected 1 or 2")
+        # TorchScript only supports RuntimeError, not ValueError etc.
+        raise RuntimeError("Unsupported A.dim(), expected 1 or 2")
 
     # pre-update states for output: x_t
-    pre_states = states[:, :-1, :]
+    pre_states = states[:, :-1, :]          # (B, L, N)
     output = (pre_states @ C.mT).real + input @ D.T
 
     return output, states
-
 
 def _complex_real_transform_blocks(
         n: int,
@@ -565,7 +578,7 @@ class lruz(nn.Module):
 
 """ SSM models ----------------------------------------- """
 
-""" Data class to set up the SSM model (values here are used just to initialize all fields) """
+""" Optional data class to set up the SSM model (values here are used just to initialize all fields) """
 
 
 @dataclass

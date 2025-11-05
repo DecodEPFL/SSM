@@ -597,7 +597,7 @@ def main():
     # Build model
     print("Building model...")
     ssm_config = model_config.to_ssm_config()
-    model = DeepSSM(model_config.n_u, model_config.n_y, ssm_config)
+    model = DeepSSM(d_input=model_config.n_u, d_output=model_config.n_y, config=ssm_config)
 
     # Try RNN
     #model = SimpleLSTM(hidden_dim=32, bidirectional=False, num_layers=2)
