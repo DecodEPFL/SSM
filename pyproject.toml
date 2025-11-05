@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
 authors = [
-  { name = "Leo Massai" }
+  { name = "Leonardo Massai" }
 ]
 classifiers = [
   "Programming Language :: Python :: 3",
