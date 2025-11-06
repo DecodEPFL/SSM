@@ -6,6 +6,7 @@ import torch
 from jax.tree_util import tree_flatten, tree_unflatten
 from typing import overload, Callable, Iterable, List, TypeVar, Any, Literal, Union, Sequence, Tuple, Optional
 from functools import partial
+import math
 
 """
 Jax-Pytorch ported functions, mostly interfaces are kept the same but unsupported features are removed:
@@ -282,3 +283,174 @@ def compute_linear_recurrence_sequential(A, B, u, x0):
         current_x = torch.matmul(A_t, current_x.unsqueeze(-1)).squeeze(-1) + input_term
         x[t] = current_x
     return x
+
+
+# Test
+
+
+def prefix_scan(x, prefix_func, dim, pad_value=0):
+    """
+    Apply prefix_func in parallel over sequence, left to right, executing
+    log2(seq length) iterations. Implemented by Franz A. Heinsen, 2024.
+
+    Args:
+        x: tensor of shape [*preceding_dims, seq_len, *operand_dims].
+        prefix_func: broadcastable binary associative function.
+        dim: dimension over which to compute the parallel scan.
+        pad_value: for padding sequences to a power of two. Default: 0.
+
+    Output:
+        y: tensor of shape [*preceding_dims, seq_len, *operand_dims].
+
+    Sample use:
+    >>> n, d = (100, 1024)
+    >>> x = torch.randn(n, d, d) / (d**0.5)       # n square matrices
+    >>> y = prefix_scan(x, torch.matmul, dim=-3)  # cumulative matmul
+    """
+    x = x.movedim(dim, -1)  # for easier indexing
+    other_dims, seq_len = (x.shape[:-1], x.size(-1))
+    n_powers_of_2 = int(math.ceil(math.log2(seq_len)))
+    n_pads = 2 ** n_powers_of_2 - seq_len
+    x = torch.nn.functional.pad(x, (0, n_pads), value=pad_value)
+    for n in (2 ** torch.arange(n_powers_of_2)).tolist():
+        x = x.view(*other_dims, -1, n * 2)
+        last_on_L = x[..., (n - 1):n]
+        last_on_L = last_on_L.movedim((-2, -1), (dim - 1, dim))
+        all_on_R = x[..., n:]
+        all_on_R = all_on_R.movedim((-2, -1), (dim - 1, dim))
+        updated_on_R = prefix_func(last_on_L, all_on_R)
+        updated_on_R = updated_on_R.movedim((dim - 1, dim), (-2, -1))
+        x = torch.cat([x[..., :n], updated_on_R], dim=-1)
+    x = x.view(*other_dims, -1)
+    x = x[..., :seq_len]
+    y = x.movedim(-1, dim)  # put dims back in orig order
+    return y
+
+
+def reduce_scan(x, reduce_func, dim):
+    """
+    Apply reduce_func in parallel over sequence, left to right, executing
+    log2(seq length) iterations. Implemented by Franz A. Heinsen, 2024.
+
+    Args:
+        x: tensor of shape [*preceding_dims, seq_len, *operand_dims].
+        reduce_func: broadcastable binary associative function.
+        dim: dimension over which to compute the parallel scan.
+
+    Output:
+        y: tensor of shape [*preceding_dims, *operand_dims].
+
+    Sample use:
+    >>> n, d = (100, 1024)
+    >>> x = torch.randn(n, d, d) / (d**0.5)       # n square matrices
+    >>> y = reduce_scan(x, torch.matmul, dim=-3)  # matmul of all matrices
+    """
+    x = x.movedim(dim, -1)  # for easier indexing
+    other_dims, seq_len = (x.shape[:-1], x.size(-1))
+    n_powers_of_2 = int(math.ceil(math.log2(seq_len)))
+    for _ in range(n_powers_of_2):
+        if x.size(-1) % 2 == 0:
+            leftover = None
+        else:
+            leftover = x[..., -1:]
+            x = x[..., :-1]
+        x = x.view(*other_dims, -1, 2)
+        operands_on_L = x[..., 0].movedim(-1, dim)
+        operands_on_R = x[..., 1].movedim(-1, dim)
+        x = reduce_func(operands_on_L, operands_on_R)
+        x = x.movedim(dim, -1)
+        if leftover is not None:
+            x = torch.cat([x, leftover], dim=-1)
+    y = x.squeeze(-1)
+    return y
+
+
+import torch.nn.functional as F
+
+
+# pip install git+https://github.com/glassroom/torch_parallel_scan.git
+
+
+def compute_linear_recurrence_parallel_scan(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        u: torch.Tensor,
+        x0: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Parallel solution of the LTI recurrence using torch_parallel_scan:
+
+        x_{t+1} = A x_t + B u_t,   t = 0..T-1
+
+    Shapes (matches your existing compute_linear_recurrence_parallel):
+        A:   (D, D)          constant (not time-varying)
+        B:   (D, D)          constant (not time-varying)
+        u:   (T, B, D)       inputs u_t
+        x0:  (B, D)          initial state x_0
+
+    Returns:
+        states: (T+1, B, D)
+            states[0]     = x_0
+            states[t + 1] = x_{t+1}
+    """
+    T, batch_size, D = u.shape
+    device = u.device
+    dtype = u.dtype
+
+    A = A.to(device=device, dtype=dtype)
+    B = B.to(device=device, dtype=dtype)
+    x0 = x0.to(device=device, dtype=dtype)
+
+    # Trivial case
+    if T == 0:
+        return x0.unsqueeze(0)  # (1, B, D)
+
+    # We’ll work in row-vector form:
+    #   x_{t+1} = x_t @ A_row + u_t @ B_row
+    A_row = A.mT  # (D, D)
+    B_row = B.mT  # (D, D)
+
+    # Reorder u to (B, T, D) to be batch-major for prefix_scan setup
+    u_bt = u.permute(1, 0, 2)  # (B, T, D)
+
+    # 1) Compute affine term: b_t = u_t @ B_row  (row-vector convention)
+    #    u_bt: (B, T, D), B_row: (D, D)  -> b: (B, T, D)
+    b = u_bt @ B_row
+
+    # 2) Constant A_row per (batch, time): shape (B, T, D, D)
+    A_block = A_row.view(1, 1, D, D).expand(batch_size, T, D, D).contiguous()
+
+    # 3) Build augmented matrices mod_W[b, t] ∈ R^{(D+1)x(D+1)} s.t.
+    #       [x_t, 1] @ mod_W[b, t] = [x_{t+1}, 1]
+    #
+    #   Block form:
+    #       mod_W = [[ A_row, 0 ],
+    #                [ b_t,   1 ]]
+    #
+    W_pad = F.pad(A_block, (0, 1), value=0.0)  # (B, T, D,   D+1)
+    b_pad = F.pad(b, (0, 1), value=1.0).unsqueeze(-2)  # (B, T, 1,   D+1)
+    mod_W = torch.cat([W_pad, b_pad], dim=-2)  # (B, T, D+1, D+1)
+
+    # 4) Parallel prefix over time dimension (dim=1 is T)
+    #    cum_mod_W[b, t] = mod_W[b, 0] @ ... @ mod_W[b, t]
+    cum_mod_W = prefix_scan(mod_W, torch.matmul, dim=1)  # (B, T, D+1, D+1)
+
+    # 5) Augmented initial state: [x0, 1]  -> (B, D+1)
+    mod_x0 = F.pad(x0, (0, 1), value=1.0)
+
+    # 6) Apply cumulative affine maps in parallel:
+    #       mod_x[b, t] = [x0[b], 1] @ cum_mod_W[b, t] = [x_{t+1}, 1]
+    #    Use einsum for batched row-vector @ matrix:
+    mod_x = torch.einsum('bd, btdk -> btk', mod_x0, cum_mod_W)  # (B, T, D+1)
+
+    # 7) Drop homogeneous coordinate and build full trajectory [x_0, ..., x_T]
+    x = mod_x[..., :-1]  # (B, T, D)
+
+    states_btD = torch.empty(batch_size, T + 1, D,
+                             device=device, dtype=dtype)
+    states_btD[:, 0, :] = x0
+    states_btD[:, 1:, :] = x
+
+    # Return as (T+1, B, D) to match your existing call-site
+    states_TBD = states_btD.permute(1, 0, 2)
+    return states_TBD

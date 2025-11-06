@@ -76,12 +76,12 @@ def _scan_diag_linear(
 
 @torch.jit.script
 def lru_forward_loop(
-    input: Tensor,
-    state: Tensor,
-    A: Tensor,
-    B: Tensor,
-    C: Tensor,
-    D: Tensor,
+        input: Tensor,
+        state: Tensor,
+        A: Tensor,
+        B: Tensor,
+        C: Tensor,
+        D: Tensor,
 ) -> Tuple[Tensor, Tensor]:
     """
     Sequential state-space recurrence (loop version).
@@ -129,9 +129,9 @@ def lru_forward_loop(
     A = A.to(dtype=dtype)
 
     # Precompute transposes (matrix-layout friendly)
-    BT = B.mT          # (H, N)
-    CT = C.mT          # (N, H_out)
-    DT = D.mT          # (H, H_out)
+    BT = B.mT  # (H, N)
+    CT = C.mT  # (N, H_out)
+    DT = D.mT  # (H, H_out)
 
     # Allocate full trajectory [x_0, ..., x_L]
     states = torch.empty(
@@ -146,32 +146,33 @@ def lru_forward_loop(
         # Diagonal A (vector of lambdas)
         lambdas = A  # (N,)
         for t in range(SEQ):
-            u_t = input[:, t, :]           # (B, H)
+            u_t = input[:, t, :]  # (B, H)
             # x = lambdas * x + u_t @ BT
-            x = x * lambdas                # broadcasts over batch
-            x = x + u_t @ BT               # (B, N)
+            x = x * lambdas  # broadcasts over batch
+            x = x + u_t @ BT  # (B, N)
             states[:, t + 1] = x
     elif A.dim() == 2:
         # Full constant A
-        A_T = A.mT                         # (N, N)
+        A_T = A.mT  # (N, N)
         for t in range(SEQ):
-            u_t = input[:, t, :]           # (B, H)
+            u_t = input[:, t, :]  # (B, H)
             # x = x @ A_T + u_t @ BT
-            x = x @ A_T                    # (B, N)
-            x = x + u_t @ BT               # (B, N)
+            x = x @ A_T  # (B, N)
+            x = x + u_t @ BT  # (B, N)
             states[:, t + 1] = x
     else:
         # TorchScript only supports RuntimeError, not ValueError etc.
         raise RuntimeError("Unsupported A.dim(), expected 1 or 2")
 
     # pre-update states for output: x_t
-    pre_states = states[:, :-1, :]         # (B, L, N)
+    pre_states = states[:, :-1, :]  # (B, L, N)
 
     # Vectorized output computation over time
     # (B, L, N) @ (N, H_out) --> (B, L, H_out)
     output = (pre_states @ CT).real + input @ DT
 
     return output, states
+
 
 def _complex_real_transform_blocks(
         n: int,
@@ -430,8 +431,8 @@ class L2RU(nn.Module):
             self.set_param()
 
         if mode == "scan":
-            u = input.permute(1, 0, 2)  # (L,B,H)
-            states = compute_linear_recurrence_parallel(self.A, self.B, u, x0).transpose(0, 1)
+            u = input.permute(1, 0, 2)  # (L,B,H) == (T,B,D)
+            states = compute_linear_recurrence_parallel_scan(self.A, self.B, u, x0).transpose(0, 1)
             self.state = states[:, -1, :].detach()
             outputs = states[:, :-1, :] @ self.C.transpose(-1, -2) + input @ self.D.transpose(-1, -2)
             return outputs, states

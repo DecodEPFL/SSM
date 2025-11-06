@@ -13,8 +13,8 @@ import math
 import nonlinear_benchmarks
 from nonlinear_benchmarks.error_metrics import RMSE, NRMSE, R_squared, MAE, fit_index
 #from SSM.utility import SimpleLSTM
-#from neural_ssm import DeepSSM, SSMConfig
-from src.neural_ssm.ssm.lru import DeepSSM, SSMConfig
+from neural_ssm import DeepSSM, SSMConfig
+
 
 
 # ============================================================================
