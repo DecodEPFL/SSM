@@ -144,7 +144,7 @@ if __name__ == "__main__":
     B = B.cpu().detach().numpy()
     C = C.data.cpu().detach().numpy()
     D = D.cpu().detach().numpy()
-
+    import control
     sys = control.ss(A, B, C, D, dt=1.0)
     # Compute the H∞ norm (L2 gain) and the peak frequency ω_peak
     gamma = control.norm(sys, p='inf')
