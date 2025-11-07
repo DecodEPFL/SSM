@@ -219,49 +219,79 @@ def compute_linear_recurrence_parallel(A, B, u, x0):
         x_0 given.
 
     Conventions (column-vector, time-major):
-        A: (T, D, D) or (D, D)        state transition
-        B: (T, D, D) or (D, D)        input matrix
-        u: (T, batch, D)              inputs u_0 .. u_{T-1}
-        x0: (batch, D)                initial state x_0
+        A: (T, D_state, D_state) or (D_state, D_state)
+           state transition
+        B: (T, D_state, D_in) or (D_state, D_in)
+           input matrix
+        u: (T, batch, D_in)              inputs u_0 .. u_{T-1}
+        x0: (batch, D_state)             initial state x_0
 
     Returns:
-        states: (T+1, batch, D)
+        states: (T+1, batch, D_state)
             states[0]     = x_0
             states[t + 1] = x_{t+1} for t = 0..T-1
     """
-    seq_len = u.shape[0]  # T
-    batch_size = u.shape[1]
-    D = u.shape[2]
+    # u: (T, batch, D_in)
+    seq_len, batch_size, D_in = u.shape
+
+    # infer state dim from A or x0
+    if A.dim() == 2:
+        D_state = A.shape[0]
+        assert A.shape[1] == D_state, "A must be square (D_state, D_state)"
+    else:
+        # A: (T, D_state, D_state)
+        assert A.shape[0] == seq_len, "time dimension of A must match u"
+        D_state = A.shape[1]
+        assert A.shape[2] == D_state, "A must be square along last two dims"
+
+    # check / infer B shape
+    if B.dim() == 2:
+        # (D_state, D_in_B)
+        assert B.shape[0] == D_state, "B first dim must match state dim"
+        D_in_B = B.shape[1]
+    else:
+        # (T, D_state, D_in_B)
+        assert B.shape[0] == seq_len, "time dimension of B must match u"
+        assert B.shape[1] == D_state, "B second dim must match state dim"
+        D_in_B = B.shape[2]
+
+    assert D_in_B == D_in, f"Input dim mismatch: u has {D_in}, B has {D_in_B}"
 
     # ensure A,B have time dimension
     if A.dim() == 2:
-        A = A.unsqueeze(0).expand(seq_len, -1, -1).contiguous()  # (T, D, D)
+        # (D_state, D_state) -> (T, D_state, D_state)
+        A = A.unsqueeze(0).expand(seq_len, -1, -1).contiguous()
     if B.dim() == 2:
-        B = B.unsqueeze(0).expand(seq_len, -1, -1).contiguous()  # (T, D, D)
+        # (D_state, D_in) -> (T, D_state, D_in)
+        B = B.unsqueeze(0).expand(seq_len, -1, -1).contiguous()
 
-    # shape (T, batch, D, D)
+    # shape for affine scan:
+    # M_t = A_t  (T, D_state, D_state) -> (T, batch, D_state, D_state)
     M = A.unsqueeze(1).expand(-1, batch_size, -1, -1).contiguous()
+
+    # B_t: (T, D_state, D_in) -> (T, batch, D_state, D_in)
     B_exp = B.unsqueeze(1).expand(-1, batch_size, -1, -1).contiguous()
 
     # v_t = B_t @ u_t
-    # u: (T, batch, D) -> (T, batch, D, 1)
-    v = torch.matmul(B_exp, u.unsqueeze(-1)).squeeze(-1)  # (T, batch, D)
+    # u: (T, batch, D_in) -> (T, batch, D_in, 1)
+    v = torch.matmul(B_exp, u.unsqueeze(-1)).squeeze(-1)  # (T, batch, D_state)
 
     # compute prefix for x_{t+1} = M_t ... M_0 x_0 + v_p[t]
-    M_p, v_p = parallel_scan_affine(M, v)  # M_p: (T, batch, D, D), v_p: (T, batch, D)
+    M_p, v_p = parallel_scan_affine(M, v)  # M_p: (T, batch, D_state, D_state), v_p: (T, batch, D_state)
 
     # x_{t+1} = M_p[t] @ x0 + v_p[t]
-    x_next = torch.matmul(M_p, x0.unsqueeze(-1)).squeeze(-1) + v_p  # (T, batch, D)
+    x_next = torch.matmul(M_p, x0.unsqueeze(-1)).squeeze(-1) + v_p  # (T, batch, D_state)
 
     # assemble full trajectory: [x_0, x_1, ..., x_T]
     states = torch.empty(
-        seq_len + 1, batch_size, D,
+        seq_len + 1, batch_size, D_state,
         device=u.device, dtype=u.dtype,
     )
     states[0] = x0
     states[1:] = x_next
 
     return states
+
 
 
 # -------------------------
@@ -454,3 +484,164 @@ def compute_linear_recurrence_parallel_scan(
     # Return as (T+1, B, D) to match your existing call-site
     states_TBD = states_btD.permute(1, 0, 2)
     return states_TBD
+
+
+# scan for blocks
+
+@torch.jit.script
+def binary_operator_block2x2(
+    q_i: Tuple[torch.Tensor, torch.Tensor],
+    q_j: Tuple[torch.Tensor, torch.Tensor],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Binary operator for parallel scan of linear recurrence with 2x2 block-diagonal A.
+
+    q_i: (A_i, b_i)
+        A_i: (..., 2, 2)
+        b_i: (..., 2)
+
+    q_j: (A_j, b_j)
+        A_j: (..., 2, 2)
+        b_j: (..., 2)
+
+    Represents composition of affine maps:
+        x -> A_i x + b_i
+        x -> A_j x + b_j
+
+    Composition:
+        x -> A_j (A_i x + b_i) + b_j
+           = (A_j A_i) x + (A_j b_i + b_j)
+    """
+    A_i, b_i = q_i
+    A_j, b_j = q_j
+
+    # A_out = A_j @ A_i  (batched 2x2 matmul)
+    A_out = torch.matmul(A_j, A_i)  # (..., 2, 2)
+
+    # b_out = A_j @ b_i + b_j  (batched matvec)
+    b_i_vec = b_i.unsqueeze(-1)             # (..., 2, 1)
+    Ab_i = torch.matmul(A_j, b_i_vec).squeeze(-1)  # (..., 2)
+    b_out = Ab_i + b_j
+
+    return A_out, b_out
+
+
+def compute_linear_recurrence_parallel_block2x2(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    u: torch.Tensor,
+    x0: torch.Tensor,
+):
+    """
+    Parallel solution of the linear recurrence with 2x2 block-diagonal A:
+
+        x_{t+1} = A @ x_t + B @ u_t,    t = 0..T-1
+        x_0 given.
+
+    Shapes (time-major, column-vector convention):
+        A:  (D_state, D_state)    block-diagonal in 2x2 blocks
+        B:  (D_state, D_in)
+        u:  (T, batch, D_in)      inputs u_0 .. u_{T-1}
+        x0: (batch, D_state)      initial state x_0
+
+    Returns:
+        states: (T+1, batch, D_state)
+            states[0]     = x_0
+            states[t + 1] = x_{t+1} for t = 0..T-1
+    """
+    # u: (T, B, D_in)
+    T, Ba, D_in = u.shape
+
+    # infer state dim and number of 2x2 blocks
+    D_state = A.shape[0]
+    assert A.shape[1] == D_state, "A must be square (D_state, D_state)"
+    assert D_state % 2 == 0, "D_state must be even for 2x2 blocks"
+    n_blocks = D_state // 2
+
+    # sanity check B
+    assert B.shape[0] == D_state, "B first dim must match state dim"
+    D_in_B = B.shape[1]
+    assert D_in_B == D_in, f"Input dim mismatch: u has {D_in}, B has {D_in_B}"
+
+    device = u.device
+    dtype = u.dtype
+
+    # ------------------------------------------------------------------
+    # 1) Extract 2x2 blocks of A: (n_blocks, 2, 2)
+    # ------------------------------------------------------------------
+    # Here we assume A is already block-diagonal in 2x2 blocks, so we can view it.
+    # If A was constructed that way (as in our Block2x2DenseL2SSM), this holds.
+    # 1) Extract 2x2 blocks of A: (n_blocks, 2, 2)
+    D_state = A.shape[0]
+    assert A.shape[1] == D_state
+    assert D_state % 2 == 0, "D_state must be even"
+    n_blocks = D_state // 2
+
+    A_blocks = torch.stack(
+        [A[2 * i:2 * i + 2, 2 * i:2 * i + 2] for i in range(n_blocks)],
+        dim=0,
+    )  # (n_blocks, 2, 2)  # (n_blocks, 2, 2)
+
+    # ------------------------------------------------------------------
+    # 2) Compute per-time input contribution v_t = B @ u_t
+    # ------------------------------------------------------------------
+    # u: (T, B, D_in), B: (D_state, D_in)
+    # v: (T, B, D_state)
+    v = torch.einsum("tbd,sd->tbs", u, B)  # or u @ B.T with reshapes
+
+    # reshape v into 2-dim blocks: (T, B, n_blocks, 2)
+    b_seq = v.view(T, Ba, n_blocks, 2)
+
+    # ------------------------------------------------------------------
+    # 3) Build A_seq for each time (broadcast A_blocks over T,B)
+    # ------------------------------------------------------------------
+    # A_blocks: (n_blocks, 2, 2) -> (T, B, n_blocks, 2, 2)
+    A_seq = A_blocks.view(1, 1, n_blocks, 2, 2).expand(T, Ba, n_blocks, 2, 2).contiguous()
+
+    # ------------------------------------------------------------------
+    # 4) Parallel prefix-scan over time using associative_scan
+    # ------------------------------------------------------------------
+    # elems is a pytree: (A_seq, b_seq), axis=0 is time
+    (A_prefix, b_prefix) = associative_scan(
+        binary_operator_block2x2,
+        (A_seq, b_seq),
+        axis=0,
+        reverse=False,
+    )
+    # A_prefix[t], b_prefix[t] represent the composed affine map from x_0-blocks to x_{t+1}-blocks:
+    #   z_{t+1} = A_prefix[t] @ z_0 + b_prefix[t]
+    # Shapes:
+    #   A_prefix: (T, B, n_blocks, 2, 2)
+    #   b_prefix: (T, B, n_blocks, 2)
+
+    # ------------------------------------------------------------------
+    # 5) Apply composed maps to initial state x0 (in block form)
+    # ------------------------------------------------------------------
+    # x0: (B, D_state) -> (B, n_blocks, 2)
+    x0_blocks = x0.view(Ba, n_blocks, 2)
+
+    # Broadcast x0 over time: (T, B, n_blocks, 2)
+    x0_blocks_exp = x0_blocks.unsqueeze(0).expand(T, -1, -1, -1)
+
+    # x_{t+1_blocks} = A_prefix[t] @ x0_blocks + b_prefix[t]
+    # A_prefix: (T,B,n_blocks,2,2), x0_blocks_exp: (T,B,n_blocks,2,1)
+    x_next_blocks = torch.matmul(
+        A_prefix,
+        x0_blocks_exp.unsqueeze(-1)
+    ).squeeze(-1) + b_prefix  # (T, B, n_blocks, 2)
+
+    # reshape back to flat state: (T, B, D_state)
+    x_next = x_next_blocks.reshape(T, Ba, D_state)
+
+    # ------------------------------------------------------------------
+    # 6) Assemble full trajectory [x_0, x_1, ..., x_T]
+    # ------------------------------------------------------------------
+    states = torch.empty(
+        T + 1, Ba, D_state,
+        device=device,
+        dtype=dtype,
+    )
+    states[0] = x0
+    states[1:] = x_next
+
+    return states

@@ -594,7 +594,7 @@ def main():
     model_config = ModelConfig(n_u=u_train.shape[1], n_y=y_train.shape[1], param='l2n', d_model=12, d_state=6,
                                gamma=None, ff='GLU', init='eye',
                                n_layers=3, d_amp=3)
-    train_config = TrainingConfig(num_epochs=5000, learning_rate=1e-4)
+    train_config = TrainingConfig(num_epochs=20000, learning_rate=1e-4)
 
     # Build model
     print("Building model...")

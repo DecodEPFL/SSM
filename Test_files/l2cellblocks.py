@@ -4,7 +4,7 @@ from torch import nn
 # Optional hook: if you already have a parallel scan kernel, plug it here.
 _HAS_SCAN = False
 try:
-    from SSM.scan_utils import compute_linear_recurrence_parallel
+    from src.neural_ssm.ssm.scan_utils import compute_linear_recurrence_parallel, compute_linear_recurrence_parallel_block2x2
     _HAS_SCAN = True
 except Exception:
     _HAS_SCAN = False
@@ -65,7 +65,7 @@ class Block2x2DenseL2SSM(nn.Module):
         train_gamma: bool = False,
         eps_radius: float = 1e-3,
         power_iters: int = 1,
-        exact_norm: bool = False,
+        exact_norm: bool = True,
         init_rho: float | None = None,
     ):
         super().__init__()
@@ -142,23 +142,11 @@ class Block2x2DenseL2SSM(nn.Module):
         """
         Scale M so that ||M||_2 <= 1 (or ≈ 1 if exact_norm=True).
         """
-        if self.exact_norm:
-            sigma = torch.linalg.svdvals(M)[0].clamp(min=1e-12)
-            scale = torch.maximum(sigma, M.new_tensor(1.0))
-            return M / scale
-
-        # Approximate norm via power iteration
-        with torch.no_grad():
-            u = torch.randn(M.shape[0], device=M.device, dtype=M.dtype)
-            u = u / (u.norm() + 1e-12)
-            for _ in range(self.power_iters):
-                v = M.t().matmul(u)
-                v = v / (v.norm() + 1e-12)
-                u = M.matmul(v)
-                u = u / (u.norm() + 1e-12)
-            sigma = u.dot(M.matmul(v)).clamp(min=1e-12)
-        scale = torch.maximum(sigma, M.new_tensor(1.0))
-        return M / scale
+        # exact largest singular value
+        sigma = torch.linalg.matrix_norm(M, ord=2)
+        sigma = sigma.clamp(min=1e-5)
+        M = M / (sigma + 0.002)
+        return M
 
     def _build_K_blocks(self):
         """
@@ -403,7 +391,8 @@ class Block2x2DenseL2SSM(nn.Module):
             # u_scan: (T,B,du)
             u_scan = u.transpose(0, 1)
             # states: (T+1,B,d_state)
-            states = compute_linear_recurrence_parallel(A_z, B_z, u_scan, z)
+            # states: (T+1,B,D_state) in z-coordinates
+            states = compute_linear_recurrence_parallel_block2x2(A_z, B_z, u_scan, z)
             z_seq = states[:-1].transpose(0, 1)  # (B,T,d_state)
             z_last = states[-1]                  # (B,d_state)
             y_seq = z_seq @ Ct + u @ Dt          # (B,T,d_output)
