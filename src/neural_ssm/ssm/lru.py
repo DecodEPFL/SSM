@@ -704,7 +704,7 @@ class L2BoundedLTICell(nn.Module):
         M = torch.cat([top, bottom], dim=0)
         return M
 
-        # ---------- NEW: initialization with eig(A) ≈ rho ----------
+        # ---------- initialization with eig(A) ≈ eigvals ----------
 
     @torch.no_grad()
     def init_orthogonal_spectrum(
