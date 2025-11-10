@@ -1,5 +1,6 @@
 import torch
 from torch import nn
+import math
 
 # Optional hook: if you already have a parallel scan kernel, plug it here.
 _HAS_SCAN = False
@@ -66,7 +67,6 @@ class Block2x2DenseL2SSM(nn.Module):
         eps_radius: float = 1e-3,
         power_iters: int = 1,
         exact_norm: bool = True,
-        init_rho: float | None = None,
     ):
         super().__init__()
         assert d_state % 2 == 0, "d_state must be even (2x2 blocks)."
@@ -101,9 +101,6 @@ class Block2x2DenseL2SSM(nn.Module):
         else:
             self.register_buffer("log_gamma", g0.log())
 
-        # optional: put |eig(K11)| ≈ init_rho at init
-        if init_rho is not None:
-            self.init_near_identity(init_rho)
 
     @property
     def gamma(self) -> torch.Tensor:
@@ -262,39 +259,84 @@ class Block2x2DenseL2SSM(nn.Module):
     # Initialization: |eig(K11)| ≈ rho
     # ----------------------------------------------------------------------
     @torch.no_grad()
-    def init_near_identity(self, rho: float = 0.99, offdiag_scale: float = 1e-3):
+    def init_on_circle(
+        self,
+        rho: float = 0.99,
+        *,
+        # phase control
+        max_phase: float | None = None,     # if not None, sample θ in [-max_phase, max_phase]
+        phase_center: float = 0.0,          # center of the phase window
+        same_phase_across_blocks: bool = False,
+        random_phase: bool = True,          # if False -> all θ_i = phase_center
+        # off-diagonal scale
+        offdiag_scale: float = .05,
+    ):
         """
-        Initialize so that each 2x2 block of A_z = K11 has eigenvalues
-        |λ| ≈ rho (<1), and off-diagonal blocks (K12,K21,K22) are small.
+        Initialize such that A_z = K11 has eigenvalues
 
-        - ρ_i = rho for all i (via rho_raw),
-        - θ_i ≈ 0 so blocks ≈ rho * I_2,
-        - off-diagonals small so ||K_raw||_2 ≈ rho and spectral normalization
-          does not rescale at init.
+            λ_i^± ≈ rho * exp(± j θ_i),
 
-        S is initialized near identity, so the dense A_x ≈ block-diag A_z in x-basis.
+        with |λ_i| ≈ rho (< 1) and θ_i controlled.
+
+        Args
+        ----
+        rho : desired modulus of eigenvalues (must be < 1).
+        max_phase : if not None, sample θ_i in
+                    [phase_center - max_phase, phase_center + max_phase].
+                    For "small phase", use something like max_phase = 0.1 (≈ 6 degrees).
+        phase_center : center of the phase interval (default 0.0).
+        same_phase_across_blocks : if True and random_phase is True,
+                    all blocks share the same θ.
+        random_phase : if False, set all θ_i = phase_center exactly
+                       (purely deterministic angle).
+        offdiag_scale : std of K12, K21, K22 at init (kept small so spectral
+                        normalization barely shrinks K at init).
         """
-        assert 0.0 < rho < 1.0, "rho should be in (0,1)"
+        assert 0.0 < rho < 1.0, "rho must be in (0,1)"
 
         n_pairs = self.d_state // 2
         device = self.rho_raw.device
         dtype = self.rho_raw.dtype
 
-        # S ≈ I
+        # 1) S ≈ I so x- and z-coordinates are initially close
         S_eye = torch.eye(self.d_state, device=device, dtype=dtype)
         S_pert = 0.01 * torch.randn(self.d_state, self.d_state, device=device, dtype=dtype)
         self.S.copy_(S_eye + S_pert)
 
-        # ρ_i = sigmoid(rho_raw_i) * (1 - eps_radius) ≈ rho
+        # 2) Set radii ρ_i ≈ rho via the sigmoid parametrization:
+        #    rho_i = sigmoid(rho_raw_i) * (1 - eps_radius)
+        # => sigmoid(rho_raw_i) = rho / (1 - eps_radius)
         target = rho / (1.0 - self.eps_radius)
+        # Clamp to avoid logit blow-up
         target = float(max(min(target, 0.999), 0.001))
         t = torch.full((n_pairs,), target, device=device, dtype=dtype)
-        self.rho_raw.copy_(torch.log(t) - torch.log(1 - t))
+        self.rho_raw.copy_(torch.log(t) - torch.log(1 - t))  # logit(target)
 
-        # Small angles
-        self.theta.zero_()
+        # 3) Set phases θ_i
+        if not random_phase:
+            # deterministic: all θ_i = phase_center
+            self.theta.fill_(phase_center)
+        else:
+            if max_phase is None:
+                # full random circle: θ_i ~ U(-π, π)
+                if same_phase_across_blocks:
+                    phi = (2 * math.pi * torch.rand(1, device=device, dtype=dtype) - math.pi)
+                    self.theta.copy_(phi.expand(n_pairs))
+                else:
+                    self.theta.uniform_(-math.pi, math.pi)
+            else:
+                # small/random window around phase_center
+                # θ ∈ [phase_center - max_phase, phase_center + max_phase]
+                low = phase_center - max_phase
+                high = phase_center + max_phase
+                if same_phase_across_blocks:
+                    phi = (high - low) * torch.rand(1, device=device, dtype=dtype) + low
+                    self.theta.copy_(phi.expand(n_pairs))
+                else:
+                    self.theta.uniform_(low, high)
 
-        # Small off-diagonal blocks
+        # 4) Small off-diagonal blocks so ||K_raw||_2 ≈ rho and spectral
+        #    normalization is almost inactive at init.
         self.K12_raw.normal_(mean=0.0, std=offdiag_scale)
         self.K21_raw.normal_(mean=0.0, std=offdiag_scale)
         self.K22_raw.normal_(mean=0.0, std=offdiag_scale)

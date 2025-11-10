@@ -5,9 +5,9 @@ from l2cell import L2BoundedLTICell
 
 from l2cellblocks import Block2x2DenseL2SSM
 
-d_state=10
+d_state=4
 d_input=23
-torch.manual_seed(39)
+torch.manual_seed(32)
 cell = Block2x2DenseL2SSM(d_state=d_state, d_input=d_input, d_output=d_input, gamma=1)
 
 
@@ -16,6 +16,14 @@ cell = Block2x2DenseL2SSM(d_state=d_state, d_input=d_input, d_output=d_input, ga
 eigvals_target = .95*torch.ones(d_state, dtype=torch.float64)
 #cell.init_near_identity()
 #cell.init_orthogonal_spectrum(eigvals_target, offdiag_scale=0.8)
+
+cell.init_on_circle(
+    rho=0.99,
+    max_phase=0.5,            # small spread
+    phase_center=0.3,          # center angle ≈ 17°
+    random_phase=True,
+)
+
 
 #cell.init_orthogonal_spectrum(eigvals_target, offdiag_scale=1e-3)
 
