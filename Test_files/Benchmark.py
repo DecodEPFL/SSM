@@ -18,6 +18,7 @@ from src.neural_ssm.ssm.lru import DeepSSM, SSMConfig
 
 
 
+
 # ============================================================================
 # Configuration Management
 # ============================================================================
@@ -58,6 +59,10 @@ class ModelConfig:
     param: str = 'l2ru'
     gamma: Optional[float] = 2
     init: str = 'rand'
+    rho: float = 0.9
+    max_phase_b: float = 0.5  # small spread
+    phase_center: float = 0  # center angle ≈ 17°
+    random_phase = True
 
     def to_ssm_config(self) -> SSMConfig:
         """Convert to SSMConfig object."""
@@ -72,7 +77,11 @@ class ModelConfig:
             dim_amp=self.d_amp,
             param=self.param,
             gamma=self.gamma,
-            init=self.init
+            init=self.init,
+            rho = self.rho,
+            max_phase_b = self.max_phase_b,
+            phase_center = self.phase_center,
+            random_phase=self.random_phase,
         )
 
 
@@ -593,7 +602,7 @@ def main():
     # Initialize configurations
     model_config = ModelConfig(n_u=u_train.shape[1], n_y=y_train.shape[1], param='l2n', d_model=12, d_state=6,
                                gamma=None, ff='GLU', init='eye',
-                               n_layers=3, d_amp=3)
+                               n_layers=3, d_amp=3, rho=0.9, phase_center=0.0, max_phase=0.06)
     train_config = TrainingConfig(num_epochs=20000, learning_rate=1e-4)
 
     # Build model
