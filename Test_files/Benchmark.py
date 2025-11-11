@@ -30,7 +30,7 @@ class TrainingConfig:
     batch_size: int = 32
     num_epochs: int = 8590
     seed: int = 9
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    device: str = "cpu" if torch.cuda.is_available() else "cpu"
     num_workers: int = 4
     pin_memory: bool = True
 
@@ -57,6 +57,8 @@ class ModelConfig:
     r_max: float = 0.98
     d_amp: int = 8
     param: str = 'l2ru'
+    d_hidden: int = 8
+    nl_layers: int = 3
     gamma: Optional[float] = 2
     init: str = 'rand'
     rho: float = 0.9
@@ -74,6 +76,8 @@ class ModelConfig:
             rmin=self.r_min,
             rmax=self.r_max,
             max_phase=self.max_phase,
+            d_hidden = self.d_hidden,
+            nl_layers = self.nl_layers,
             dim_amp=self.d_amp,
             param=self.param,
             gamma=self.gamma,
@@ -593,16 +597,34 @@ def main():
     print(test.state_initialization_window_length)  # = 50
     u_train, y_train = train_val
     u_val, y_val = test
+
+
     # Convert to torch tensors and reshape to (N, 1)
     u_train = torch.tensor(u_train, dtype=torch.float32).unsqueeze(-1)
     y_train = torch.tensor(y_train, dtype=torch.float32).unsqueeze(-1)
     u_val = torch.tensor(u_val, dtype=torch.float32).unsqueeze(-1)
     y_val = torch.tensor(y_val, dtype=torch.float32).unsqueeze(-1)
 
+
+
+    # data normalization
+    mu_u = u_train.mean(dim=0)  # over all time + trajectories
+    mu_y = y_train.mean(dim=0)
+    u_center = u_train - mu_u
+    y_center = y_train - mu_y
+    sigma_u = u_train.sub(mu_u).pow(2).mean(dim=0).sqrt()
+    sigma_y = y_train.sub(mu_y).pow(2).mean(dim=0).sqrt()
+    u_norm = u_center / sigma_u
+    y_norm = y_center / sigma_y
+
+    u_val_norm = (u_val - mu_u) / (sigma_u + 1e-8)
+    y_val_norm = (y_val - mu_y) / (sigma_y + 1e-8)
+
+
     # Initialize configurations
-    model_config = ModelConfig(n_u=u_train.shape[1], n_y=y_train.shape[1], param='l2n', d_model=12, d_state=6,
+    model_config = ModelConfig(n_u=u_train.shape[1], n_y=y_train.shape[1], param='l2n', d_model=6, d_state=2,
                                gamma=None, ff='GLU', init='eye',
-                               n_layers=3, d_amp=3, rho=0.9, phase_center=0.0, max_phase=0.06)
+                               n_layers=9, d_amp=3, rho=0.9, phase_center=0.0, max_phase_b=0.06, d_hidden=6, nl_layers=11)
     train_config = TrainingConfig(num_epochs=20000, learning_rate=1e-4)
 
     # Build model
@@ -621,6 +643,9 @@ def main():
 
     # Train model
     history = trainer.fit(u_train, y_train, u_val, y_val, use_early_stopping=False)
+
+    # Train model (normalized)
+    #history = trainer.fit(u_norm, y_norm, u_val_norm, y_val_norm, use_early_stopping=False)
 
     # load best model if available
     best_path = train_config.save_dir / "best_model.pth"
