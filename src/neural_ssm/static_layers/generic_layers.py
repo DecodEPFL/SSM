@@ -20,7 +20,7 @@ class GLU(nn.Module):
         self.activation = nn.GELU()
         self.dropout = nn.Dropout(config.dropout) if config.dropout > 0 else nn.Identity()
 
-        # More efficient sequential construction
+        # Sequential construction
         self.output_linear = nn.Sequential(
             nn.Linear(config.d_input, 2 * config.d_input),
             nn.GLU(dim=-1),

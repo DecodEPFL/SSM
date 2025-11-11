@@ -1370,6 +1370,7 @@ class SSMConfig:
     scale: float = 1  # Lipschitz constant of the Lipschitz bounded MLP (LMLP)
     dim_amp: int = 4  # controls the hidden layer's dimension of the MLP
     d_hidden: int = 4  # controls the hidden layer's dimension of the non-linear layer
+    nl_layers: int = 2 # number of hidden layers of the non-linear layer
     param: str = None  # pick the parametrization you want to use for the LRU. Default = LRU, other options are L2RU
     # and ZAK
     gamma: float = None  # set the overall l2 gain value in case you want to keep it fixed and not trainable, if set to
@@ -1444,6 +1445,7 @@ class SSL(nn.Module):
         l_config.d_input = config.d_model
         l_config.d_output = config.d_model
         l_config.d_hidden = config.d_hidden
+        l_config.n_layers = config.nl_layers
 
         ff_layers = {
             "GLU": lambda: GLU(l_config),
@@ -1486,6 +1488,7 @@ class DeepSSM(nn.Module):
             scale: float = 1,
             dim_amp: int = 4,
             d_hidden: int = 4,
+            nl_layers: int =3,
             param: Optional[str] = None,
             gamma: Optional[float] = None,
             init: str = "eye",
@@ -1516,6 +1519,7 @@ class DeepSSM(nn.Module):
                 scale=scale,
                 dim_amp=dim_amp,
                 d_hidden=d_hidden,
+                nl_layers = nl_layers,
                 param=param,
                 gamma=gamma,
                 init=init,

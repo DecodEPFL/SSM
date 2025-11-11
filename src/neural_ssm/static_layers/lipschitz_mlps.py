@@ -12,21 +12,14 @@ class TLIP(nn.Module):
         super().__init__()
         # Pre-compute hidden dimension for efficiency
         self.hidden_dim = config.d_hidden
-        layers = torchlip.Sequential(
-            # First layer: input_dim -> hidden_dims[0]
-            torchlip.SpectralLinear(config.d_input, self.hidden_dim),
-            torchlip.GroupSort2(2),  # GroupSort activation (more expressive than ReLU)
+        layers = nn.ModuleList()
+        layers.append(torchlip.SpectralLinear(config.d_input, self.hidden_dim))
+        layers.append(torchlip.GroupSort2(2))
 
-            # Hidden static_layers
-            torchlip.SpectralLinear(self.hidden_dim, self.hidden_dim),
-            torchlip.GroupSort2(2),
-
-            torchlip.SpectralLinear(self.hidden_dim, self.hidden_dim),
-            torchlip.GroupSort2(2),
-
-            # Output layer: hidden_dims[-1] -> output_dim
-            torchlip.SpectralLinear(self.hidden_dim, config.d_output)
-        )
+        for i in range(config.n_layers):
+            layers.append(torchlip.SpectralLinear(self.hidden_dim, self.hidden_dim))
+            layers.append(torchlip.GroupSort2(2))
+        layers.append(torchlip.SpectralLinear(self.hidden_dim, config.d_output))
         self.model = nn.Sequential(*layers)
 
     def forward(self, x):
