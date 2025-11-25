@@ -17,12 +17,12 @@ eigvals_target = .95*torch.ones(d_state, dtype=torch.float64)
 #cell.init_near_identity()
 #cell.init_orthogonal_spectrum(eigvals_target, offdiag_scale=0.8)
 
-cell.init_on_circle(
-    rho=0.99,
-    max_phase=0.5,            # small spread
-    phase_center=0.3,          # center angle ≈ 17°
-    random_phase=True,
-)
+# cell.init_on_circle(
+#     rho=0.99,
+#     max_phase=0.5,            # small spread
+#     phase_center=0.3,          # center angle ≈ 17°
+#     random_phase=True,
+# )
 
 
 #cell.init_orthogonal_spectrum(eigvals_target, offdiag_scale=1e-3)

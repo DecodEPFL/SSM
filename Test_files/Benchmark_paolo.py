@@ -592,18 +592,19 @@ def main():
 
     # Load data
     print("Loading data...")
+    data = torch.load('temp_for_leo.pt')
+    data_valid = torch.load('temp_for_leo_valid.pt')
+    y_train = data['y_batch']
+    u_train = data['u1_batch']
+    y_train=y_train.unsqueeze(2)
+    u_train=u_train.unsqueeze(2)
+    y_val = data_valid['y_batch']
+    u_val = data_valid['u1_batch']
+    y_val=y_val.unsqueeze(0)
+    u_val=u_val.unsqueeze(0)
+    y_val=y_val.unsqueeze(2)
+    u_val=u_val.unsqueeze(2)
 
-    train_val, test = nonlinear_benchmarks.Cascaded_Tanks()
-    print(test.state_initialization_window_length)  # = 50
-    u_train, y_train = train_val
-    u_val, y_val = test
-
-
-    # Convert to torch tensors and reshape to (N, 1)
-    u_train = torch.tensor(u_train, dtype=torch.float32).unsqueeze(-1)
-    y_train = torch.tensor(y_train, dtype=torch.float32).unsqueeze(-1)
-    u_val = torch.tensor(u_val, dtype=torch.float32).unsqueeze(-1)
-    y_val = torch.tensor(y_val, dtype=torch.float32).unsqueeze(-1)
 
 
 
@@ -622,10 +623,10 @@ def main():
 
 
     # Initialize configurations
-    model_config = ModelConfig(n_u=u_train.shape[1], n_y=y_train.shape[1], param='l2n', d_model=8, d_state=8,
+    model_config = ModelConfig(n_u=u_train.shape[2], n_y=y_train.shape[2], param='lru', d_model=8, d_state=8,
                                gamma=None, ff='GLU', init='eye',
-                               n_layers=7, d_amp=3, rho=0.9, phase_center=0.0, max_phase_b=0.04, d_hidden=12, nl_layers=3)
-    train_config = TrainingConfig(num_epochs=2, learning_rate=1e-2)
+                               n_layers=2, d_amp=3, rho=0.9, phase_center=0.0, max_phase_b=0.04, d_hidden=12, nl_layers=3)
+    train_config = TrainingConfig(num_epochs=2000, learning_rate=1e-3)
 
     # Build model
     print("Building model...")
@@ -659,11 +660,15 @@ def main():
     print("Generating predictions and print best RMSE...")
     y_train_pred = trainer.predict(u_train)
     y_val_pred = trainer.predict(u_val)
-    n = test.state_initialization_window_length
 
-    RMSE_result = RMSE(test.y[n:], y_val_pred[n:].cpu().detach().numpy())  # skip the first n
-    print(RMSE_result)  # report this number
+    batch=5
 
+    y_train_pred = y_train_pred[batch,0:-1]
+    y_val_pred = y_val_pred
+    n = 0
+
+    y_val=y_val[0,:,:]
+    y_train = y_train[batch,0:-1]
     # Visualize results
     print("Creating visualizations...")
     visualizer = Visualizer(
