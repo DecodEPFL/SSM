@@ -52,7 +52,7 @@ class ModelConfig:
     d_state: int = 11
     n_layers: int = 1
     ff: str = "LMLP"  # GLU | MLP | LMLP
-    max_phase: float = math.pi / 50
+    max_phase: float = math.pi / 60
     r_min: float = 0.7
     r_max: float = 0.98
     d_amp: int = 8
@@ -607,25 +607,25 @@ def main():
 
 
 
-    # data normalization
-    mu_u = u_train.mean(dim=0)  # over all time + trajectories
-    mu_y = y_train.mean(dim=0)
-    u_center = u_train - mu_u
-    y_center = y_train - mu_y
-    sigma_u = u_train.sub(mu_u).pow(2).mean(dim=0).sqrt()
-    sigma_y = y_train.sub(mu_y).pow(2).mean(dim=0).sqrt()
-    u_norm = u_center / sigma_u
-    y_norm = y_center / sigma_y
-
-    u_val_norm = (u_val - mu_u) / (sigma_u + 1e-8)
-    y_val_norm = (y_val - mu_y) / (sigma_y + 1e-8)
+    # # data normalization
+    # mu_u = u_train.mean(dim=0)  # over all time + trajectories
+    # mu_y = y_train.mean(dim=0)
+    # u_center = u_train - mu_u
+    # y_center = y_train - mu_y
+    # sigma_u = u_train.sub(mu_u).pow(2).mean(dim=0).sqrt()
+    # sigma_y = y_train.sub(mu_y).pow(2).mean(dim=0).sqrt()
+    # u_norm = u_center / sigma_u
+    # y_norm = y_center / sigma_y
+    #
+    # u_val_norm = (u_val - mu_u) / (sigma_u + 1e-8)
+    # y_val_norm = (y_val - mu_y) / (sigma_y + 1e-8)
 
 
     # Initialize configurations
-    model_config = ModelConfig(n_u=u_train.shape[1], n_y=y_train.shape[1], param='l2n', d_model=6, d_state=2,
+    model_config = ModelConfig(n_u=u_train.shape[1], n_y=y_train.shape[1], param='l2n', d_model=8, d_state=8,
                                gamma=None, ff='GLU', init='eye',
-                               n_layers=9, d_amp=3, rho=0.9, phase_center=0.0, max_phase_b=0.06, d_hidden=6, nl_layers=11)
-    train_config = TrainingConfig(num_epochs=20000, learning_rate=1e-4)
+                               n_layers=7, d_amp=3, rho=0.9, phase_center=0.0, max_phase_b=0.04, d_hidden=12, nl_layers=3)
+    train_config = TrainingConfig(num_epochs=2, learning_rate=1e-2)
 
     # Build model
     print("Building model...")

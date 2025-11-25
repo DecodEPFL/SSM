@@ -1,4 +1,6 @@
 # python
+from __future__ import annotations
+
 import math
 from typing import TypedDict, Dict
 from torch import Tensor
@@ -991,9 +993,9 @@ class Block2x2DenseL2SSM(nn.Module):
         self.theta = nn.Parameter(0.01 * torch.randn(n_pairs))
 
         # --- off-diagonal blocks of K are dense ---
-        self.K12_raw = nn.Parameter(0.05 * torch.randn(d_state, d_input))
-        self.K21_raw = nn.Parameter(0.05 * torch.randn(d_output, d_state))
-        self.K22_raw = nn.Parameter(0.05 * torch.randn(d_output, d_input))
+        self.K12_raw = nn.Parameter(0.5 * torch.randn(d_state, d_input))
+        self.K21_raw = nn.Parameter(0.5 * torch.randn(d_output, d_state))
+        self.K22_raw = nn.Parameter(0.5 * torch.randn(d_output, d_input))
 
         # --- gamma (>0) ---
         g0 = torch.tensor(float(gamma))
@@ -1379,7 +1381,7 @@ class SSMConfig:
     # parameters needed for the prescribed-gain parametrization
     rho: float = 0.9
     max_phase_b: float = 0.04          # small spread
-    phase_center: float = 0        # center angle ≈ 17°
+    phase_center: float = 0        # center angle
     random_phase: bool = True
 
     # Parallel scan must be selected in the forward call of the SSM.
@@ -1429,6 +1431,8 @@ class SSL(nn.Module):
                 d_output=config.d_model,
                 train_gamma=True,
             )
+            # initialization of matrix A
+            self.lru.init_on_circle(rho=config.rho, max_phase=config.max_phase_b, phase_center=config.phase_center, random_phase=config.random_phase)
         elif config.param == "l2nt":
             self.lru = L2BoundedLTICell(
                 d_state=config.d_state,
@@ -1436,8 +1440,6 @@ class SSL(nn.Module):
                 d_output=config.d_model,
                 train_gamma=True,
                 )
-            # initialization of matrix A
-            self.lru.init_on_circle(rho=config.rho, max_phase=config.max_phase_b, phase_center=config.phase_center, random_phase=config.random_phase)
         else:
             raise ValueError("Invalid parametrization")
 
