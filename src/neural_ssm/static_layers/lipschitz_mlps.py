@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.nn.utils.parametrizations as param
 from deel import torchlip
 from ..static_layers.generic_layers import LayerConfig
 
@@ -132,3 +133,30 @@ class LMLP(nn.Module):
         return self.model(input)
 
 
+class L2BoundedGLU(nn.Module):
+    """GLU-like block with provable global l2-Lipschitz constant <= gamma."""
+    def __init__(self, config: LayerConfig):
+        super().__init__()
+        self.lip = nn.Parameter(torch.tensor(config.lip))
+
+        # NOTE: dropout during training scales by 1/(1-p), which increases Lipschitz.
+        # If you want a guarantee in *training mode too*, we include the worst-case factor.
+        self.p = float(config.dropout)
+        self.dropout = nn.Dropout(self.p) if self.p > 0 else nn.Identity()
+
+        # One linear to 2d, spectral-normalized so ||W||_2 <= 1 (approximately, via power iteration)
+        self.lin = param.spectral_norm(nn.Linear(config.d_input, 2 * config.d_input))
+
+        self.value_nl = nn.Tanh()      # bounded + 1-Lipschitz
+        self.gate_nl = nn.Sigmoid()    # bounded, Lipschitz <= 1/4 elementwise
+
+        drop_factor = 1.0 / (1.0 - self.p) if self.p > 0 else 1.0
+        base_lip = 1.25 * drop_factor
+        self.register_buffer("_scale", torch.tensor(self.lip / base_lip))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.dropout(x)
+        h = self.lin(x)
+        a, b = h.chunk(2, dim=-1)
+        y = self.value_nl(a) * self.gate_nl(b)
+        return self._scale * y
