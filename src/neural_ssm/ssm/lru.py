@@ -1271,7 +1271,7 @@ class Block2x2DenseL2SSM(nn.Module):
         *,
         time_first: bool = False,
         return_state: bool = False,
-        mode: str = "loop",               # "loop" or "scan"
+        mode: str = "scan",               # "loop" or "scan"
     ):
         """
         Forward in z-coordinates (internal state). This is the thing you'd
@@ -1452,6 +1452,7 @@ class SSL(nn.Module):
         ff_layers = {
             "GLU": lambda: GLU(l_config),
             "MLP": lambda: MLP(l_config),
+            "LGLU":lambda :L2BoundedGLU(l_config),
             "LMLP": lambda: LMLP(l_config),
             "TLIP": lambda: TLIP(l_config),
         }
@@ -1496,7 +1497,7 @@ class DeepSSM(nn.Module):
             init: str = "eye",
             rho: float =0.9,
             max_phase_b: float=0.5,            # small spread
-            phase_center: float=0,          # center angle ≈ 17°
+            phase_center: float=0,          # center angle ≈ 0°
             random_phase=True,
             config: Optional[SSMConfig] = None,
     ):
@@ -1558,17 +1559,21 @@ class DeepSSM(nn.Module):
         # Cascade blocks
         for i, block in enumerate(self.blocks):
             x, st = block(x, state=layer_states[i], mode=mode)
-            layer_states[i] = st[:, -1, :]  # keep only final state
+            layer_states[i] = st[:, -1, :]  # keep only the final state
 
         # Decode
         if self.config.param is not None and self.config.gamma is not None:
             gamma_t = torch.abs(self.gamma_t) if gamma is None else gamma
-            gammaLRU = [torch.abs(block.lru.gamma) for block in self.blocks if hasattr(block.lru, "gamma")]
+            gammaLRU = [
+                torch.abs(block.lru.gamma * block.ff.lip) if hasattr(block.ff, "lip")
+                else torch.abs(block.lru.gamma)
+                for block in self.blocks
+            ]
             if len(gammaLRU) > 0:
                 gammaLRU_tensor = torch.stack(gammaLRU)
                 enc_norm = torch.linalg.matrix_norm(self.encoder, 2)
                 dec_norm = torch.linalg.matrix_norm(self.decoder, 2)
-                gamma_prod = torch.prod(gammaLRU_tensor) + 1  # kept as in original
+                gamma_prod = torch.prod(gammaLRU_tensor+1)
                 decoder_scaled = (gamma_t * self.decoder) / (enc_norm * dec_norm * gamma_prod)
                 outputs = x @ decoder_scaled.T
             else:

@@ -623,9 +623,9 @@ def main():
 
 
     # Initialize configurations
-    model_config = ModelConfig(n_u=u_train.shape[2], n_y=y_train.shape[2], param='lru', d_model=8, d_state=8,
+    model_config = ModelConfig(n_u=u_train.shape[2], n_y=y_train.shape[2], param='l2n', d_model=8, d_state=8,
                                gamma=None, ff='GLU', init='eye',
-                               n_layers=2, d_amp=3, rho=0.9, phase_center=0.0, max_phase_b=0.04, d_hidden=12, nl_layers=3)
+                               n_layers=7, d_amp=3, rho=0.9, phase_center=0.0, max_phase_b=0.04, d_hidden=12, nl_layers=3)
     train_config = TrainingConfig(num_epochs=2000, learning_rate=1e-3)
 
     # Build model
