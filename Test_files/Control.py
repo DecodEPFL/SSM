@@ -40,7 +40,7 @@ class ModelConfig:
     r_min: float = 0.7
     r_max: float = 0.98
     d_amp: int = 8
-    param: str = 'l2ru'
+    param: str = 'l2n'
     d_hidden: int = 8
     nl_layers: int = 3
     gamma: Optional[float] = 2
@@ -262,62 +262,129 @@ class ObjCfg:
     stay_last_L: int = 30
 
     # weights
-    w_obs: float = 16.0
+    w_obs: float = 21.0
     w_reach: float = 2.0
     w_stay: float = 2.0
     w_u2: float = 0.02
 
 
-def objective(y: torch.Tensor, u: torch.Tensor, cfg: ObjCfg) -> torch.Tensor:
+def obstacle_loss(
+    y: torch.Tensor,  # (B,T,2)
+    obstacles,
+    softplus_temp: float,
+    margin: float = 0.10,
+    time_beta: float = 70.0,     # larger -> closer to max over time
+    cvar_q: float = 0.7          # penalize worst 20% in batch
+) -> torch.Tensor:
+    if obstacles is None or len(obstacles) == 0:
+        return torch.zeros((), device=y.device, dtype=y.dtype)
+
+    B, T, _ = y.shape
+    pen = 0.0
+    for (cx, cy), r in obstacles:
+        c = torch.tensor([cx, cy], device=y.device, dtype=y.dtype)
+        d2 = ((y - c) ** 2).sum(dim=-1)                 # (B,T)
+        r_eff2 = (r + margin) ** 2
+        pen = pen + F.softplus((r_eff2 - d2) / softplus_temp).pow(2)  # (B,T)
+
+    # smooth max over time: (B,)
+    pen_time = (1.0 / time_beta) * torch.logsumexp(time_beta * pen, dim=1)
+
+    # CVaR over batch: mean of worst (1-cvar_q) fraction
+    k = max(1, int((1.0 - cvar_q) * B))
+    worst, _ = torch.topk(pen_time, k=k, largest=True)
+    return worst.mean()
+
+def obstacle_penalty_per_traj(
+    y: torch.Tensor,  # (B,T,2)
+    obstacles,
+    softplus_temp: float,
+    margin: float = 0.10,
+    time_beta: float = 50.0,
+) -> torch.Tensor:
     """
-    y: (B,T,2), u: (B,T,n_u)
-    Keeps only:
-      - obstacle avoidance (soft barrier)
-      - reach target (eventually)
-      - stay near target (last L steps)
-      (+ optional control effort)
+    Per-trajectory obstacle penalty: returns (B,).
+    Same ingredients as obstacle_loss, but WITHOUT CVaR batch aggregation.
+    """
+    if obstacles is None or len(obstacles) == 0:
+        return torch.zeros(y.shape[0], device=y.device, dtype=y.dtype)
+
+    B, T, _ = y.shape
+    pen = torch.zeros(B, T, device=y.device, dtype=y.dtype)
+
+    for (cx, cy), r in obstacles:
+        c = torch.tensor([cx, cy], device=y.device, dtype=y.dtype)
+        d2 = ((y - c) ** 2).sum(dim=-1)                 # (B,T)
+        r_eff2 = (r + margin) ** 2
+        pen = pen + F.softplus((r_eff2 - d2) / softplus_temp).pow(2)
+
+    # smooth max over time: (B,)
+    pen_time = (1.0 / time_beta) * torch.logsumexp(time_beta * pen, dim=1)
+    return pen_time
+
+
+def objective_per_traj(y: torch.Tensor, u: torch.Tensor, cfg: ObjCfg) -> torch.Tensor:
+    """
+    Per-trajectory objective for VALUE MAP: returns (B,).
+    IMPORTANT: no CVaR here (otherwise values depend on the batch composition).
     """
     device, dtype = y.device, y.dtype
     B, T, _ = y.shape
     target = torch.tensor(cfg.target, device=device, dtype=dtype)
 
-    # -------------------
-    # obstacle avoidance
-    # -------------------
-    obs_pen = 0.0
-    if cfg.obstacles is not None:
-        for (cx, cy), r in cfg.obstacles:
-            c = torch.tensor([cx, cy], device=device, dtype=dtype)
-            d2 = ((y - c) ** 2).sum(dim=-1)  # (B,T)
-            # penalty if inside: softplus(r^2 - d^2)
-            obs_pen = obs_pen + F.softplus((r * r - d2) / cfg.softplus_temp).pow(2)  # (B,T)
+    obs_traj = obstacle_penalty_per_traj(
+        y, cfg.obstacles,
+        softplus_temp=cfg.softplus_temp,
+        margin=0.10,
+        time_beta=50.0
+    )  # (B,)
 
-    # -------------------
-    # reach target (eventually)
-    # -------------------
     d2_goal = ((y - target) ** 2).sum(dim=-1)  # (B,T)
     softmin = -(1.0 / cfg.softmin_beta) * torch.logsumexp(-cfg.softmin_beta * d2_goal, dim=1)  # (B,)
     reach_pen = F.softplus((softmin - cfg.eps_goal ** 2) / 0.02)  # (B,)
 
-    # -------------------
-    # stay near target at the end
-    # -------------------
     L = min(cfg.stay_last_L, T)
-    stay_pen = d2_goal[:, T - L :].mean(dim=1)  # (B,)
+    stay_pen = d2_goal[:, T - L:].mean(dim=1)  # (B,)
 
-    # -------------------
-    # control effort
-    # -------------------
     u_pen = (u * u).sum(dim=-1).mean(dim=1)  # (B,)
 
-    # total
-    loss = (
-        cfg.w_obs * obs_pen.mean()
-        + cfg.w_reach * reach_pen.mean()
-        + cfg.w_stay * stay_pen.mean()
-        + cfg.w_u2 * u_pen.mean()
+    return (
+        cfg.w_obs * obs_traj
+        + cfg.w_reach * reach_pen
+        + cfg.w_stay * stay_pen
+        + cfg.w_u2 * u_pen
     )
-    return loss
+
+
+def objective(y: torch.Tensor, u: torch.Tensor, cfg: ObjCfg) -> torch.Tensor:
+    """
+    TRAINING objective (scalar).
+    Keeps your CVaR obstacle term + mean reach/stay/effort.
+    """
+    device, dtype = y.device, y.dtype
+    B, T, _ = y.shape
+    target = torch.tensor(cfg.target, device=device, dtype=dtype)
+
+    # CVaR obstacle (scalar)
+    obs = obstacle_loss(
+        y, cfg.obstacles,
+        softplus_temp=cfg.softplus_temp,
+        margin=0.10,
+        time_beta=50.0,
+        cvar_q=0.8
+    )
+
+    d2_goal = ((y - target) ** 2).sum(dim=-1)  # (B,T)
+    softmin = -(1.0 / cfg.softmin_beta) * torch.logsumexp(-cfg.softmin_beta * d2_goal, dim=1)  # (B,)
+    reach_pen = F.softplus((softmin - cfg.eps_goal ** 2) / 0.02)  # (B,)
+
+    L = min(cfg.stay_last_L, T)
+    stay_pen = d2_goal[:, T - L:].mean(dim=1)  # (B,)
+
+    u_pen = (u * u).sum(dim=-1).mean(dim=1)  # (B,)
+
+    return cfg.w_obs * obs + cfg.w_reach * reach_pen.mean() + cfg.w_stay * stay_pen.mean() + cfg.w_u2 * u_pen.mean()
+
 
 
 # ============================================================
@@ -340,32 +407,60 @@ class ControllerWrapper(nn.Module):
 
 @dataclass
 class FPcfg:
-    n_iter: int = 10
+    n_iter: int = 30
     relax: float = 0.7
+
+    # stopping
+    atol: float = 1e-4          # absolute tolerance on u update (per-element RMS)
+    rtol: float = 1e-3          # relative tolerance on u update
+    min_iter: int = 2           # don't stop too early
+    patience: int = 2           # require convergence for this many consecutive iters
+    norm: str = "rms"           # "rms" or "linf"
+
+
+def _residual_error(u_hat: torch.Tensor, u: torch.Tensor, norm: str):
+    # residual r = Π(G(u)) - u
+    r = u_hat - u
+    if norm == "linf":
+        err = r.abs().amax(dim=(1, 2))                       # (B,)
+        scale = u.abs().amax(dim=(1, 2)).clamp_min(1e-12)    # (B,)
+    else:  # "rms"
+        err = r.pow(2).mean(dim=(1, 2)).sqrt()               # (B,)
+        scale = u.pow(2).mean(dim=(1, 2)).sqrt().clamp_min(1e-12)
+    return err, scale
 
 
 def solve_closed_loop(
-    plant: DiagonalizablePlant,
+    plant,
     controller: nn.Module,
     x0: torch.Tensor,
     T: int,
     cfg: FPcfg,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Fixed point on trajectories:
-      y = G(u)
-      u = Π(y)
-    Damped Picard iteration:
-      u <- (1-ω)u + ω Π(G(u))
-    """
     B = x0.shape[0]
     n_u = plant.cfg.n_u
     u = torch.zeros(B, T, n_u, device=x0.device, dtype=x0.dtype)
 
-    for _ in range(cfg.n_iter):
+    good_streak = 0
+    for it in range(cfg.n_iter):
         y = plant.rollout_y_from_u(x0, u)
         u_hat = controller(y)
-        u = (1.0 - cfg.relax) * u + cfg.relax * u_hat
+
+        # stop on fixed-point residual (not on damped delta)
+        err, scale = _residual_error(u_hat, u, cfg.norm)
+        thresh = cfg.atol + cfg.rtol * scale
+        all_good = bool((err <= thresh).all().item())
+
+        # damped update
+        u_next = (1.0 - cfg.relax) * u + cfg.relax * u_hat
+        u = u_next
+
+        if it + 1 >= cfg.min_iter and all_good:
+            good_streak += 1
+            if good_streak >= cfg.patience:
+                break
+        else:
+            good_streak = 0
 
     y = plant.rollout_y_from_u(x0, u)
     return y, u
@@ -460,6 +555,94 @@ def plot_landscape_and_trajectory(y_traj: np.ndarray, obj_cfg: ObjCfg, title: st
     plt.grid(True)
 
 
+@torch.no_grad()
+def compute_value_map(
+    plant: DiagonalizablePlant,
+    controller: nn.Module,
+    obj_cfg: ObjCfg,
+    fp_cfg: FPcfg,
+    T: int,
+    lo: float = -3.0,
+    hi: float = 3.0,
+    grid_n: int = 101,
+    chunk_size: int = 1024,
+    device: str = "cuda",
+    dtype: torch.dtype = torch.float32,
+):
+    """
+    Computes a value map V over initial positions (x0[0], x0[1]) on a grid.
+    V[i,j] = per-trajectory loss starting at (X[i,j], Y[i,j]).
+    Also returns a collision mask COL[i,j] indicating if the trajectory ever entered an obstacle.
+    """
+    controller.eval()
+
+    gx = np.linspace(lo, hi, grid_n)
+    gy = np.linspace(lo, hi, grid_n)
+    X, Y = np.meshgrid(gx, gy, indexing="xy")  # (grid_n, grid_n)
+    pts = np.stack([X.reshape(-1), Y.reshape(-1)], axis=1)     # (N,2)
+    N = pts.shape[0]
+
+    V_all = torch.empty(N, device="cpu", dtype=torch.float32)
+    COL_all = torch.empty(N, device="cpu", dtype=torch.bool)
+
+    for s in range(0, N, chunk_size):
+        e = min(s + chunk_size, N)
+        pts_chunk = torch.tensor(pts[s:e], device=device, dtype=dtype)  # (Bc,2)
+
+        x0 = torch.zeros((e - s, plant.cfg.n_x), device=device, dtype=dtype)
+        x0[:, 0:2] = pts_chunk
+
+        y, u = solve_closed_loop(plant, controller, x0, T=T, cfg=fp_cfg)
+
+        # per-trajectory value (NO CVaR)
+        vals = objective_per_traj(y, u, obj_cfg)  # (Bc,)
+        V_all[s:e] = vals.detach().cpu().to(torch.float32)
+
+        # collision mask: did we ever go inside any obstacle?
+        if obj_cfg.obstacles is None or len(obj_cfg.obstacles) == 0:
+            col = torch.zeros(e - s, device=device, dtype=torch.bool)
+        else:
+            col = torch.zeros(e - s, device=device, dtype=torch.bool)
+            for (cx, cy), r in obj_cfg.obstacles:
+                c = torch.tensor([cx, cy], device=device, dtype=dtype)
+                d2 = ((y - c) ** 2).sum(dim=-1)  # (B,T)
+                col = col | (d2.min(dim=1).values < (r * r))
+        COL_all[s:e] = col.detach().cpu()
+
+    V = V_all.numpy().reshape(grid_n, grid_n)
+    COL = COL_all.numpy().reshape(grid_n, grid_n)
+    return X, Y, V, COL
+
+
+def plot_value_map(X, Y, V, COL, obj_cfg: ObjCfg, title: str = "Closed-loop value map"):
+    plt.figure(figsize=(8.2, 6.8))
+    cs = plt.contourf(X, Y, V, levels=60)
+    plt.colorbar(cs, label="trajectory loss (per start)")
+
+    # overlay approximate collision boundary
+    if COL is not None:
+        plt.contour(X, Y, COL.astype(float), levels=[0.5], linewidths=1.5)
+
+    ax = plt.gca()
+
+    # obstacles
+    if obj_cfg.obstacles is not None:
+        for (cx, cy), r in obj_cfg.obstacles:
+            ax.add_patch(plt.Circle((cx, cy), r, fill=False, linewidth=2))
+
+    # target + reach radius
+    tx, ty = obj_cfg.target
+    ax.scatter([tx], [ty], marker="x", s=80)
+    ax.add_patch(plt.Circle((tx, ty), obj_cfg.eps_goal, fill=False, linestyle="--", linewidth=2))
+
+    plt.xlabel("x0[0]")
+    plt.ylabel("x0[1]")
+    plt.title(title + "\n(overlay shows where trajectories collide)")
+    plt.axis("equal")
+    plt.grid(True)
+
+
+
 # ============================================================
 # 8) Main: gain computation + training + plots
 # ============================================================
@@ -480,7 +663,7 @@ def main():
           + (f" | w_peak≈{w_peak:.4f} rad/sample" if w_peak is not None else ""))
 
     # ---- Controller (your DeepSSM) ----
-    ssm=DeepSSM(d_input=plant_cfg.n_y, d_output=plant_cfg.n_u, param='l2n', gamma=1/(gamma+0.001), ff='LGLU', n_layers=2, d_model=8, d_state=8).to(device)
+    ssm=DeepSSM(d_input=plant_cfg.n_y, d_output=plant_cfg.n_u, param='l2n', gamma=1/(gamma+0.001), ff='LGLU', n_layers=2, d_model=10, d_state=10).to(device)
     controller = ControllerWrapper(ssm).to(device)
 
     # ---- Objective ----
@@ -490,13 +673,13 @@ def main():
     )
 
     # ---- Fixed point solver cfg ----
-    fp_cfg = FPcfg(n_iter=10, relax=0.7)
+    fp_cfg = FPcfg(n_iter=30, relax=0.7)
 
     # ---- Training ----
-    B = 16
+    B = 340
     T = 160
-    steps = 1300
-    opt = torch.optim.Adam(controller.parameters(), lr=2e-3)
+    steps = 44000
+    opt = torch.optim.Adam(controller.parameters(), lr=2e-4)
 
     loss_hist = []
 
@@ -520,8 +703,8 @@ def main():
     # ---- Make plots with a single rollout ----
     with torch.no_grad():
         x0 = torch.zeros(1, plant_cfg.n_x, device=device, dtype=dtype)
-        x0[:, 0:2] = torch.tensor([[2.5, 2.0]], device=device, dtype=dtype)
-        y, u = solve_closed_loop(plant, controller, x0, T=T, cfg=FPcfg(n_iter=12, relax=0.7))
+        x0[:, 0:2] = torch.tensor([[-.5, -2]], device=device, dtype=dtype)
+        y, u = solve_closed_loop(plant, controller, x0, T=T, cfg=FPcfg(n_iter=30, relax=0.7))
 
         y_np = y[0].cpu().numpy()
         u_np = u[0].cpu().numpy()
@@ -557,7 +740,31 @@ def main():
     plt.grid(True)
     plt.legend()
 
+    # ---- Value map over starting positions ----
+    with torch.no_grad():
+        Xg, Yg, Vmap, COL = compute_value_map(
+            plant=plant,
+            controller=controller,
+            obj_cfg=obj_cfg,
+            fp_cfg=fp_cfg,
+            T=T,
+            lo=-3.0,
+            hi=3.0,
+            grid_n=101,         # bump to 121 if you want finer
+            chunk_size=1024,    # adjust for GPU memory
+            device=device,
+            dtype=dtype,
+        )
+
+    plot_value_map(Xg, Yg, Vmap, COL, obj_cfg, title="Value map (per-start trajectory loss)")
+
+
+
+
+
     plt.show()
+
+    y
 
 
 if __name__ == "__main__":
