@@ -8,6 +8,7 @@ from dataclasses import fields
 from .scan_utils import *
 from ..static_layers.generic_layers import *
 from ..static_layers.lipschitz_mlps import *
+from .experimental import ExpertSelectiveTimeVaryingSSM
 
 
 # --------- Small utilities (DRY helpers) ---------
@@ -1440,6 +1441,13 @@ class SSL(nn.Module):
                 d_output=config.d_model,
                 train_gamma=True,
                 )
+        elif config.param == "tv":
+            self.lru = ExpertSelectiveTimeVaryingSSM(
+                d_state=config.d_state,
+            d_in=config.d_model,
+            d_out=config.d_model,
+            train_gamma=True,
+            )
         else:
             raise ValueError("Invalid parametrization")
 
