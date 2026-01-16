@@ -1266,92 +1266,99 @@ class Block2x2DenseL2SSM(nn.Module):
     # Forward: loop (for now) + scan hook
     # ----------------------------------------------------------------------
     def forward(
-        self,
-        u: torch.Tensor,
-        state: torch.Tensor | None = None,   # state in z-basis
-        *,
-        time_first: bool = False,
-        return_state: bool = False,
-        mode: str = "scan",               # "loop" or "scan"
+            self,
+            u: torch.Tensor,
+            state: torch.Tensor | None = None,  # x0 in x-basis
+            *,
+            time_first: bool = False,
+            return_state: bool = True,  # if True return x_seq
+            mode: str = "scan",  # "loop" or "scan"
+            return_last: bool = False,
     ):
         """
-        Forward in z-coordinates (internal state). This is the thing you'd
-        plug into your L2RU-like block; z is just the hidden state.
-
-        Args
-        ----
-        u :  (B,T,d_input) if time_first=False
-             (T,B,d_input) if time_first=True
-        z0 : (B,d_state) or (d_state,) or None (zero init)
-        time_first : if True, interpret first dim as time
-        return_state : if True, also return z_seq
-        mode : "loop" or "scan"
-
-        Returns
-        -------
-        y_seq  : (B,T,d_output)
-        z_last : (B,d_state)
-        (optional) z_seq : (B,T,d_state)
+        Returns:
+            y_seq: (B,T,dy) (or (T,B,dy) if time_first)
+            x_seq: (B,T,dx) (or (T,B,dx) if time_first)  [states x_0..x_{T-1}]
+            x_last: (B,dx)                               [x_T] if return_last
         """
         if u.dim() == 2:
-            if time_first:
-                u = u.unsqueeze(1)  # (T,1,du)
-            else:
-                u = u.unsqueeze(0)  # (1,T,du)
+            u = u.unsqueeze(0) if not time_first else u.unsqueeze(1)  # (1,T,du) or (T,1,du)
 
         if time_first:
-            u = u.transpose(0, 1)  # (B,T,du)
-
-        B_sz, T, du = u.shape
-        assert du == self.d_input
-
-        A_z, B_z, C_z, D_z, _ = self.compute_z_matrices()
-        At, Bt, Ct, Dt = A_z.T, B_z.T, C_z.T, D_z.T
-
-        # initial state
-        if state is None:
-            z = u.new_zeros(B_sz, self.d_state)
+            u_bt = u.transpose(0, 1)  # (B,T,du)
         else:
-            if state.dim() == 1:
-                x0_ = state.unsqueeze(0).expand(B_sz, -1)
-            else:
-                x0_ = state
-            # z = S x in column convention → row-wise: z = x @ S^T
-            z = x0_ @ self.S.T
+            u_bt = u
 
-        # LOOP mode
+        B_sz, T, du = u_bt.shape
+        assert du == self.d_input
+        dx = self.d_state
+
+        # z-dynamics matrices (in z-coordinates)
+        A_z, B_z, C_z, D_z, _ = self.compute_z_matrices()  # A_z: (dx,dx), B_z: (dx,du), etc.
+
+        # initial x0
+        if state is None:
+            x0 = u_bt.new_zeros(B_sz, dx)
+        else:
+            x0 = state.unsqueeze(0).expand(B_sz, -1) if state.dim() == 1 else state
+            x0 = x0.to(device=u_bt.device, dtype=u_bt.dtype)
+
+        # convert to z0:  z = S x  (row form)
+        S = self.S.to(device=u_bt.device, dtype=u_bt.dtype)
+        z0 = x0 @ S.T  # (B,dx)
+
         if mode != "scan":
-            y_seq = u.new_empty(B_sz, T, self.d_output)
-            z_seq = u.new_empty(B_sz, T, self.d_state)
+            # LOOP (row convention, consistent with z = x @ S^T)
+            At, Bt, Ct, Dt = A_z.T, B_z.T, C_z.T, D_z.T
 
+            y_seq = u_bt.new_empty(B_sz, T, self.d_output)
+            z_seq = u_bt.new_empty(B_sz, T, dx)
+
+            z = z0
             for t in range(T):
-                u_t = u[:, t, :]
+                u_t = u_bt[:, t, :]
                 z_seq[:, t, :] = z
-                y_t = z @ Ct + u_t @ Dt
-                y_seq[:, t, :] = y_t
+                y_seq[:, t, :] = z @ Ct + u_t @ Dt
                 z = z @ At + u_t @ Bt
 
-            z_last = z
+            z_last = z  # z_T
 
         else:
-            # SCAN mode (if you have compute_linear_recurrence_parallel)
-            # u_scan: (T,B,du)
-            u_scan = u.transpose(0, 1)
-            # states: (T+1,B,d_state)
-            # states: (T+1,B,D_state) in z-coordinates
-            states = compute_linear_recurrence_parallel_block2x2(A_z, B_z, u_scan, z)
-            z_seq = states[:-1].transpose(0, 1)  # (B,T,d_state)
-            z_last = states[-1]                  # (B,d_state)
-            y_seq = z_seq @ Ct + u @ Dt          # (B,T,d_output)
+            # SCAN (scan is column-convention):
+            # it expects u time-major (T,B,du)
+            u_tb = u_bt.transpose(0, 1).contiguous()  # (T,B,du)
+
+            # IMPORTANT: scan computes v_t = B @ u_t using einsum("tbd,sd->tbs")
+            # with B shape (state, in). That matches B_z.
+            states = compute_linear_recurrence_parallel_block2x2(A_z, B_z, u_tb, z0)  # (T+1,B,dx)
+
+            # states[t] is z_t (in row-batch representation, still fine)
+            z_tb = states[:-1]  # (T,B,dx) = z_0..z_{T-1}
+            z_last = states[-1]  # (B,dx)   = z_T
+            z_seq = z_tb.transpose(0, 1).contiguous()  # (B,T,dx)
+
+            # outputs
+            y_seq = z_seq @ C_z.T + u_bt @ D_z.T  # (B,T,dy)
+
+        # Convert z_seq -> x_seq using x = z S^{-T}
+        # Solve (S^T) x^T = z^T  => x^T = (S^T)^{-1} z^T
+        # Use solve rather than inv:
+        # x_seq: (B,T,dx)
+        zT = z_seq.reshape(B_sz * T, dx).T  # (dx, B*T)
+        xT = torch.linalg.solve(S.T, zT).T  # (B*T, dx)
+        x_seq = xT.reshape(B_sz, T, dx)
+
+        # x_last similarly from z_last:
+        z_last_T = z_last.T  # (dx,B)
+        x_last = torch.linalg.solve(S.T, z_last_T).T  # (B,dx)
 
         if time_first:
             y_seq = y_seq.transpose(0, 1)
-            z_seq = z_seq.transpose(0, 1)
+            x_seq = x_seq.transpose(0, 1)
 
-        if return_state:
-            return y_seq, z_seq
-        return y_seq, z_seq
-
+        if return_last:
+            return y_seq, x_seq, x_last
+        return y_seq, x_seq
 
 
 """ SSM models ----------------------------------------- """
