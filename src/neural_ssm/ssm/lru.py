@@ -8,7 +8,7 @@ from dataclasses import fields
 from .scan_utils import *
 from ..static_layers.generic_layers import *
 from ..static_layers.lipschitz_mlps import *
-from .experimental import ExpertSelectiveTimeVaryingSSM
+from .experimental import ExpertSelectiveTimeVaryingSSM, Block2x2SelectiveBCDExpertsL2SSM
 
 
 # --------- Small utilities (DRY helpers) ---------
@@ -1442,12 +1442,13 @@ class SSL(nn.Module):
                 train_gamma=True,
                 )
         elif config.param == "tv":
-            self.lru = ExpertSelectiveTimeVaryingSSM(
+            self.lru = Block2x2SelectiveBCDExpertsL2SSM(
                 d_state=config.d_state,
-            d_in=config.d_model,
-            d_out=config.d_model,
+            d_input=config.d_model,
+            d_output=config.d_model,
             train_gamma=True,
             )
+            self.lru.init_on_circle(rho=config.rho, max_phase=config.max_phase_b, phase_center=config.phase_center, random_phase=config.random_phase)
         else:
             raise ValueError("Invalid parametrization")
 
