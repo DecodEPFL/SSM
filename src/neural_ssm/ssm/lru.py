@@ -9,7 +9,7 @@ from .scan_utils import *
 from ..static_layers.generic_layers import *
 from ..static_layers.lipschitz_mlps import *
 from .experimental import ExpertSelectiveTimeVaryingSSM, Block2x2SelectiveBCDExpertsL2SSM
-from .Mamba import  RobustMambaDiagSSM
+from .mamba import  RobustMambaDiagSSM
 
 
 # --------- Small utilities (DRY helpers) ---------
@@ -1384,8 +1384,9 @@ class SSMConfig:
     nl_layers: int = 2 # number of hidden layers of the non-linear layer
     param: str = None  # pick the parametrization you want to use for the LRU. Default = LRU, other options are L2RU
     # and ZAK
-    gamma: float = None  # set the overall l2 gain value in case you want to keep it fixed and not trainable, if set to
-    # None, the gain will be trainable.
+    gamma: float = 1  # set the overall l2 gain value for the SSM. If set to None, the l2 gain will be trainable and
+    # not specified.
+    train_gamma: bool = True # choose weather the l2 gain of the dynamical systems should be trainable or fixed.
     init: str = 'eye'  # controls the initialization of the parameters when the L2RU param is chosen.
     # parameters needed for the prescribed-gain parametrization
     rho: float = 0.9
@@ -1438,7 +1439,7 @@ class SSL(nn.Module):
                 d_state=config.d_state,
                 d_input=config.d_model,
                 d_output=config.d_model,
-                train_gamma=True,
+                train_gamma=config.train_gamma,
             )
             # initialization of matrix A
             self.lru.init_on_circle(rho=config.rho, max_phase=config.max_phase_b, phase_center=config.phase_center, random_phase=config.random_phase)
@@ -1447,14 +1448,14 @@ class SSL(nn.Module):
                 d_state=config.d_state,
                 d_input=config.d_model,
                 d_output=config.d_model,
-                train_gamma=True,
+                train_gamma=config.train_gamma,
                 )
         elif config.param == "tv":
             self.lru = RobustMambaDiagSSM(
                 d_state=config.d_state,
             d_model=config.d_model,
             d_out=config.d_model,
-            train_gamma=True,
+            train_gamma=config.train_gamma,
             )
             #self.lru.init_on_circle(rho=config.rho, max_phase=config.max_phase_b, phase_center=config.phase_center, random_phase=config.random_phase)
         else:
@@ -1510,7 +1511,8 @@ class DeepSSM(nn.Module):
             d_hidden: int = 4,
             nl_layers: int =3,
             param: Optional[str] = None,
-            gamma: Optional[float] = None,
+            gamma: Optional[float] = 1,
+            train_gamma: Optional[float] = False,
             init: str = "eye",
             rho: float =0.9,
             max_phase_b: float=0.5,            # small spread
@@ -1542,6 +1544,7 @@ class DeepSSM(nn.Module):
                 nl_layers = nl_layers,
                 param=param,
                 gamma=gamma,
+                train_gamma = train_gamma,
                 init=init,
                 rho=rho,
                 max_phase_b=max_phase_b,
@@ -1549,7 +1552,7 @@ class DeepSSM(nn.Module):
                 random_phase=random_phase,
             )
 
-        if self.config.param is not None and self.config.gamma is not None:
+        if self.config.param is not 'lru' and self.config.gamma is not None:
             self.register_buffer("gamma_t", torch.tensor(self.config.gamma))
             self.encoder = nn.Parameter(torch.randn(self.config.d_model, self.d_input))
             self.decoder = nn.Parameter(torch.randn(self.d_output, self.config.d_model))
@@ -1579,7 +1582,7 @@ class DeepSSM(nn.Module):
             layer_states[i] = st[:, -1, :]  # keep only the final state
 
         # Decode
-        if self.config.param is not None and self.config.gamma is not None:
+        if self.config.param is not 'lru' and self.config.gamma is not None:
             gamma_t = torch.abs(self.gamma_t) if gamma is None else gamma
             gammaLRU = [
                 torch.abs(block.lru.gamma * block.ff.lip) if hasattr(block.ff, "lip")

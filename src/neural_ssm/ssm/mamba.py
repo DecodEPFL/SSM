@@ -147,7 +147,7 @@ class RobustMambaDiagSSM(nn.Module):
         init_rho: float = 0.99,       # a ≈ rho initially
         init_delta0: float = 1.0,     # typical delta at init
         init_param_scale: float = 0.02,
-        # keep b,c bounded before normalization (helps avoid shrinking a too much)
+        # keep b,c bounded before normalization (helps avoid shrinking too much)
         bc_nonlinearity: Literal["tanh", "identity"] = "tanh",
         # projection bounds (<=1 keeps overall bound = gamma)
         proj_bound: float = 1.0,
@@ -157,12 +157,12 @@ class RobustMambaDiagSSM(nn.Module):
         self.N = int(d_state if d_state is not None else d_model)
         self.D_out = int(d_out if d_out is not None else d_model)
 
-        assert self.N == self.D, (
-            "To keep the clean overall bound with proj_bound=1 and avoid extra bookkeeping, "
-            "set d_state == d_model. If you really want N!=D, it still works, but you're "
-            "mixing dimensions via projections; the bound stays <= gamma as long as "
-            "||W_in||,||W_out|| <= 1."
-        )
+        # assert self.N == self.D, (
+        #     "To keep the clean overall bound with proj_bound=1 and avoid extra bookkeeping, "
+        #     "set d_state == d_model. If you really want N!=D, it still works, but you're "
+        #     "mixing dimensions via projections; the bound stays <= gamma as long as "
+        #     "||W_in||,||W_out|| <= 1."
+        # )
 
         # gamma (>0)
         g0 = torch.tensor(float(gamma))
