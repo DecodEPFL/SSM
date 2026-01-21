@@ -8,7 +8,7 @@ import math
 from argparse import Namespace
 import torch
 from tqdm import tqdm
-from SSM.ssm import DeepSSM, SSMConfig
+from src.neural_ssm.ssm.lru import DeepSSM, SSMConfig
 import control
 
 seed = 66

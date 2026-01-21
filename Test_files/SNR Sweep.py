@@ -2,7 +2,7 @@ import numpy as np
 import torch
 import matplotlib.pyplot as plt
 from typing import Callable, Dict, List
-from SSM.ssm import DeepSSM, SSMConfig  # Assuming this is your module; adjust if needed
+from src.neural_ssm.ssm.lru import DeepSSM, SSMConfig
 import math
 from argparse import Namespace
 
@@ -165,15 +165,15 @@ if __name__ == "__main__":
     cfg_robust = {
         "n_u": 3,
         "n_y": 3,
-        "d_model": 5,
-        "d_state": 6,
+        "d_model": 4,
+        "d_state": 12,
         "n_layers": 1,
-        "ff": "LMLP",  # GLU | MLP | LMLP
+        "ff": "LGLU",  # GLU | MLP | LMLP
         "max_phase": math.pi / 50,
         "r_min": 0.7,
         "r_max": 0.98,
-        "param": 'l2ru',
-        "gamma": 6,
+        "param": 'tv',
+        "gamma": .8,
         "init": 'eye'
     }
     cfg_robust = Namespace(**cfg_robust)
@@ -184,12 +184,12 @@ if __name__ == "__main__":
         "d_model": 5,
         "d_state": 6,
         "n_layers": 1,
-        "ff": "LMLP",  # GLU | MLP | LMLP
+        "ff": "LGLU",  # GLU | MLP | LMLP
         "max_phase": math.pi / 50,
         "r_min": 0.7,
         "r_max": 0.98,
-        "param": None,
-        "gamma": 6,
+        "param": 'l2ru',
+        "gamma": 2,
         "init": 'eye'
     }
     cfg_vanilla = Namespace(**cfg_vanilla)
@@ -199,13 +199,13 @@ if __name__ == "__main__":
                               ff=cfg_robust.ff,
                               rmin=cfg_robust.r_min, rmax=cfg_robust.r_max, max_phase=cfg_robust.max_phase,
                               param=cfg_robust.param, gamma=cfg_robust.gamma, init=cfg_robust.init)
-    model_robust = DeepSSM(cfg_robust.n_u, cfg_robust.n_y, config_robust)
+    model_robust = DeepSSM(d_input=cfg_robust.n_u, d_output= cfg_robust.n_y, config=config_robust)
 
     config_vanilla = SSMConfig(d_model=cfg_vanilla.d_model, d_state=cfg_vanilla.d_state, n_layers=cfg_vanilla.n_layers,
                                ff=cfg_vanilla.ff,
                                rmin=cfg_vanilla.r_min, rmax=cfg_vanilla.r_max, max_phase=cfg_vanilla.max_phase,
                                param=cfg_vanilla.param, gamma=cfg_vanilla.gamma)
-    model_vanilla = DeepSSM(cfg_vanilla.n_u, cfg_vanilla.n_y, config_vanilla)
+    model_vanilla = DeepSSM(d_input=cfg_vanilla.n_u, d_output=cfg_vanilla.n_y, config=config_vanilla)
 
     # Simulate functions (torch in/out for grads)
     simulate_fn_robust = make_torch_simulate_fn(model_robust, device=torch.device('cpu'), mode='scan')
