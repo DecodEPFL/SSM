@@ -1381,7 +1381,7 @@ class SSMConfig:
     scale: float = 1  # Lipschitz constant of the Lipschitz bounded MLP (LMLP)
     dim_amp: int = 4  # controls the hidden layer's dimension of the MLP
     d_hidden: int = 4  # controls the hidden layer's dimension of the non-linear layer
-    nl_layers: int = 2 # number of hidden layers of the non-linear layer
+    nl_layers: int = 2 # number of hidden layers of the non-linear layers (static nonlinearities)
     param: str = None  # pick the parametrization you want to use for the LRU. Default = LRU, other options are L2RU
     # and ZAK
     gamma: float = 1  # set the overall l2 gain value for the SSM. If set to None, the l2 gain will be trainable and
@@ -1406,14 +1406,13 @@ SSMConfigDict = TypedDict('SSMConfigDict',
 """ SSMs blocks ----------------------------------------- """
 
 
-# python
 class SSL(nn.Module):
-    """State Space Layer: LRU --> FF --> residual"""
-
+    """State Space Layer: (pre-norm) -> LRU -> FF -> dropout -> residual"""
     def __init__(self, config: SSMConfig):
         super().__init__()
         self.ln = nn.LayerNorm(config.d_model, bias=config.bias)
 
+        # --- SSM selection ---
         if config.param is None or config.param == "lru":
             self.lru = LRU(
                 in_features=config.d_model,
@@ -1441,26 +1440,30 @@ class SSL(nn.Module):
                 d_output=config.d_model,
                 train_gamma=config.train_gamma,
             )
-            # initialization of matrix A
-            self.lru.init_on_circle(rho=config.rho, max_phase=config.max_phase_b, phase_center=config.phase_center, random_phase=config.random_phase)
+            self.lru.init_on_circle(
+                rho=config.rho,
+                max_phase=config.max_phase_b,
+                phase_center=config.phase_center,
+                random_phase=config.random_phase,
+            )
         elif config.param == "l2nt":
             self.lru = L2BoundedLTICell(
                 d_state=config.d_state,
                 d_input=config.d_model,
                 d_output=config.d_model,
                 train_gamma=config.train_gamma,
-                )
+            )
         elif config.param == "tv":
             self.lru = RobustMambaDiagSSM(
                 d_state=config.d_state,
-            d_model=config.d_model,
-            d_out=config.d_model,
-            train_gamma=config.train_gamma,
+                d_model=config.d_model,
+                d_out=config.d_model,
+                train_gamma=config.train_gamma,
             )
-            #self.lru.init_on_circle(rho=config.rho, max_phase=config.max_phase_b, phase_center=config.phase_center, random_phase=config.random_phase)
         else:
             raise ValueError("Invalid parametrization")
 
+        # --- FF selection ---
         l_config = LayerConfig()
         l_config.d_input = config.d_model
         l_config.d_output = config.d_model
@@ -1468,145 +1471,140 @@ class SSL(nn.Module):
         l_config.n_layers = config.nl_layers
 
         ff_layers = {
-            "GLU": lambda: GLU(l_config),
-            "MLP": lambda: MLP(l_config),
-            "LGLU":lambda :L2BoundedGLU(l_config),
-            "LMLP": lambda: LMLP(l_config),
-            "TLIP": lambda: TLIP(l_config),
+            "GLU": GLU,
+            "MLP": MLP,
+            "LGLU": L2BoundedGLU,
+            "LMLP": LMLP,
+            "TLIP": TLIP,
         }
         if config.ff not in ff_layers:
             raise ValueError(f"Unknown feedforward type: {config.ff}")
+        self.ff = ff_layers[config.ff](l_config)
 
-        self.ff = ff_layers[config.ff]()
         self.dropout = nn.Dropout(config.dropout)
 
-    def forward(self, x: torch.Tensor, state: Optional[torch.Tensor] = None, mode: str = "loop"):
-        z, st = self.lru(_normalize_to_3d(x), state=state, mode=mode)  # LTI
-        z = self.ff(z)  # nonlinearity
+    def forward(self, x3d: torch.Tensor, state: Optional[torch.Tensor] = None, mode: str = "loop"):
+        # assume x is already [B,T,D]
+        #xn = self.ln(x3d)
+        z, st = self.lru(x3d, state=state, mode=mode)
+        z = self.ff(z)
         z = self.dropout(z)
-        return z + x, st
+        return x3d + z, st
 
 
-# python
+
+
 class DeepSSM(nn.Module):
     """Deep SSM: encoder -> n blocks -> decoder."""
-
     def __init__(
-            self,
-            d_input: int,
-            d_output: int,
-            *,
-            # explicit keyword-only params mirroring SSMConfig (purely for type hints)
-            d_model: int = 10,
-            d_state: int = 32,
-            n_layers: int = 2,
-            dropout: float = 0.0,
-            bias: bool = False,
-            rmin: float = 0.0,
-            rmax: float = 1.0,
-            max_phase: float = 2 * math.pi,
-            ff: str = "MLP",
-            scale: float = 1,
-            dim_amp: int = 4,
-            d_hidden: int = 4,
-            nl_layers: int =3,
-            param: Optional[str] = None,
-            gamma: Optional[float] = 1,
-            train_gamma: Optional[float] = False,
-            init: str = "eye",
-            rho: float =0.9,
-            max_phase_b: float=0.5,            # small spread
-            phase_center: float=0,          # center angle ≈ 0°
-            random_phase=True,
-            config: Optional[SSMConfig] = None,
+        self,
+        d_input: int,
+        d_output: int,
+        *,
+        d_model: int = 10,
+        d_state: int = 32,
+        n_layers: int = 2,
+        dropout: float = 0.0,
+        bias: bool = False,
+        rmin: float = 0.0,
+        rmax: float = 1.0,
+        max_phase: float = 2 * math.pi,
+        ff: str = "LGLU",
+        scale: float = 1,
+        dim_amp: int = 4,
+        d_hidden: int = 4,
+        nl_layers: int = 3,
+        param: Optional[str] = 'lru',
+        gamma: Optional[float] = 1.0,
+        train_gamma: Optional[bool] = True,
+        init: str = "eye",
+        rho: float = 0.9,
+        max_phase_b: float = 0.5,
+        phase_center: float = 0,
+        random_phase: bool = True,
+        config: Optional[SSMConfig] = None,
     ):
         super().__init__()
         self.d_input = d_input
         self.d_output = d_output
 
-        # prefer an explicit config instance, otherwise create one from kwargs
-        if config is not None:
-            self.config = config
-        else:
-            self.config = SSMConfig(
-                d_model=d_model,
-                d_state=d_state,
-                n_layers=n_layers,
-                dropout=dropout,
-                bias=bias,
-                rmin=rmin,
-                rmax=rmax,
-                max_phase=max_phase,
-                ff=ff,
-                scale=scale,
-                dim_amp=dim_amp,
-                d_hidden=d_hidden,
-                nl_layers = nl_layers,
-                param=param,
-                gamma=gamma,
-                train_gamma = train_gamma,
-                init=init,
-                rho=rho,
-                max_phase_b=max_phase_b,
-                phase_center=phase_center,
-                random_phase=random_phase,
-            )
+        self.config = config if config is not None else SSMConfig(
+            d_model=d_model, d_state=d_state, n_layers=n_layers, dropout=dropout, bias=bias,
+            rmin=rmin, rmax=rmax, max_phase=max_phase, ff=ff, scale=scale, dim_amp=dim_amp,
+            d_hidden=d_hidden, nl_layers=nl_layers, param=param, gamma=gamma,
+            train_gamma=train_gamma, init=init, rho=rho, max_phase_b=max_phase_b,
+            phase_center=phase_center, random_phase=random_phase,
+        )
 
-        if self.config.param is not 'lru' and self.config.gamma is not None:
-            self.register_buffer("gamma_t", torch.tensor(self.config.gamma))
-            self.encoder = nn.Parameter(torch.randn(self.config.d_model, self.d_input))
-            self.decoder = nn.Parameter(torch.randn(self.d_output, self.config.d_model))
+        self.use_cert_scaling = (self.config.param != "lru") and (self.config.gamma is not None)
+
+        if self.use_cert_scaling:
+            self.register_buffer("gamma_t", torch.tensor(float(self.config.gamma)))
+            self.encoder_w = nn.Parameter(torch.randn(self.config.d_model, self.d_input))
+            self.decoder_w = nn.Parameter(torch.randn(self.d_output, self.config.d_model))
+
+            # config.ff is shared, so hasattr is constant across blocks
+            self.ff_has_lip = (config.ff in {"LGLU", "TLIP"}) or True  # or safer: set after blocks are built
         else:
             self.encoder = nn.Linear(d_input, self.config.d_model, bias=False)
             self.decoder = nn.Linear(self.config.d_model, d_output, bias=False)
 
         self.blocks = nn.ModuleList([SSL(self.config) for _ in range(self.config.n_layers)])
 
+        if self.use_cert_scaling:
+            # now that blocks exist, we can check once
+            self.ff_has_lip = hasattr(self.blocks[0].ff, "lip")
+
+
     def forward(self, u: torch.Tensor, state: Optional[List[torch.Tensor]] = None, gamma=None, mode: str = "scan"):
-        # Initialize per-layer states
-        layer_states: List[Optional[torch.Tensor]]
+        u3d = _normalize_to_3d(u)
+
         if state is None:
-            layer_states = [None] * len(self.blocks)
+            layer_states: List[Optional[torch.Tensor]] = [None] * len(self.blocks)
         else:
             layer_states = state if isinstance(state, list) else [state] * len(self.blocks)
 
         # Encode
-        if isinstance(self.encoder, nn.Linear):
-            x = self.encoder(_normalize_to_3d(u))
+        if self.use_cert_scaling:
+            x = F.linear(u3d, self.encoder_w, bias=None)
         else:
-            x = _normalize_to_3d(u) @ self.encoder.T
+            x = self.encoder(u3d)
 
-        # Cascade blocks
+        # Blocks
         for i, block in enumerate(self.blocks):
             x, st = block(x, state=layer_states[i], mode=mode)
-            layer_states[i] = st[:, -1, :]  # keep only the final state
+            layer_states[i] = st[:, -1, :]
 
         # Decode
-        if self.config.param is not 'lru' and self.config.gamma is not None:
-            gamma_t = torch.abs(self.gamma_t) if gamma is None else gamma
-            gammaLRU = [
-                torch.abs(block.lru.gamma * block.ff.lip) if hasattr(block.ff, "lip")
-                else torch.abs(block.lru.gamma)
-                for block in self.blocks
-            ]
-            if len(gammaLRU) > 0:
-                gammaLRU_tensor = torch.stack(gammaLRU)
-                enc_norm = torch.linalg.matrix_norm(self.encoder, 2)
-                dec_norm = torch.linalg.matrix_norm(self.decoder, 2)
-                gamma_prod = torch.prod(gammaLRU_tensor+1)
-                decoder_scaled = (gamma_t * self.decoder) / (enc_norm * dec_norm * gamma_prod)
-                outputs = x @ decoder_scaled.T
-            else:
-                outputs = x @ self.decoder.T
+        if self.use_cert_scaling:
+            gamma_t = self.gamma_t.abs() if gamma is None else torch.as_tensor(gamma, device=x.device, dtype=x.dtype).abs()
+
+            # collect per-block gains
+            g = torch.stack([block.lru.gamma.abs() for block in self.blocks])
+            if self.ff_has_lip:
+                l = torch.stack([block.ff.lip.abs() for block in self.blocks])
+                g = g * l
+
+            # prod(1+g) in log-space
+            log_gamma_prod = torch.log1p(g).sum()
+            gamma_prod = torch.exp(log_gamma_prod)
+
+            # EXACT SVD norms with backward
+            enc_norm = torch.linalg.svdvals(self.encoder_w).max()
+            dec_norm = torch.linalg.svdvals(self.decoder_w).max()
+
+            scale = gamma_t / (enc_norm * dec_norm * gamma_prod + 1e-12)
+            decoder_scaled = self.decoder_w * scale
+
+            outputs = F.linear(x, decoder_scaled, bias=None)
         else:
-            outputs = self.decoder(x) if isinstance(self.decoder, nn.Linear) else x @ self.decoder.T
+            outputs = self.decoder(x)
 
         return outputs, layer_states
 
     def reset(self):
         for block in self.blocks:
             block.lru.reset()
-
 
 # Pure LRU blocks -----------------------------------------------
 
