@@ -168,12 +168,12 @@ if __name__ == "__main__":
         "d_model": 4,
         "d_state": 12,
         "n_layers": 1,
-        "ff": "LGLU",  # GLU | MLP | LMLP
+        "ff": "GLU",  # GLU | MLP | LMLP
         "max_phase": math.pi / 50,
         "r_min": 0.7,
         "r_max": 0.98,
         "param": 'tv',
-        "gamma": .8,
+        "gamma": 2,
         "init": 'eye'
     }
     cfg_robust = Namespace(**cfg_robust)
@@ -206,6 +206,7 @@ if __name__ == "__main__":
                                rmin=cfg_vanilla.r_min, rmax=cfg_vanilla.r_max, max_phase=cfg_vanilla.max_phase,
                                param=cfg_vanilla.param, gamma=cfg_vanilla.gamma)
     model_vanilla = DeepSSM(d_input=cfg_vanilla.n_u, d_output=cfg_vanilla.n_y, config=config_vanilla)
+
 
     # Simulate functions (torch in/out for grads)
     simulate_fn_robust = make_torch_simulate_fn(model_robust, device=torch.device('cpu'), mode='scan')
