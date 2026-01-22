@@ -1377,7 +1377,7 @@ class SSMConfig:
     rmin: float = 0.0  # min. magnitude of the eigenvalues at initialization in the complex parametrization
     rmax: float = 1.0  # max. magnitude of the eigenvalues at initialization in the complex parametrization
     max_phase: float = 2 * math.pi  # maximum phase of the eigenvalues at initialization in the complex parametrization
-    ff: str = "MLP"  # non-linear block used in the scaffolding
+    ff: str = "MLP"  # non-linear static block used in the scaffolding
     scale: float = 1  # Lipschitz constant of the Lipschitz bounded MLP (LMLP)
     dim_amp: int = 4  # controls the hidden layer's dimension of the MLP
     d_hidden: int = 4  # controls the hidden layer's dimension of the non-linear layer
@@ -1407,7 +1407,8 @@ SSMConfigDict = TypedDict('SSMConfigDict',
 
 
 class SSL(nn.Module):
-    """State Space Layer: (pre-norm) -> LRU -> FF -> dropout -> residual"""
+    """State Space Layer: LRU -> FF -> dropout (optional) -> residual
+    y = FF(LRU(u))+u """
     def __init__(self, config: SSMConfig):
         super().__init__()
         self.ln = nn.LayerNorm(config.d_model, bias=config.bias)
