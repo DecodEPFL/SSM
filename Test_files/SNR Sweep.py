@@ -196,7 +196,7 @@ if __name__ == "__main__":
 
     # Build models
     config_robust = SSMConfig(d_model=cfg_robust.d_model, d_state=cfg_robust.d_state, n_layers=cfg_robust.n_layers,
-                              ff=cfg_robust.ff,
+                              ff="GLU",
                               rmin=cfg_robust.r_min, rmax=cfg_robust.r_max, max_phase=cfg_robust.max_phase,
                               param=cfg_robust.param, gamma=cfg_robust.gamma, init=cfg_robust.init)
     model_robust = DeepSSM(d_input=cfg_robust.n_u, d_output= cfg_robust.n_y, config=config_robust)
