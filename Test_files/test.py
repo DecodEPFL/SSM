@@ -2,7 +2,7 @@ import numpy as np
 import torch
 import time
 from l2cell import L2BoundedLTICell
-
+from src.neural_ssm.ssm.lru import DeepSSM, SSMConfig
 from l2cellblocks import Block2x2DenseL2SSM
 
 d_state=4
@@ -10,6 +10,13 @@ d_input=23
 torch.manual_seed(32)
 cell = Block2x2DenseL2SSM(d_state=d_state, d_input=d_input, d_output=d_input, gamma=1)
 
+
+ssm = DeepSSM(d_input=3, d_output=3, d_model=6, d_state=8,n_layers=2, ff='GLU')
+
+a,b=ssm(u = torch.randn((3,1,3)), state = None)
+
+SSM_1_101 = DeepSSM(d_input=1, d_output=1, d_model = 8, d_state=8, n_layers = 7, ff='GLU', param='l2n',
+                    max_phase_b=0.04,  d_hidden=12, dim_amp=3)
 
 # Initialize A with eigenvalues ≈ 0.99
 # target spectrum: 3 slow modes, 3 faster, some negative

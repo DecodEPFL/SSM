@@ -1472,7 +1472,7 @@ class DeepSSM(nn.Module):
         d_hidden: int = 4,
         nl_layers: int = 3,
         param: Optional[str] = 'lru',
-        gamma: Optional[float] = 1.0,
+        gamma: Optional[float] = None,
         train_gamma: Optional[bool] = True,
         init: str = "eye",
         rho: float = 0.9,
@@ -1501,7 +1501,7 @@ class DeepSSM(nn.Module):
             self.decoder_w = nn.Parameter(torch.randn(self.d_output, self.config.d_model))
 
             # config.ff is shared, so hasattr is constant across blocks
-            self.ff_has_lip = (config.ff in {"LGLU", "TLIP"}) or True  # or safer: set after blocks are built
+            self.ff_has_lip = (self.config.ff in {"LGLU", "TLIP"}) or True  # or safer: set after blocks are built
         else:
             self.encoder = nn.Linear(d_input, self.config.d_model, bias=False)
             self.decoder = nn.Linear(self.config.d_model, d_output, bias=False)
