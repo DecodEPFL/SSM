@@ -56,6 +56,12 @@ def associative_scan(operator, elems, axis=0, reverse=False):
         raise TypeError("lax.associative_scan: fn argument should be callable.")
     elems_flat, tree = tree_flatten(elems)
 
+    nd = elems_flat[0].ndim
+    if axis < 0:
+        axis += nd
+    if not (0 <= axis < nd):
+        raise ValueError(f"axis={axis} out of bounds for ndim={nd}")
+
     if reverse:
         elems_flat = [torch.flip(elem, [axis]) for elem in elems_flat]
 

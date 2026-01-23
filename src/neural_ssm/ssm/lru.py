@@ -26,52 +26,55 @@ def _normalize_to_3d(x: torch.Tensor) -> torch.Tensor:
 
 
 def _init_or_cast_state(
-        state: Optional[torch.Tensor],
-        batch_size: int,
-        n_state: int,
-        device: torch.device,
-        dtype: torch.dtype,
+    state: Optional[torch.Tensor],
+    batch_size: int,
+    n_state: int,
+    device: torch.device,
+    dtype: torch.dtype,
 ) -> torch.Tensor:
-    if state is not None:
-        return state.to(device=device, dtype=dtype)
-    return torch.zeros(batch_size, n_state, device=device, dtype=dtype)
+    if state is None:
+        return torch.zeros(batch_size, n_state, device=device, dtype=dtype)
+
+    # accept (N,) or (B,N)
+    if state.dim() == 1:
+        state = state.unsqueeze(0).expand(batch_size, -1)
+    elif state.dim() == 2:
+        if state.size(0) == 1 and batch_size > 1:
+            state = state.expand(batch_size, -1)
+    else:
+        raise ValueError("state must have shape (N,) or (B,N)")
+
+    if state.shape != (batch_size, n_state):
+        raise ValueError(f"state has shape {tuple(state.shape)}, expected {(batch_size, n_state)}")
+
+    return state.to(device=device, dtype=dtype)
 
 
-def _scan_diag_linear(
-        lambdas: torch.Tensor,  # (N,)
-        Bu: torch.Tensor,  # (B, L, N) = B u_t already
-        x0: torch.Tensor,  # (B, N)
-) -> torch.Tensor:
-    """
-    Diagonal linear recurrence via parallel scan:
 
-        x_{t+1} = lambdas * x_t + Bu[:, t]
-
-    Args:
-        lambdas: (N,)
-        Bu:      (B, L, N)  precomputed B @ u_t
-        x0:      (B, N)     initial state x_0
-
-    Returns:
-        states:  (B, L+1, N) with
-                 states[:, 0]   = x_0
-                 states[:, t+1] = x_{t+1} for t = 0..L-1
-    """
+def _scan_diag_linear(lambdas: torch.Tensor, Bu: torch.Tensor, x0: torch.Tensor) -> torch.Tensor:
     Bsz, L, N = Bu.shape
-    Bu = Bu.clone()
-    x0 = x0.squeeze(1)
-    # fold x0 into the first step
-    Bu[:, 0, :] += lambdas * x0
 
-    lam_seq = lambdas.expand(L, -1)  # (L, N)
+    # ensure x0 is (B,N)
+    if x0.dim() == 1:
+        x0 = x0.unsqueeze(0).expand(Bsz, -1)
+    elif x0.dim() == 2 and x0.size(0) == 1 and Bsz > 1:
+        x0 = x0.expand(Bsz, -1)
+    if x0.shape != (Bsz, N):
+        raise ValueError(f"x0 has shape {tuple(x0.shape)}, expected {(Bsz, N)}")
+
+    if L == 0:
+        return x0.unsqueeze(1)  # (B,1,N) = [x0]
+
+    Bu = Bu.clone()
+    Bu[:, 0, :] = Bu[:, 0, :] + lambdas * x0   # fold x0 into first step
+
+    lam_seq = lambdas.expand(L, -1)            # (L,N)
 
     def _scan_fn(bu_seq):
-        # returns sequence x_1..x_L, shape (L, N)
         return associative_scan(binary_operator_diag, (lam_seq, bu_seq))[1]
 
-    x_next = torch.vmap(_scan_fn)(Bu)  # (B, L, N): x_1..x_L
+    x_next = torch.vmap(_scan_fn)(Bu)          # (B,L,N) = x_1..x_L
 
-    # assemble full trajectory [x_0, ..., x_L]
     states = torch.empty(Bsz, L + 1, N, device=Bu.device, dtype=Bu.dtype)
     states[:, 0] = x0
     states[:, 1:] = x_next
@@ -80,100 +83,56 @@ def _scan_diag_linear(
 
 @torch.jit.script
 def lru_forward_loop(
-        input: Tensor,
-        state: Tensor,
-        A: Tensor,
-        B: Tensor,
-        C: Tensor,
-        D: Tensor,
+    input: Tensor,  # (B,L,H) real (usually)
+    state: Tensor,  # (B,N) complex for LRU
+    A: Tensor,      # (N,) or (N,N) complex
+    B: Tensor,      # (N,H) complex
+    C: Tensor,      # (H_out,N) complex
+    D: Tensor,      # (H_out,H) real
 ) -> Tuple[Tensor, Tensor]:
-    """
-    Sequential state-space recurrence (loop version).
-
-    Recurrence:
-        x_{t+1} = A x_t + B u_t
-        y_t     = Re(C x_t) + D u_t
-
-    Supports:
-        - A: (N,)   -> diagonal (elementwise multiplication)
-        - A: (N,N)  -> full constant matrix
-
-    Args:
-        input:  (B, L, H)
-        state:  (B, N)        initial state x_0
-        A:      (N,) or (N,N) state transition
-        B:      (N, H)
-        C:      (H_out, N)
-        D:      (H_out, H)
-
-    Returns:
-        output: (B, L, H_out)   y_t = Re(C x_t) + D u_t
-        states: (B, L+1, N)     full trajectory [x_0, ..., x_L]
-    """
     BATCH, SEQ, H = input.shape
     N = state.size(1)
 
-    # Basic shape sanity checks
-    assert state.size(0) == BATCH
-    assert B.size(0) == N and B.size(1) == H
-    assert C.size(1) == N
-    assert D.size(1) == H
-
-    # Use input's dtype/device as reference
-    dtype = input.dtype
+    # compute recurrence in the state dtype (complex)
+    sdtype = state.dtype
     device = input.device
 
-    # Cast everything once, up front (no per-step .to calls)
-    state = state.to(dtype=dtype, device=device)
-    B = B.to(dtype=dtype, device=device)
-    C = C.to(dtype=dtype, device=device)
-    D = D.to(dtype=dtype, device=device)
+    x = state.to(device=device, dtype=sdtype)
+    A = A.to(device=device, dtype=sdtype)
+    B = B.to(device=device, dtype=sdtype)
+    C = C.to(device=device, dtype=sdtype)
 
-    # A might be complex in LRU; keep dtype consistent but don't force device move
-    A = A.to(dtype=dtype)
+    # D stays in input dtype (real), so y is real like in scan
+    D = D.to(device=device, dtype=input.dtype)
 
-    # Precompute transposes (matrix-layout friendly)
-    BT = B.mT  # (H, N)
-    CT = C.mT  # (N, H_out)
-    DT = D.mT  # (H, H_out)
+    BT = B.mT          # (H,N) complex
+    CT = C.mT          # (N,H_out) complex
+    DT = D.mT          # (H,H_out) real
 
-    # Allocate full trajectory [x_0, ..., x_L]
-    states = torch.empty(
-        (BATCH, SEQ + 1, N),
-        device=device,
-        dtype=dtype,
-    )
-    x = state  # (B, N)
+    states = torch.empty((BATCH, SEQ + 1, N), device=device, dtype=sdtype)
     states[:, 0] = x
 
     if A.dim() == 1:
-        # Diagonal A (vector of lambdas)
-        lambdas = A  # (N,)
+        lambdas = A  # (N,) complex
         for t in range(SEQ):
-            u_t = input[:, t, :]  # (B, H)
-            # x = lambdas * x + u_t @ BT
-            x = x * lambdas  # broadcasts over batch
-            x = x + u_t @ BT  # (B, N)
+            u_t_c = input[:, t, :].to(dtype=sdtype)   # complex for state update
+            x = x * lambdas + u_t_c @ BT
             states[:, t + 1] = x
     elif A.dim() == 2:
-        # Full constant A
-        A_T = A.mT  # (N, N)
+        A_T = A.mT
         for t in range(SEQ):
-            u_t = input[:, t, :]  # (B, H)
-            # x = x @ A_T + u_t @ BT
-            x = x @ A_T  # (B, N)
-            x = x + u_t @ BT  # (B, N)
+            u_t_c = input[:, t, :].to(dtype=sdtype)
+            x = x @ A_T + u_t_c @ BT
             states[:, t + 1] = x
     else:
-        # TorchScript only supports RuntimeError, not ValueError etc.
         raise RuntimeError("Unsupported A.dim(), expected 1 or 2")
 
-    # pre-update states for output: x_t
-    pre_states = states[:, :-1, :]  # (B, L, N)
+    pre_states = states[:, :-1, :]  # x_0..x_{L-1}
 
-    # Vectorized output computation over time
-    # (B, L, N) @ (N, H_out) --> (B, L, H_out)
-    output = (pre_states @ CT).real + input @ DT
+    # output is real (match scan): Re(C x_t) + D u_t
+    y_lin = (pre_states @ CT).real.to(dtype=input.dtype)     # (B,L,H_out)
+    y_dir = input @ DT                                       # (B,L,H_out)
+    output = y_lin + y_dir
 
     return output, states
 
@@ -311,7 +270,6 @@ class LRU(nn.Module):
 
     def forward(self, input: torch.Tensor, gamma: Optional[float] = None, state: Optional[torch.Tensor] = None,
                 mode: str = "loop"):
-        input = _normalize_to_3d(input)
         self.state = _init_or_cast_state(state, input.shape[0], self.state_features, input.device, self.B.dtype)
         if mode == "scan":
             return self.forward_scan(input, self.state)
@@ -1267,35 +1225,35 @@ class Block2x2DenseL2SSM(nn.Module):
     # Forward: loop (for now) + scan hook
     # ----------------------------------------------------------------------
     def forward(
-            self,
-            u: torch.Tensor,
-            state: torch.Tensor | None = None,  # x0 in x-basis
-            *,
-            time_first: bool = False,
-            return_state: bool = True,  # if True return x_seq
-            mode: str = "scan",  # "loop" or "scan"
-            return_last: bool = False,
+        self,
+        u: torch.Tensor,
+        state: torch.Tensor | None = None,  # x0 in x-basis
+        *,
+        time_first: bool = False,
+        return_state: bool = True,          # if True return x_seq (x0..x_{T+1})
+        mode: str = "scan",                 # "loop" or "scan"
+        return_last: bool = False,          # if True return x_last (= x_{T+1})
     ):
         """
+        Input:
+            u contains (u_0,...,u_T)  -> length L = T+1
+
         Returns:
-            y_seq: (B,T,dy) (or (T,B,dy) if time_first)
-            x_seq: (B,T,dx) (or (T,B,dx) if time_first)  [states x_0..x_{T-1}]
-            x_last: (B,dx)                               [x_T] if return_last
+            y_seq: (B,L,dy) (or (L,B,dy) if time_first)          [y_0..y_T]
+            x_seq: (B,L+1,dx) (or (L+1,B,dx) if time_first)      [x_0..x_{T+1}]   if return_state
+            x_last: (B,dx)                                      [x_{T+1}]        if return_last
         """
         if u.dim() == 2:
-            u = u.unsqueeze(0) if not time_first else u.unsqueeze(1)  # (1,T,du) or (T,1,du)
+            u = u.unsqueeze(0) if not time_first else u.unsqueeze(1)  # (1,L,du) or (L,1,du)
 
-        if time_first:
-            u_bt = u.transpose(0, 1)  # (B,T,du)
-        else:
-            u_bt = u
-
-        B_sz, T, du = u_bt.shape
+        # make batch-first for internal computation
+        u_bt = u.transpose(0, 1).contiguous() if time_first else u
+        B_sz, L, du = u_bt.shape
         assert du == self.d_input
         dx = self.d_state
 
         # z-dynamics matrices (in z-coordinates)
-        A_z, B_z, C_z, D_z, _ = self.compute_z_matrices()  # A_z: (dx,dx), B_z: (dx,du), etc.
+        A_z, B_z, C_z, D_z, _ = self.compute_z_matrices()  # A_z: (dx,dx), B_z: (dx,du), ...
 
         # initial x0
         if state is None:
@@ -1304,62 +1262,60 @@ class Block2x2DenseL2SSM(nn.Module):
             x0 = state.unsqueeze(0).expand(B_sz, -1) if state.dim() == 1 else state
             x0 = x0.to(device=u_bt.device, dtype=u_bt.dtype)
 
-        # convert to z0:  z = S x  (row form)
+        # convert to z0: z = S x  (row form)
         S = self.S.to(device=u_bt.device, dtype=u_bt.dtype)
         z0 = x0 @ S.T  # (B,dx)
 
         if mode != "scan":
-            # LOOP (row convention, consistent with z = x @ S^T)
+            # LOOP in row convention:
             At, Bt, Ct, Dt = A_z.T, B_z.T, C_z.T, D_z.T
 
-            y_seq = u_bt.new_empty(B_sz, T, self.d_output)
-            z_seq = u_bt.new_empty(B_sz, T, dx)
+            y_seq = u_bt.new_empty(B_sz, L, self.d_output)   # y_0..y_T
+            z_seq = u_bt.new_empty(B_sz, L + 1, dx)          # z_0..z_{T+1}
 
             z = z0
-            for t in range(T):
+            for t in range(L):
                 u_t = u_bt[:, t, :]
-                z_seq[:, t, :] = z
-                y_seq[:, t, :] = z @ Ct + u_t @ Dt
-                z = z @ At + u_t @ Bt
+                z_seq[:, t, :] = z                           # z_t
+                y_seq[:, t, :] = z @ Ct + u_t @ Dt           # y_t
+                z = z @ At + u_t @ Bt                        # z_{t+1}
 
-            z_last = z  # z_T
+            z_seq[:, L, :] = z                               # z_{T+1}
+            z_last = z
 
         else:
-            # SCAN (scan is column-convention):
-            # it expects u time-major (T,B,du)
-            u_tb = u_bt.transpose(0, 1).contiguous()  # (T,B,du)
+            # SCAN expects time-major inputs (L,B,du)
+            u_tb = u_bt.transpose(0, 1).contiguous()  # (L,B,du)
 
-            # IMPORTANT: scan computes v_t = B @ u_t using einsum("tbd,sd->tbs")
-            # with B shape (state, in). That matches B_z.
-            states = compute_linear_recurrence_parallel_block2x2(A_z, B_z, u_tb, z0)  # (T+1,B,dx)
+            # states is (L+1,B,dx): z_0..z_{T+1}
+            states = compute_linear_recurrence_parallel_block2x2(A_z, B_z, u_tb, z0)
 
-            # states[t] is z_t (in row-batch representation, still fine)
-            z_tb = states[:-1]  # (T,B,dx) = z_0..z_{T-1}
-            z_last = states[-1]  # (B,dx)   = z_T
-            z_seq = z_tb.transpose(0, 1).contiguous()  # (B,T,dx)
+            # batch-first sequence of states
+            z_seq = states.transpose(0, 1).contiguous()      # (B,L+1,dx)
+            z_last = z_seq[:, -1, :]                         # (B,dx) = z_{T+1}
 
-            # outputs
-            y_seq = z_seq @ C_z.T + u_bt @ D_z.T  # (B,T,dy)
+            # outputs use z_t for t=0..T (exclude last state)
+            y_seq = z_seq[:, :-1, :] @ C_z.T + u_bt @ D_z.T  # (B,L,dy)
 
-        # Convert z_seq -> x_seq using x = z S^{-T}
-        # Solve (S^T) x^T = z^T  => x^T = (S^T)^{-1} z^T
-        # Use solve rather than inv:
-        # x_seq: (B,T,dx)
-        zT = z_seq.reshape(B_sz * T, dx).T  # (dx, B*T)
-        xT = torch.linalg.solve(S.T, zT).T  # (B*T, dx)
-        x_seq = xT.reshape(B_sz, T, dx)
+        # Convert full z_seq -> x_seq using solve: (S^T) x^T = z^T
+        # z_seq: (B,L+1,dx)
+        z_flat_T = z_seq.reshape(B_sz * (L + 1), dx).T       # (dx, B*(L+1))
+        x_flat = torch.linalg.solve(S.T, z_flat_T).T         # (B*(L+1), dx)
+        x_seq = x_flat.reshape(B_sz, L + 1, dx)              # (B,L+1,dx)
+        x_last = x_seq[:, -1, :]                             # (B,dx) = x_{T+1}
 
-        # x_last similarly from z_last:
-        z_last_T = z_last.T  # (dx,B)
-        x_last = torch.linalg.solve(S.T, z_last_T).T  # (B,dx)
-
+        # restore time_first if requested
         if time_first:
-            y_seq = y_seq.transpose(0, 1)
-            x_seq = x_seq.transpose(0, 1)
+            y_seq = y_seq.transpose(0, 1).contiguous()       # (L,B,dy)
+            x_seq = x_seq.transpose(0, 1).contiguous()       # (L+1,B,dx)
 
-        if return_last:
+        if return_state and return_last:
             return y_seq, x_seq, x_last
-        return y_seq, x_seq
+        if return_state:
+            return y_seq, x_seq
+        if return_last:
+            return y_seq, x_last
+        return y_seq
 
 
 """ SSM models ----------------------------------------- """
