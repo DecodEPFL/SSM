@@ -278,23 +278,23 @@ class RobustMambaDiagSSM(nn.Module):
         return a, b, c, u_scaled
 
     def forward(
-        self,
-        u: torch.Tensor,                    # (B,T,D)  (your convention)
-        state: Optional[torch.Tensor] = None, # z0: (B,N) or (N,)
-        *,
-        mode: Literal["scan", "loop"] = "scan",
-        return_state: bool = True,
+            self,
+            u: torch.Tensor,  # (B,T,D) = (u_0,...,u_{T-1})
+            state: Optional[torch.Tensor] = None,  # z0: (B,N) or (N,)
+            *,
+            mode: Literal["scan", "loop"] = "scan",
+            return_state: bool = True,
+            return_last: bool = False,
     ):
         """
         Returns:
-          y: (B,T,D_out)
-          z_last: (B,N)
-          (optional) z_seq: (B,T,N)  [z_0..z_{T-1}]
+          y:      (B,T,D_out)                 [y_0..y_{T-1}]
+          z_seq:  (B,T+1,N) if return_state   [z_0..z_T]
+          z_last: (B,N)    if return_last    [z_T]
         """
         assert u.dim() == 3, "Expected u of shape (B,T,D)"
         B, T, D = u.shape
         assert D == self.D
-
         device, dtype = u.device, u.dtype
 
         # init z0
@@ -305,37 +305,55 @@ class RobustMambaDiagSSM(nn.Module):
             z0 = z0.to(device=device, dtype=dtype)
 
         a_bt, b_bt, c_bt, u_scaled_bt = self._compute_params(u)  # all (B,T,N)
-        bu_bt = b_bt * u_scaled_bt                               # (B,T,N)
+        bu_bt = b_bt * u_scaled_bt  # (B,T,N)
 
         if mode == "loop":
             z = z0
             y_hat = torch.empty(B, T, self.N, device=device, dtype=dtype)
-            z_seq = torch.empty(B, T, self.N, device=device, dtype=dtype) if return_state else None
+
+            z_seq = torch.empty(B, T + 1, self.N, device=device, dtype=dtype) if return_state else None
+            if return_state:
+                z_seq[:, 0, :] = z0
 
             for t in range(T):
-                if return_state:
-                    z_seq[:, t, :] = z
+                # y_t uses z_t
                 y_hat[:, t, :] = c_bt[:, t, :] * z
+                # update to z_{t+1}
                 z = a_bt[:, t, :] * z + bu_bt[:, t, :]
 
-            z_last = z
+                if return_state:
+                    z_seq[:, t + 1, :] = z  # store z_{t+1}
+
+            z_last = z  # z_T
 
         else:
             # scan needs (T,B,N)
-            a_tb = a_bt.transpose(0, 1).contiguous()
-            bu_tb = bu_bt.transpose(0, 1).contiguous()
+            a_tb = a_bt.transpose(0, 1).contiguous()  # (T,B,N)
+            bu_tb = bu_bt.transpose(0, 1).contiguous()  # (T,B,N)
 
-            states = diag_recurrence_scan(a_tb, bu_tb, z0)  # (T+1,B,N)
-            z_tb = states[:-1]                               # (T,B,N) = z_0..z_{T-1}
-            z_last = states[-1]                              # (B,N)
-            z_bt = z_tb.transpose(0, 1).contiguous()         # (B,T,N)
+            # states: (T+1,B,N) = z_0..z_T
+            states = diag_recurrence_scan(a_tb, bu_tb, z0)
 
-            y_hat = c_bt * z_bt
-            z_seq = z_bt if return_state else None
+            z_last = states[-1]  # (B,N) = z_T
 
-        # bounded output projection: y = W_out y_hat, ||W_out||<=1 so energy doesn't increase
+            if return_state:
+                z_seq = states.transpose(0, 1).contiguous()  # (B,T+1,N)
+                z_bt = z_seq[:, :-1, :]  # (B,T,N) = z_0..z_{T-1}
+            else:
+                z_seq = None
+                z_bt = states[:-1].transpose(0, 1).contiguous()
+
+            # y_t uses z_t
+            y_hat = c_bt * z_bt  # (B,T,N)
+
+        # bounded output projection
         y = self.out_proj(y_hat)  # (B,T,D_out)
 
+        if return_state and return_last:
+            return y, z_seq, z_last
         if return_state:
             return y, z_seq
-        return y, z_seq
+        if return_last:
+            return y, z_last
+        return y
+

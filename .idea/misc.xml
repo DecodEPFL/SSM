@@ -3,7 +3,7 @@
   <component name="Black">
     <option name="sdkName" value="perf-boost-base" />
   </component>
-  <component name="ProjectRootManager" version="2" project-jdk-name="Python 3.14 (L2RU)" project-jdk-type="Python SDK" />
+  <component name="ProjectRootManager" version="2" project-jdk-name="SSM (2)" project-jdk-type="Python SDK" />
   <component name="PythonCompatibilityInspectionAdvertiser">
     <option name="version" value="3" />
   </component>

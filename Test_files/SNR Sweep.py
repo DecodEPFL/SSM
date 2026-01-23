@@ -172,7 +172,7 @@ if __name__ == "__main__":
         "max_phase": math.pi / 50,
         "r_min": 0.7,
         "r_max": 0.98,
-        "param": 'tv',
+        "param": 'lru',
         "gamma": 2,
         "init": 'eye'
     }
@@ -207,6 +207,9 @@ if __name__ == "__main__":
                                param=cfg_vanilla.param, gamma=cfg_vanilla.gamma)
     model_vanilla = DeepSSM(d_input=cfg_vanilla.n_u, d_output=cfg_vanilla.n_y, config=config_vanilla)
 
+    u = torch.randn(5, 2, 3)
+    a, b = model_robust(u = u, mode = 'loop')
+    a2, b2 = model_robust(u=u, mode='scan')
 
     # Simulate functions (torch in/out for grads)
     simulate_fn_robust = make_torch_simulate_fn(model_robust, device=torch.device('cpu'), mode='scan')
