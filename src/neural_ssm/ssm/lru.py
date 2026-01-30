@@ -1225,14 +1225,14 @@ class Block2x2DenseL2SSM(nn.Module):
     # Forward: loop (for now) + scan hook
     # ----------------------------------------------------------------------
     def forward(
-        self,
-        u: torch.Tensor,
-        state: torch.Tensor | None = None,  # x0 in x-basis
-        *,
-        time_first: bool = False,
-        return_state: bool = True,          # if True return x_seq (x0..x_{T+1})
-        mode: str = "scan",                 # "loop" or "scan"
-        return_last: bool = False,          # if True return x_last (= x_{T+1})
+            self,
+            u: torch.Tensor,
+            state: torch.Tensor | None = None,  # x0 in x-basis
+            *,
+            time_first: bool = False,
+            return_state: bool = True,  # if True return x_seq (x0..x_{T+1})
+            mode: str = "scan",  # "loop" or "scan"
+            return_last: bool = False,  # if True return x_last (= x_{T+1})
     ):
         """
         Input:
@@ -1242,73 +1242,107 @@ class Block2x2DenseL2SSM(nn.Module):
             y_seq: (B,L,dy) (or (L,B,dy) if time_first)          [y_0..y_T]
             x_seq: (B,L+1,dx) (or (L+1,B,dx) if time_first)      [x_0..x_{T+1}]   if return_state
             x_last: (B,dx)                                      [x_{T+1}]        if return_last
+
+        Design:
+            - scan: stays in z-basis exactly as before (fast)
+            - loop: runs recurrence directly in x-basis to match step-by-step feeding x_last
         """
+        # ---- normalize input to (B,L,du) ----
         if u.dim() == 2:
             u = u.unsqueeze(0) if not time_first else u.unsqueeze(1)  # (1,L,du) or (L,1,du)
 
-        # make batch-first for internal computation
         u_bt = u.transpose(0, 1).contiguous() if time_first else u
         B_sz, L, du = u_bt.shape
         assert du == self.d_input
         dx = self.d_state
 
-        # z-dynamics matrices (in z-coordinates)
-        A_z, B_z, C_z, D_z, _ = self.compute_z_matrices()  # A_z: (dx,dx), B_z: (dx,du), ...
+        # ---- z-basis matrices (as before) ----
+        A_z, B_z, C_z, D_z, _ = self.compute_z_matrices()
 
-        # initial x0
+        # ---- initial x0 in x-basis ----
         if state is None:
             x0 = u_bt.new_zeros(B_sz, dx)
         else:
             x0 = state.unsqueeze(0).expand(B_sz, -1) if state.dim() == 1 else state
             x0 = x0.to(device=u_bt.device, dtype=u_bt.dtype)
 
-        # convert to z0: z = S x  (row form)
+        # S used for x<->z
         S = self.S.to(device=u_bt.device, dtype=u_bt.dtype)
-        z0 = x0 @ S.T  # (B,dx)
 
         if mode != "scan":
-            # LOOP in row convention:
-            At, Bt, Ct, Dt = A_z.T, B_z.T, C_z.T, D_z.T
+            # Row convention:
+            #   z = x @ S^T
+            #   z_{t+1} = z_t @ A_z^T + u_t @ B_z^T
+            #   y_t = z_t @ C_z^T + u_t @ D_z^T
+            #
+            # Convert to x-dynamics:
+            #   x_{t+1} = x_t @ (S^T A_z^T (S^T)^{-1}) + u_t @ (B_z^T (S^T)^{-1})
+            #   y_t     = x_t @ (S^T C_z^T) + u_t @ D_z^T
+            I = torch.eye(dx, device=u_bt.device, dtype=u_bt.dtype)
+            ST_inv = torch.linalg.solve(S.T, I)  # (S^T)^{-1}
 
-            y_seq = u_bt.new_empty(B_sz, L, self.d_output)   # y_0..y_T
-            z_seq = u_bt.new_empty(B_sz, L + 1, dx)          # z_0..z_{T+1}
+            At = A_z.T
+            Bt = B_z.T
+            Ct = C_z.T
+            Dt = D_z.T
 
-            z = z0
+            A_x = S.T @ At @ ST_inv  # (dx, dx)
+            B_x = Bt @ ST_inv  # (du, dx)
+            C_x = S.T @ Ct  # (dx, dy)
+            D_x = Dt  # (du, dy)
+
+            y_seq = u_bt.new_empty(B_sz, L, self.d_output)
+            x_seq = u_bt.new_empty(B_sz, L + 1, dx) if return_state else None
+
+            x = x0
+            if return_state:
+                x_seq[:, 0, :] = x
+
             for t in range(L):
-                u_t = u_bt[:, t, :]
-                z_seq[:, t, :] = z                           # z_t
-                y_seq[:, t, :] = z @ Ct + u_t @ Dt           # y_t
-                z = z @ At + u_t @ Bt                        # z_{t+1}
+                u_t = u_bt[:, t, :]  # (B,du)
+                y_seq[:, t, :] = x @ C_x + u_t @ D_x
+                x = x @ A_x + u_t @ B_x
+                if return_state:
+                    x_seq[:, t + 1, :] = x
 
-            z_seq[:, L, :] = z                               # z_{T+1}
-            z_last = z
+            x_last = x
 
         else:
-            # SCAN expects time-major inputs (L,B,du)
+            # ==========================================================
+            # SCAN (keep exactly as before, in z-basis)
+            # ==========================================================
+            z0 = x0 @ S.T  # (B,dx)
+
+            # scan expects time-major (L,B,du)
             u_tb = u_bt.transpose(0, 1).contiguous()  # (L,B,du)
 
-            # states is (L+1,B,dx): z_0..z_{T+1}
+            # states: (L+1,B,dx) = z_0..z_{T+1}
             states = compute_linear_recurrence_parallel_block2x2(A_z, B_z, u_tb, z0)
 
-            # batch-first sequence of states
-            z_seq = states.transpose(0, 1).contiguous()      # (B,L+1,dx)
-            z_last = z_seq[:, -1, :]                         # (B,dx) = z_{T+1}
+            # batch-first
+            z_seq = states.transpose(0, 1).contiguous()  # (B,L+1,dx)
+            z_last = z_seq[:, -1, :]  # (B,dx)
 
             # outputs use z_t for t=0..T (exclude last state)
             y_seq = z_seq[:, :-1, :] @ C_z.T + u_bt @ D_z.T  # (B,L,dy)
 
-        # Convert full z_seq -> x_seq using solve: (S^T) x^T = z^T
-        # z_seq: (B,L+1,dx)
-        z_flat_T = z_seq.reshape(B_sz * (L + 1), dx).T       # (dx, B*(L+1))
-        x_flat = torch.linalg.solve(S.T, z_flat_T).T         # (B*(L+1), dx)
-        x_seq = x_flat.reshape(B_sz, L + 1, dx)              # (B,L+1,dx)
-        x_last = x_seq[:, -1, :]                             # (B,dx) = x_{T+1}
+            # Convert states to x-basis only if needed
+            if return_state:
+                z_flat_T = z_seq.reshape(B_sz * (L + 1), dx).T
+                x_flat = torch.linalg.solve(S.T, z_flat_T).T
+                x_seq = x_flat.reshape(B_sz, L + 1, dx)
+                x_last = x_seq[:, -1, :]
+            else:
+                x_seq = None
+                x_last = torch.linalg.solve(S.T, z_last.T).T  # (B,dx)
 
-        # restore time_first if requested
+        # ---- restore time_first ----
         if time_first:
-            y_seq = y_seq.transpose(0, 1).contiguous()       # (L,B,dy)
-            x_seq = x_seq.transpose(0, 1).contiguous()       # (L+1,B,dx)
+            y_seq = y_seq.transpose(0, 1).contiguous()  # (L,B,dy)
+            if return_state:
+                x_seq = x_seq.transpose(0, 1).contiguous()  # (L+1,B,dx)
 
+        # ---- returns ----
         if return_state and return_last:
             return y_seq, x_seq, x_last
         if return_state:
@@ -1316,7 +1350,6 @@ class Block2x2DenseL2SSM(nn.Module):
         if return_last:
             return y_seq, x_last
         return y_seq
-
 
 """ SSM models ----------------------------------------- """
 
@@ -1330,8 +1363,8 @@ class SSMConfig:
     n_layers: int = 2  # number of SSMs blocks in cascade for deep structures
     dropout: float = 0.0  # set it different from 0 if you want to introduce dropout regularization
     bias: bool = False  # bias of MLP static_layers
-    rmin: float = 0.0  # min. magnitude of the eigenvalues at initialization in the complex parametrization
-    rmax: float = 1.0  # max. magnitude of the eigenvalues at initialization in the complex parametrization
+    rmin: float = .8  # min. magnitude of the eigenvalues at initialization in the complex parametrization
+    rmax: float = .95  # max. magnitude of the eigenvalues at initialization in the complex parametrization
     max_phase: float = 2 * math.pi  # maximum phase of the eigenvalues at initialization in the complex parametrization
     ff: str = "MLP"  # non-linear static block used in the scaffolding
     scale: float = 1  # Lipschitz constant of the Lipschitz bounded MLP (LMLP)
@@ -1463,8 +1496,8 @@ class DeepSSM(nn.Module):
         n_layers: int = 2,
         dropout: float = 0.0,
         bias: bool = False,
-        rmin: float = 0.0,
-        rmax: float = 1.0,
+        rmin: float = .8,
+        rmax: float = .95,
         max_phase: float = 2 * math.pi,
         ff: str = "LGLU",
         scale: float = 1,
@@ -1573,11 +1606,159 @@ class PureLRUR(nn.Module):
         super().__init__()
         if param == "l2ru":
             self.lru = L2RU(state_features=n, gamma=gamma, init=init)
-        elif param == "zak":
-            self.lru = lruz(input_features=n, output_features=n, state_features=n, gamma=gamma)
+        elif param == "lru":
+            self.lru = LRU(in_features=n, out_features=n, state_features=n)
         else:
             raise ValueError("Unsupported param")
 
     def forward(self, x: torch.Tensor, state: Optional[torch.Tensor] = None, mode: str = "scan"):
         y, st = self.lru(_normalize_to_3d(x), state=state, mode=mode)
         return y, st
+
+
+
+
+class SimpleRNN(nn.Module):
+    """
+    Thin wrapper around nn.RNN that first normalizes the input to 3D
+    using the same convention as DeepSSM.
+
+    Input:
+      u: (T, d_input) or (B, T, d_input)
+
+    State:
+      state (h0): (d_hidden,) or (B, d_hidden) or (1, B, d_hidden)
+
+    Returns (batch-first):
+      y: (B, T, d_output)
+      h_seq (optional): (B, T+1, d_hidden) = [h0, h1, ..., hT]
+      h_last (optional): (B, d_hidden)     = hT
+    """
+
+    def __init__(
+        self,
+        d_input: int,
+        d_hidden: int,
+        d_output: int,
+        *,
+        num_layers: int = 1,
+        nonlinearity: str = "tanh",  # "tanh" or "relu"
+        bias: bool = True,
+        dropout: float = 0.0,        # only applied if num_layers > 1 (PyTorch behavior)
+        bidirectional: bool = False, # for simplicity, we keep return shapes as-is
+    ):
+        super().__init__()
+        self.d_input = int(d_input)
+        self.d_hidden = int(d_hidden)
+        self.d_output = int(d_output)
+        self.num_layers = int(num_layers)
+        self.bidirectional = bool(bidirectional)
+        self.num_directions = 2 if self.bidirectional else 1
+
+        self.rnn = nn.RNN(
+            input_size=self.d_input,
+            hidden_size=self.d_hidden,
+            num_layers=self.num_layers,
+            nonlinearity=nonlinearity,
+            bias=bias,
+            batch_first=True,
+            dropout=dropout,
+            bidirectional=self.bidirectional,
+        )
+
+        # Project RNN outputs to d_output
+        self.out_proj = nn.Linear(self.d_hidden * self.num_directions, self.d_output, bias=bias)
+
+    def _format_h0(self, h0: Optional[torch.Tensor], B: int, device, dtype) -> torch.Tensor:
+        """
+        nn.RNN expects h0: (num_layers * num_directions, B, d_hidden)
+        Accept:
+          - None
+          - (d_hidden,)
+          - (B, d_hidden)
+          - (1, B, d_hidden)  [for convenience if user already has RNN shape]
+          - (L, B, d_hidden)  [full shape]
+        """
+        L = self.num_layers * self.num_directions
+
+        if h0 is None:
+            return torch.zeros(L, B, self.d_hidden, device=device, dtype=dtype)
+
+        if h0.dim() == 1:
+            h0 = h0.unsqueeze(0).unsqueeze(0)  # (1,1,H)
+        elif h0.dim() == 2:
+            h0 = h0.unsqueeze(0)               # (1,B,H)
+        elif h0.dim() == 3:
+            pass
+        else:
+            raise ValueError(f"h0 must have dim 1,2,3; got shape {tuple(h0.shape)}")
+
+        # Broadcast batch if needed
+        if h0.size(1) == 1 and B > 1:
+            h0 = h0.expand(h0.size(0), B, h0.size(2))
+
+        # Broadcast layers if needed
+        if h0.size(0) == 1 and L > 1:
+            h0 = h0.expand(L, h0.size(1), h0.size(2))
+
+        if h0.shape != (L, B, self.d_hidden):
+            raise ValueError(f"h0 has shape {tuple(h0.shape)}, expected {(L, B, self.d_hidden)}")
+
+        return h0.to(device=device, dtype=dtype)
+
+    def forward(
+        self,
+        u: torch.Tensor,
+        state: Optional[torch.Tensor] = None,  # h0
+        *,
+        return_state: bool = False,
+        return_last: bool = False,
+    ) -> Union[
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        Tuple[torch.Tensor, torch.Tensor],
+        Tuple[torch.Tensor, torch.Tensor],
+        Tuple[torch.Tensor],
+    ]:
+        u3d = _normalize_to_3d(u)  # (B,T,D)
+        B, T, D = u3d.shape
+        if D != self.d_input:
+            raise ValueError(f"Expected input dim {self.d_input}, got {D}")
+
+        h0 = self._format_h0(state, B, u3d.device, u3d.dtype)
+
+        # Run RNN
+        out, hT = self.rnn(u3d, h0)  # out: (B,T,H*num_dir), hT: (L,B,H)
+
+        # Project to output dim
+        y = self.out_proj(out)       # (B,T,d_output)
+
+        # Build full hidden trajectory if requested: [h0, h1, ..., hT]
+        # nn.RNN doesn't return all hidden states per step directly,
+        # but `out` *is* the last-layer hidden state at each time.
+        # For multi-layer RNNs, this corresponds to the top layer only.
+        a = 0
+        h_seq = None
+        if return_state:
+            # top-layer h_t sequence is out; prepend the top-layer initial state
+            top_layer_idx = self.num_directions * (self.num_layers - 1)
+            h0_top = h0[top_layer_idx: top_layer_idx + self.num_directions]  # (num_dir,B,H)
+            # If bidirectional, top "initial" is two directions; we pack them consistently
+            # by taking the forward direction state as "the" h0 for the sequence.
+            h0_seq = h0_top[0].transpose(0, 0)  # (B,H) no-op, explicit
+            h_seq = torch.empty(B, T + 1, out.size(-1), device=u3d.device, dtype=u3d.dtype)
+            h_seq[:, 0, :] = torch.cat([h0_top[d] for d in range(self.num_directions)], dim=-1) if self.num_directions > 1 else h0_top[0]
+            h_seq[:, 1:, :] = out
+
+        # last hidden (top layer)
+        h_last = None
+        if return_last:
+            top_layer = hT[-self.num_directions:]  # (num_dir,B,H)
+            h_last = torch.cat([top_layer[d] for d in range(self.num_directions)], dim=-1) if self.num_directions > 1 else top_layer[0]
+
+        if return_state and return_last:
+            return y, h_seq, h_last
+        if return_state:
+            return y, h_seq
+        if return_last:
+            return y, h_last
+        return y, a

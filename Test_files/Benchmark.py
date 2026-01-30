@@ -14,7 +14,7 @@ import nonlinear_benchmarks
 from nonlinear_benchmarks.error_metrics import RMSE, NRMSE, R_squared, MAE, fit_index
 #from SSM.utility import SimpleLSTM
 #from neural_ssm import DeepSSM, SSMConfig
-from src.neural_ssm.ssm.lru import DeepSSM, SSMConfig
+from src.neural_ssm.ssm.lru import DeepSSM, SSMConfig, SimpleRNN
 
 
 
@@ -593,7 +593,7 @@ def main():
     # Load data
     print("Loading data...")
 
-    train_val, test = nonlinear_benchmarks.Cascaded_Tanks()
+    train_val, test = nonlinear_benchmarks.WienerHammerBenchMark()
     print(test.state_initialization_window_length)  # = 50
     u_train, y_train = train_val
     u_val, y_val = test
@@ -604,8 +604,11 @@ def main():
     y_train = torch.tensor(y_train, dtype=torch.float32).unsqueeze(-1)
     u_val = torch.tensor(u_val, dtype=torch.float32).unsqueeze(-1)
     y_val = torch.tensor(y_val, dtype=torch.float32).unsqueeze(-1)
-
-
+    #
+    # u_train = _normalize_to_3d(u_train)
+    # u_val = _normalize_to_3d(u_val)
+    # y_val = _normalize_to_3d(y_val)
+    # y_train = _normalize_to_3d(y_train)
 
     # # data normalization
     # mu_u = u_train.mean(dim=0)  # over all time + trajectories
@@ -622,17 +625,17 @@ def main():
 
 
     # Initialize configurations
-    model_config = ModelConfig(n_u=u_train.shape[1], n_y=y_train.shape[1], param='lru', d_model=8, d_state=8,
-                               gamma=.2, ff='LGLU', init='eye',
+    model_config = ModelConfig(n_u=u_train.shape[1], n_y=y_train.shape[1], param='l2n', d_model=8, d_state=8,
+                               gamma=7, ff='LGLU', init='eye',
                                n_layers=3, d_amp=3, rho=0.9, phase_center=0.0, max_phase_b=0.04, d_hidden=12, nl_layers=3)
-    train_config = TrainingConfig(num_epochs=2000, learning_rate=1e-2)
+    train_config = TrainingConfig(num_epochs=600, learning_rate=1e-2)
 
     # Build model
     print("Building model...")
     ssm_config = model_config.to_ssm_config()
     model = DeepSSM(d_input=model_config.n_u, d_output=model_config.n_y, config=ssm_config)
 
-
+    #model = SimpleRNN(d_input=1, d_hidden=20, num_layers=1, d_output= 1, nonlinearity='tanh')
 
 
     # Try RNN
@@ -664,7 +667,7 @@ def main():
     y_val_pred = trainer.predict(u_val)
     n = test.state_initialization_window_length
 
-    RMSE_result = RMSE(test.y[n:], y_val_pred[n:].cpu().detach().numpy())  # skip the first n
+    RMSE_result = 1000*RMSE(test.y[n:], y_val_pred[n:].cpu().detach().numpy())  # skip the first n
     print(RMSE_result)  # report this number
 
     # Visualize results
