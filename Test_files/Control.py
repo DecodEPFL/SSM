@@ -663,7 +663,7 @@ def main():
           + (f" | w_peak≈{w_peak:.4f} rad/sample" if w_peak is not None else ""))
 
     # ---- Controller (your DeepSSM) ----
-    ssm=DeepSSM(d_input=plant_cfg.n_y, d_output=plant_cfg.n_u, param='l2n', gamma=1/(gamma+0.001), ff='LGLU', n_layers=2, d_model=10, d_state=10).to(device)
+    ssm=DeepSSM(d_input=plant_cfg.n_y, d_output=plant_cfg.n_u, param='tv', gamma=1/(gamma+0.001), ff='LGLU', n_layers=2, d_model=10, d_state=10).to(device)
     controller = ControllerWrapper(ssm).to(device)
 
     # ---- Objective ----

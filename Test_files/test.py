@@ -2,8 +2,9 @@ import numpy as np
 import torch
 import time
 from l2cell import L2BoundedLTICell
-from src.neural_ssm.ssm.lru import DeepSSM, SSMConfig
+from src.neural_ssm.ssm.lru import DeepSSM, SSMConfig, PureLRUR
 from l2cellblocks import Block2x2DenseL2SSM
+import matplotlib.pyplot as plt
 
 d_state=4
 d_input=23
@@ -11,7 +12,70 @@ torch.manual_seed(32)
 cell = Block2x2DenseL2SSM(d_state=d_state, d_input=d_input, d_output=d_input, gamma=1)
 
 
-ssm = DeepSSM(d_input=3, d_output=3, d_model=6, d_state=8,n_layers=2, ff='GLU')
+lru = PureLRUR(n=2, param='l2ru', gamma=.2)
+
+u1 = 5*torch.rand(5,180,2)+torch.tensor(5.)
+u2 = 5*torch.ones(5,180,2)+torch.tensor(3.)
+
+#u = torch.cat((u1,  u2), 1)
+
+#a,b = lru(u)
+
+u=torch.randn(1,100,1)
+
+
+
+ssm = DeepSSM(d_input=1, d_output=1, d_model=8, d_state=8, n_layers=7, ff='GLU', param='tv', gamma=None, nl_layers=5)
+
+a,b = ssm(u = u, state = None)
+
+a=a.detach().cpu().numpy()
+
+x = None
+yy=[]
+for t in range(100):
+    y, x = ssm(u = u[0,t:t+1,:], state = x)
+    yy.append(y)
+
+yy=torch.cat(yy, dim=1)
+yy = yy.detach().cpu().numpy()
+
+plt.figure()
+plt.plot(a[0,:,0], label = "run")
+plt.plot(yy[0,:,0], label = "iteration")
+plt.grid()
+plt.legend()
+plt.show()
+
+
+
+a0, b0 = ssm(u=u[:,:1,:], state = None, mode = 'loop')
+a1, b1 = ssm(u=u[:, 1:2, :], state = b0, mode = 'loop')
+a2, b2 = ssm(u=u[:,2:3,:], state = b1, mode = 'loop')
+a3, b3 = ssm(u=u[:,3:4,:], state = b2, mode = 'loop')
+
+
+
+ud= torch.zeros_like(u)
+ud[:,0,:] = u[:,0,:]
+
+for k in range(u.size(1)-1):
+    ud[:,k+1,:] = torch.abs(u[:,k+1,:]-u[:,k,:])
+
+yd= torch.zeros_like(a)
+yd[:,0,:] = a[:,0,:]
+
+for k in range(a.size(1)-1):
+    yd[:,k+1,:] = torch.abs(a[:,k+1,:]-a[:,k,:])
+
+plt.plot(yd[2,:,0].detach().numpy())
+plt.show()
+
+plt.plot(a[2,:,0].detach().numpy())
+plt.show()
+
+
+ssm = DeepSSM(d_input=3, d_output=3, d_model=6, d_state=8, n_layers=2, ff='GLU', param='tv', gamma=1)
 
 a,b=ssm(u = torch.randn((3,1,3)), state = None)
 
