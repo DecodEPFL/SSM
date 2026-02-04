@@ -50,7 +50,7 @@ Main message: `l2n` and `tv`, when used with a Lipschitz-bounded nonlinearity su
 
 All these parametrizations support both forward execution modes:
 
-- parallel scan via `mode="scan"`
+- parallel scan via `mode="scan"` (tipically very fast for long sequences)
 - standard recurrence loop via `mode="loop"`
 
 You select the mode at call time, e.g. `model(u, mode="scan")` or `model(u, mode="loop")`.
