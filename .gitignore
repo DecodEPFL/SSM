@@ -1,0 +1,4 @@
+# Packaging artifacts
+dist/
+build/
+*.egg-info/
