@@ -4,7 +4,7 @@ Tutorial: train DeepSSM on a nonlinear benchmark dataset.
 This tutorial is intentionally simple and uses only the core DeepSSM API.
 What we do:
 1) load a nonlinear benchmark dataset
-2) build DeepSSM directly from constructor arguments
+2) build DeepSSM
 3) train with a small, standard PyTorch loop
 4) evaluate with full-sequence and chunked stateful inference
 
@@ -14,7 +14,6 @@ The goal is to make each step easy to read and reuse in your own scripts.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 
 import matplotlib.pyplot as plt
 import nonlinear_benchmarks
@@ -53,9 +52,8 @@ class TutorialConfig:
     train_mode: str = "scan"  # "scan" or "loop"
     eval_mode: str = "scan"
 
-    # Optional plotting
-    save_plot: bool = True
-    out_dir: Path = Path(__file__).resolve().parent / "checkpoints" / "tutorial"
+    # Plotting
+    show_plots: bool = True
 
     # Optional stateful inference demo
     stream_chunk_len: int = 200
@@ -143,7 +141,7 @@ def main() -> None:
     # This is the direct API. We do not use SSMConfig here on purpose.
     # DeepSSM returns (y, state):
     # - y: output sequence, shape (B, L, d_output)
-    # - state: list of last states (one per SSL block)
+    # - state: list of states (one per SSL block)
     model = DeepSSM(
         d_input=u_train.size(-1),
         d_output=y_train.size(-1),
@@ -180,7 +178,7 @@ def main() -> None:
         optimizer.zero_grad()
 
         # Forward pass with selected execution mode ("scan" or "loop").
-        # We do not pass a state here -> zero initialization at each call.
+        # We do not pass a state here -> zero initialization at each call since we feed the whole input sequence at once.
         y_train_pred, _ = model(u_train, mode=cfg.train_mode)
         train_loss = criterion(y_train_pred, y_train)
         train_loss.backward()
@@ -226,27 +224,37 @@ def main() -> None:
     print(f"Max |full - streaming| difference: {max_diff:.6e}")
 
     # ------------------------------------------------------------------
-    # 5) Optional plot
+    # 5) Plot results at the end
     # ------------------------------------------------------------------
-    if cfg.save_plot:
-        cfg.out_dir.mkdir(parents=True, exist_ok=True)
-        fig_path = cfg.out_dir / "tutorial_prediction.png"
-
+    if cfg.show_plots:
         y_true_np = y_test[0, :, 0].detach().cpu().numpy()
         y_pred_np = y_full[0, :, 0].detach().cpu().numpy()
 
-        plt.figure(figsize=(8, 3))
-        plt.plot(y_true_np, label="True", linewidth=1.2)
-        plt.plot(y_pred_np, label="DeepSSM", linewidth=1.2, linestyle="--")
-        plt.axvline(n_init, color="gray", linestyle=":", linewidth=1, label="Warm-up end")
-        plt.xlabel("Time step")
-        plt.ylabel("Output")
-        plt.title("DeepSSM Tutorial - Wiener Hammerstein benchmark")
-        plt.legend()
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(9, 6))
+
+        # Prediction plot
+        ax1.plot(y_true_np, label="True", linewidth=1.2)
+        ax1.plot(y_pred_np, label="DeepSSM", linewidth=1.2, linestyle="--")
+        ax1.axvline(n_init, color="gray", linestyle=":", linewidth=1, label="Warm-up end")
+        ax1.set_xlabel("Time step")
+        ax1.set_ylabel("Output")
+        ax1.set_title("DeepSSM Tutorial - Prediction")
+        ax1.legend()
+        ax1.grid(alpha=0.25)
+
+        # Log-loss plot
+        epochs = np.arange(1, len(train_losses) + 1)
+        ax2.plot(epochs, train_losses, label="Train loss", linewidth=1.2)
+        ax2.plot(epochs, test_losses, label="Test loss", linewidth=1.2)
+        ax2.set_yscale("log")
+        ax2.set_xlabel("Epoch")
+        ax2.set_ylabel("MSE loss (log scale)")
+        ax2.set_title("Training curves")
+        ax2.legend()
+        ax2.grid(alpha=0.25)
+
         plt.tight_layout()
-        plt.savefig(fig_path, dpi=180)
-        plt.close()
-        print(f"Saved plot to: {fig_path}")
+        plt.show()
 
 
 if __name__ == "__main__":
