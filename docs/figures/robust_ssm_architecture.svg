@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="560" viewBox="0 0 1280 560">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#334155"/>
+    </marker>
+    <style>
+      .title { font: 700 28px Arial, sans-serif; fill: #0f172a; }
+      .label { font: 600 18px Arial, sans-serif; fill: #0f172a; }
+      .small { font: 500 16px Arial, sans-serif; fill: #334155; }
+      .box { fill: #ffffff; stroke: #334155; stroke-width: 2; rx: 12; ry: 12; }
+      .core { fill: #f8fafc; stroke: #1e293b; stroke-width: 2; rx: 12; ry: 12; }
+      .accent { fill: #eef2ff; stroke: #3730a3; stroke-width: 2; rx: 12; ry: 12; }
+      .guide { stroke: #334155; stroke-width: 2; fill: none; marker-end: url(#arrow); }
+      .dashed { stroke-dasharray: 8 6; }
+    </style>
+  </defs>
+
+  <rect x="0" y="0" width="1280" height="560" fill="#f8fafc"/>
+  <text x="36" y="46" class="title">Robust Deep SSM: Components and Data Flow</text>
+
+  <rect class="box" x="40" y="210" width="130" height="80"/>
+  <text x="75" y="258" class="label">Input u</text>
+
+  <rect class="box" x="220" y="200" width="160" height="100"/>
+  <text x="268" y="247" class="label">Encoder</text>
+  <text x="242" y="275" class="small">Linear projection</text>
+
+  <rect class="accent" x="430" y="95" width="590" height="320"/>
+  <text x="620" y="130" class="label">SSM Blocks (repeated n_layers)</text>
+
+  <rect class="core" x="470" y="165" width="230" height="100"/>
+  <text x="540" y="207" class="label">Dynamic Core</text>
+  <text x="500" y="235" class="small">param = lru | l2n | tv</text>
+
+  <rect class="core" x="750" y="165" width="230" height="100"/>
+  <text x="780" y="207" class="label">Static Nonlinearity</text>
+  <text x="776" y="235" class="small">ff = LGLU / LMLP / ...</text>
+
+  <rect class="box" x="470" y="295" width="510" height="90"/>
+  <text x="660" y="345" class="label">Residual: x + FF(SSM(x))</text>
+
+  <rect class="box dashed" x="500" y="430" width="450" height="95"/>
+  <text x="615" y="465" class="label">Optional Certified Scaling</text>
+  <text x="533" y="492" class="small">Uses gamma and block gains for l2n/tv</text>
+
+  <rect class="box" x="1060" y="200" width="160" height="100"/>
+  <text x="1111" y="247" class="label">Decoder</text>
+  <text x="1084" y="275" class="small">Linear projection</text>
+
+  <rect class="box" x="1060" y="355" width="160" height="80"/>
+  <text x="1110" y="402" class="label">Output y</text>
+
+  <path class="guide" d="M 170 250 L 220 250"/>
+  <path class="guide" d="M 380 250 L 470 250"/>
+  <path class="guide" d="M 700 215 L 750 215"/>
+  <path class="guide" d="M 980 250 L 1060 250"/>
+  <path class="guide" d="M 1140 300 L 1140 355"/>
+  <path class="guide" d="M 865 430 L 865 385"/>
+  <path class="guide" d="M 865 295 L 865 265"/>
+  <path class="guide" d="M 585 265 L 585 295"/>
+  <path class="guide" d="M 340 250 L 340 345 L 470 345"/>
+  <path class="guide" d="M 980 345 L 1060 345"/>
+</svg>

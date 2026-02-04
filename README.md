@@ -1,199 +1,135 @@
 # neural-ssm
 
-PyTorch implementations of neural state-space models (SSMs), including LRU-based and L2-bounded variants for stable system modeling and system identification.
+PyTorch implementations of robust neural state-space models (SSMs), centered on:
 
-This repo focuses on:
-- fast sequence processing via parallel scan
-- controllable/stable recurrent parametrizations
-- practical training scripts for benchmark datasets
+- free parametrizations of L2-bounded linear dynamical systems
+- Lipschitz-bounded static nonlinearities for robust deep SSM design
 
----
+The mathematical details are in:
 
-## Highlights
-
-- Multiple recurrent SSM blocks under one API (`DeepSSM`)
-- L2-bounded variants with gain control (`gamma`) and certificate-oriented scaling
-- Loop and scan execution modes (`mode="loop"` or `mode="scan"`)
-- Optional Lipschitz feedforward layers (`LMLP`, `LGLU`, `TLIP`)
-- End-to-end benchmark training script with Optuna hyperparameter search
-
----
+- **Free Parametrization of L2-bounded State Space Models**  
+  https://arxiv.org/abs/2503.23818
 
 ## Installation
 
-### 1) Clone the repository
+Install from pip:
 
 ```bash
-git clone https://github.com/LeoMassai/neural-ssm.git
-cd neural-ssm
+pip install neural-ssm
 ```
 
-### 2) Create and activate an environment (recommended)
+Install the latest GitHub version:
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate  # macOS/Linux
+pip install git+https://github.com/LeoMassai/neural-ssm.git
 ```
 
-### 3) Install the package
+## Architecture and robustness recipe
 
-```bash
-pip install -e .
-```
+![Robust Deep SSM architecture](docs/figures/robust_ssm_architecture.svg)
 
-Optional development dependencies:
+Reading the figure from left to right:
 
-```bash
-pip install -e ".[dev]"
-```
+1. Input is projected by an encoder.
+2. A stack of SSL blocks is applied.
+3. Each block combines:
+   - a dynamic core (`lru`, `l2n`, or `tv`)
+   - a static nonlinearity (`LGLU`, `LMLP`, `GLU`, ...)
+   - a residual connection.
+4. Output is projected by a decoder.
+5. For `l2n`/`tv`, optional certified scaling with `gamma` is used to preserve prescribed L2 robustness behavior.
 
-Optional example dependencies:
+Main message: `l2n` and `tv`, when used with a Lipschitz-bounded nonlinearity such as `LGLU`, enable robust deep SSMs with prescribed L2 bound.
 
-```bash
-pip install -e ".[examples]"
-```
+## Main parametrizations
 
-For benchmark and control scripts in `Test_files`, you may also need:
+- `lru`: inspired by "Resurrecting Linear Recurrences"; efficient and stable linear recurrent backbone.
+- `l2n`: SSM with prescribed L2 bound via free parametrization.
+- `tv`: time-varying selective SSM with prescribed L2 bound (paper in preparation).
 
-```bash
-pip install scipy optuna nonlinear-benchmarks control
-```
+All these parametrizations support both forward execution modes:
 
----
+- parallel scan via `mode="scan"`
+- standard recurrence loop via `mode="loop"`
 
-## Quick Start
+You select the mode at call time, e.g. `model(u, mode="scan")` or `model(u, mode="loop")`.
+
+## Where each component is in the code
+
+- End-to-end wrapper (encoder, stack, decoder):  
+  `DeepSSM` in `src/neural_ssm/ssm/lru.py`
+- Repeated SSM block (dynamic core + nonlinearity + residual):  
+  `SSL` in `src/neural_ssm/ssm/lru.py`
+- Dynamic cores:
+  - `lru` -> `LRU` in `src/neural_ssm/ssm/lru.py`
+  - `l2n` -> `Block2x2DenseL2SSM` in `src/neural_ssm/ssm/lru.py`
+  - `tv` -> `RobustMambaDiagSSM` in `src/neural_ssm/ssm/mamba.py`
+- Static nonlinearities:
+  - `GLU`, `MLP` in `src/neural_ssm/static_layers/generic_layers.py`
+  - `LGLU`, `LMLP`, `TLIP` in `src/neural_ssm/static_layers/lipschitz_mlps.py`
+- Parallel scan utilities:  
+  `src/neural_ssm/ssm/scan_utils.py`
+
+## Quick tutorial
+
+### A) Create a model using `SSMConfig`
 
 ```python
 import torch
 from neural_ssm import DeepSSM, SSMConfig
 
 cfg = SSMConfig(
-    d_model=8,
-    d_state=8,
-    n_layers=3,
-    ff="LGLU",      # GLU | MLP | LMLP | LGLU | TLIP
-    param="l2n",    # lru | l2ru | zak | l2n | l2nt | tv
+    d_model=16,
+    d_state=16,
+    n_layers=4,
+    param="l2n",      # lru | l2n | tv | ...
+    ff="LGLU",        # GLU | MLP | LMLP | LGLU | TLIP
     gamma=2.0,
-    train_gamma=True,
+    train_gamma=False,
 )
 
 model = DeepSSM(d_input=1, d_output=1, config=cfg)
-
-u = torch.randn(16, 300, 1)            # (batch, time, input_dim)
-y, state = model(u, mode="scan")       # or mode="loop"
-print(y.shape)                          # (16, 300, 1)
+u = torch.randn(8, 200, 1)               # (batch, time, input_dim)
+y, state = model(u, mode="scan")         # or mode="loop"
 ```
 
----
+### B) Create a model with direct constructor arguments
 
-## Core API
+```python
+import torch
+from neural_ssm import DeepSSM
 
-Main classes live in `src/neural_ssm/ssm/lru.py` and are re-exported at package level:
+model = DeepSSM(
+    d_input=1,
+    d_output=1,
+    d_model=16,
+    d_state=16,
+    n_layers=4,
+    param="tv",
+    ff="LGLU",
+    gamma=2.0,
+    train_gamma=False,
+)
 
-- `DeepSSM`: encoder -> stacked SSM blocks -> decoder
-- `SSMConfig`: dataclass for architecture and parametrization settings
-- `LRU`: complex diagonal LRU with scan/loop simulation
-- `L2RU`: L2-stable LRU-style block
-- `lruz`: alternative LRU parametrization
-- `PureLRUR`: recurrent-only wrapper block
-- `SimpleRNN`: baseline recurrent model
-
-Feedforward/static layers:
-
-- `GLU`, `MLP` in `src/neural_ssm/static_layers/generic_layers.py`
-- `LMLP`, `L2BoundedGLU`, `TLIP` in `src/neural_ssm/static_layers/lipschitz_mlps.py`
-
-Additional modules:
-
-- `REN` model in `src/neural_ssm/rens/ren.py`
-- experimental/time-varying SSM variants in `src/neural_ssm/ssm/experimental.py`
-
----
-
-## Benchmark Training
-
-The main benchmark script is:
-
-```bash
-python Test_files/Benchmark.py
+u = torch.randn(8, 200, 1)
+y, state = model(u, mode="scan")
 ```
 
-What it does:
-- loads the Wiener-Hammerstein benchmark from `nonlinear_benchmarks`
-- trains a `DeepSSM` model
-- computes validation RMSE
-- saves checkpoints and plots in `checkpoints/`
+## Top-level API
 
-### Hyperparameter optimization (Optuna)
+- `DeepSSM`, `SSMConfig`
+- `LRU`, `L2RU`, `lruz`, `PureLRUR`, `SimpleRNN`
+- static layers re-exported in `neural_ssm.layers`
 
-`Test_files/Benchmark.py` includes an Optuna study that tunes:
-- number of SSM layers (`n_layers`)
-- learning rate
-- gain parameter (`gamma`)
+## Examples
 
-Best parameters are written to:
-
-- `checkpoints/optuna_best_params.json`
-
-You can adjust search settings in the script via `HyperOptConfig`.
-
----
-
-## Project Structure
-
-```text
-src/neural_ssm/
-  __init__.py
-  ssm/
-    lru.py
-    scan_utils.py
-    mamba.py
-    experimental.py
-  static_layers/
-    generic_layers.py
-    lipschitz_mlps.py
-  rens/
-    ren.py
-
-Test_files/
-  Benchmark.py
-  Example.py
-  Control_Example.py
-  ...
-```
-
----
-
-## Development
-
-Run style/type/test tooling (if installed via `.[dev]`):
-
-```bash
-ruff check .
-black .
-mypy src
-pytest
-```
-
----
+Example and experiment scripts are available in `Test_files/`.
 
 ## Citation
 
-If you use this code in research, please cite:
+If you use this repository in research, please cite:
 
 **Free Parametrization of L2-bounded State Space Models**  
 https://arxiv.org/abs/2503.23818
-
----
-
-## Notes
-
-- This is an active research codebase; APIs and scripts may evolve.
-- Some scripts in `Test_files/` are exploratory and may require extra dependencies/datasets.
-- If your local scripts import via `src.neural_ssm...`, that works from repository root.  
-  For installed-package usage, prefer `import neural_ssm`.
-
-
-
 
 
