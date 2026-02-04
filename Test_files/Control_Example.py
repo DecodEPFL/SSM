@@ -4,6 +4,7 @@ from typing import Callable, Optional, Tuple, Dict, Any
 import math
 import copy
 import time
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -118,7 +119,7 @@ class MBTrainer:
         val_criterion: Optional[Callable[..., torch.Tensor]] = None,
         scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
         grad_clip: Optional[float] = None,
-        checkpoint_dir: Optional[str] = "./checkpoints",
+        checkpoint_dir: Optional[str] = None,
     ):
         self.dynamics = dynamics.to(device) if device is not None else dynamics
         self.controller = controller.to(device) if device is not None else controller
@@ -128,7 +129,8 @@ class MBTrainer:
         self.opt = controller_optimizer
         self.scheduler = scheduler
         self.grad_clip = grad_clip
-        self.ckpt_dir = checkpoint_dir
+        default_ckpt_dir = Path(__file__).resolve().parent / "checkpoints"
+        self.ckpt_dir = str(default_ckpt_dir if checkpoint_dir is None else checkpoint_dir)
         os.makedirs(self.ckpt_dir, exist_ok=True)
 
     def train(
@@ -346,7 +348,7 @@ def demo():
         val_criterion=criterion_wrapper,
         scheduler=scheduler,
         grad_clip=1.0,
-        checkpoint_dir="../checkpoints_demo",
+        checkpoint_dir=str(Path(__file__).resolve().parent / "checkpoints_demo"),
     )
 
     results = trainer.train(
