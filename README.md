@@ -1,9 +1,10 @@
 # neural-ssm
 
-PyTorch implementations of robust neural state-space models (SSMs), centered on:
+PyTorch implementations of state-space models (SSMs) with a built-in robustness certificate in the form of a tunable L2-bound. 
+This is obtained by using:
 
 - free parametrizations of L2-bounded linear dynamical systems
-- Lipschitz-bounded static nonlinearities for robust deep SSM design
+- Lipschitz-bounded static nonlinearities
 
 The mathematical details are in:
 
@@ -25,6 +26,7 @@ pip install git+https://github.com/LeoMassai/neural-ssm.git
 ```
 
 ## Architecture and robustness recipe
+Let's see what is an SSM more in detail 
 
 ![L2 DeepSSM architecture](docs/figures/l2_deepssm.svg)
 
@@ -33,7 +35,7 @@ Reading the figure from left to right:
 1. Input is projected by an encoder.
 2. A stack of SSL blocks is applied.
 3. Each block combines:
-   - a dynamic core (`lru`, `l2n`, or `tv`)
+   - a dynamic core with different state-space parametrizations (`lru`, `l2n`, or `tv`)
    - a static nonlinearity (`LGLU`, `LMLP`, `GLU`, ...)
    - a residual connection.
 4. Output is projected by a decoder.
@@ -42,9 +44,9 @@ Main message: `l2n` and `tv`, when used with a Lipschitz-bounded nonlinearity su
 
 ## Main parametrizations
 
-- `lru`: inspired by "Resurrecting Linear Recurrences"; efficient and stable linear recurrent backbone.
-- `l2n`: SSM with prescribed L2 bound via free parametrization.
-- `tv`: time-varying selective SSM with prescribed L2 bound (paper in preparation).
+- `lru`: inspired by "Resurrecting Linear Recurrences"; parametrizes all and only stable LTI systems.
+- `l2n`: free parametrization of all and only LTI systems with a prescribed L2 bound.
+- `tv`: free parametrization of a time-varying selective recurrent unit with prescribed L2 bound (paper in preparation).
 
 All these parametrizations support both forward execution modes:
 
