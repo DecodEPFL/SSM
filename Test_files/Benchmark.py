@@ -6,16 +6,21 @@ from torch.utils.data import Dataset, DataLoader, TensorDataset
 import scipy.io as sio
 from pathlib import Path
 from typing import Dict, Tuple, Optional, Any
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from tqdm import tqdm
 import logging
 import math
 import nonlinear_benchmarks
 from nonlinear_benchmarks.error_metrics import RMSE, NRMSE, R_squared, MAE, fit_index
+import json
 #from SSM.utility import SimpleLSTM
 #from neural_ssm import DeepSSM, SSMConfig
 from src.neural_ssm.ssm.lru import DeepSSM, SSMConfig, SimpleRNN
 
+try:
+    import optuna
+except ImportError:  # pragma: no cover - optional dependency
+    optuna = None
 
 
 
@@ -87,6 +92,26 @@ class ModelConfig:
             phase_center = self.phase_center,
             random_phase=self.random_phase,
         )
+
+
+@dataclass
+class HyperOptConfig:
+    """Configuration for Optuna hyperparameter optimization."""
+    enabled: bool = True
+    n_trials: int = 20
+    num_epochs: int = 250
+    timeout_seconds: Optional[int] = None
+    n_layers_min: int = 1
+    n_layers_max: int = 6
+    lr_min: float = 1e-4
+    lr_max: float = 5e-2
+    gamma_min: float = 0.5
+    gamma_max: float = 20.0
+    d_model_min: int = 4
+    d_model_max: int = 32
+    d_state_min: int = 4
+    d_state_max: int = 32
+    d_state_step: int = 2
 
 
 # ============================================================================
@@ -579,16 +604,109 @@ class Visualizer:
 # Main Training Script
 # ============================================================================
 
-def main():
-    """Main training function."""
-
-    # Set random seeds for reproducibility
-    seed = 9
+def set_random_seed(seed: int) -> None:
+    """Set random seeds for reproducibility."""
     torch.manual_seed(seed)
     np.random.seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
         torch.backends.cudnn.deterministic = True
+
+
+def optimize_hyperparameters(
+        u_train: torch.Tensor,
+        y_train: torch.Tensor,
+        u_val: torch.Tensor,
+        y_val: torch.Tensor,
+        init_window: int,
+        base_model_config: ModelConfig,
+        base_train_config: TrainingConfig,
+        hpo_config: HyperOptConfig,
+) -> Dict[str, Any]:
+    """
+    Tune n_layers, d_model, d_state, learning_rate, and gamma with Optuna.
+
+    Returns:
+        Dictionary with best hyperparameters and objective value.
+    """
+    if optuna is None:
+        raise ImportError("Optuna is not installed. Install it with: pip install optuna")
+
+    def objective(trial: "optuna.Trial") -> float:
+        n_layers = trial.suggest_int("n_layers", hpo_config.n_layers_min, hpo_config.n_layers_max)
+        d_model = trial.suggest_int("d_model", hpo_config.d_model_min, hpo_config.d_model_max)
+        d_state = trial.suggest_int(
+            "d_state",
+            hpo_config.d_state_min,
+            hpo_config.d_state_max,
+            step=hpo_config.d_state_step,
+        )
+        learning_rate = trial.suggest_float(
+            "learning_rate", hpo_config.lr_min, hpo_config.lr_max, log=True
+        )
+        gamma = trial.suggest_float("gamma", hpo_config.gamma_min, hpo_config.gamma_max, log=True)
+
+        if base_model_config.param == "l2n" and d_state % 2 != 0:
+            raise optuna.TrialPruned("d_state must be even when param='l2n'.")
+
+        model_config = replace(
+            base_model_config,
+            n_layers=n_layers,
+            d_model=d_model,
+            d_state=d_state,
+            gamma=gamma,
+        )
+        trial_save_dir = base_train_config.save_dir / "optuna_trials" / f"trial_{trial.number}"
+        train_config = replace(
+            base_train_config,
+            learning_rate=learning_rate,
+            num_epochs=hpo_config.num_epochs,
+            save_best_only=False,
+            save_dir=trial_save_dir,
+        )
+
+        set_random_seed(base_train_config.seed + trial.number)
+
+        model = DeepSSM(
+            d_input=model_config.n_u,
+            d_output=model_config.n_y,
+            config=model_config.to_ssm_config(),
+        )
+        trainer = SystemIDTrainer(model, train_config, criterion=nn.MSELoss())
+        trainer.fit(u_train, y_train, u_val, y_val, use_early_stopping=True)
+
+        y_val_target = y_val.squeeze().cpu().detach().numpy()
+        y_val_pred = trainer.predict(u_val).squeeze().cpu().detach().numpy()
+        val_rmse = 1000 * RMSE(y_val_target[init_window:], y_val_pred[init_window:])
+
+        trial.set_user_attr("best_val_loss", trainer.best_val_loss)
+        return float(val_rmse)
+
+    sampler = optuna.samplers.TPESampler(seed=base_train_config.seed)
+    study = optuna.create_study(direction="minimize", sampler=sampler)
+    study.optimize(
+        objective,
+        n_trials=hpo_config.n_trials,
+        timeout=hpo_config.timeout_seconds,
+    )
+
+    best_params = {
+        "n_layers": int(study.best_params["n_layers"]),
+        "d_model": int(study.best_params["d_model"]),
+        "d_state": int(study.best_params["d_state"]),
+        "learning_rate": float(study.best_params["learning_rate"]),
+        "gamma": float(study.best_params["gamma"]),
+        "objective_rmse_x1000": float(study.best_value),
+    }
+    return best_params
+
+
+def main():
+    """Main training function."""
+
+    # Set random seeds for reproducibility
+    seed = 9
+    set_random_seed(seed)
 
     # Load data
     print("Loading data...")
@@ -625,10 +743,50 @@ def main():
 
 
     # Initialize configurations
-    model_config = ModelConfig(n_u=u_train.shape[1], n_y=y_train.shape[1], param='l2n', d_model=8, d_state=8,
-                               gamma=7, ff='LGLU', init='eye',
-                               n_layers=3, d_amp=3, rho=0.9, phase_center=0.0, max_phase_b=0.04, d_hidden=12, nl_layers=3)
-    train_config = TrainingConfig(num_epochs=600, learning_rate=1e-2)
+    model_config = ModelConfig(n_u=u_train.shape[1], n_y=y_train.shape[1], param='tv', d_model=8, d_state=8,
+                               gamma=None, ff='GLU', init='eye',
+                               n_layers=6, d_amp=3, rho=0.9, phase_center=0.0, max_phase_b=0.04, d_hidden=12, nl_layers=3)
+    train_config = TrainingConfig(num_epochs=6000, learning_rate=1.6568e-02)
+    hpo_config = HyperOptConfig(enabled=False, n_trials=20, num_epochs=250)
+
+    # Hyperparameter search
+    if hpo_config.enabled:
+        print("Running Optuna hyperparameter optimization...")
+        best_params = optimize_hyperparameters(
+            u_train=u_train,
+            y_train=y_train,
+            u_val=u_val,
+            y_val=y_val,
+            init_window=test.state_initialization_window_length,
+            base_model_config=model_config,
+            base_train_config=train_config,
+            hpo_config=hpo_config,
+        )
+        model_config = replace(
+            model_config,
+            n_layers=best_params["n_layers"],
+            d_model=best_params["d_model"],
+            d_state=best_params["d_state"],
+            gamma=best_params["gamma"],
+        )
+        train_config = replace(train_config, learning_rate=best_params["learning_rate"])
+
+        print("Best hyperparameters found:")
+        print(f"  n_layers:      {best_params['n_layers']}")
+        print(f"  d_model:       {best_params['d_model']}")
+        print(f"  d_state:       {best_params['d_state']}")
+        print(f"  learning_rate: {best_params['learning_rate']:.4e}")
+        print(f"  gamma:         {best_params['gamma']:.4f}")
+        print(f"  RMSE x1000:    {best_params['objective_rmse_x1000']:.6f}")
+
+        best_params_path = train_config.save_dir / "optuna_best_params.json"
+        best_params_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(best_params_path, "w", encoding="utf-8") as f:
+            json.dump(best_params, f, indent=2)
+        print(f"Saved Optuna results to {best_params_path}")
+
+        # Reset seed before final training for reproducibility
+        set_random_seed(seed)
 
     # Build model
     print("Building model...")

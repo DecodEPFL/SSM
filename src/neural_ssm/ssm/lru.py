@@ -984,15 +984,17 @@ class Block2x2DenseL2SSM(nn.Module):
             device=rho.device,
             dtype=rho.dtype,
         )
-        for i in range(n_pairs):
-            r = rho[i]
-            block = torch.tensor(
-                [[c[i], -s[i]],
-                 [s[i],  c[i]]],
-                device=K11.device,
-                dtype=K11.dtype,
-            )
-            K11[2 * i : 2 * i + 2, 2 * i : 2 * i + 2] = r * block
+        idx = torch.arange(n_pairs, device=K11.device)
+        i0 = 2 * idx
+        i1 = i0 + 1
+
+        rc = rho * c
+        rs = rho * s
+
+        K11[i0, i0] = rc
+        K11[i0, i1] = -rs
+        K11[i1, i0] = rs
+        K11[i1, i1] = rc
         return K11
 
     # ----------------------------------------------------------------------
@@ -1019,7 +1021,7 @@ class Block2x2DenseL2SSM(nn.Module):
 
         K = self._spectral_normalize(K_raw)
 
-        dx, du, dy = self.d_state, self.d_input, self.d_output
+        dx, dy = self.d_state, self.d_output
         K11 = K[:dx, :dx]
         K12 = K[:dx, dx:]
         K21 = K[dx:, :dx]
@@ -1067,7 +1069,6 @@ class Block2x2DenseL2SSM(nn.Module):
         """
         A_z, B_z, C_z, D_z, _ = self.compute_z_matrices()
         S = self.S
-        gamma = self.gamma
 
         Sinv = torch.linalg.inv(S)
         # A_x = S^{-1} A_z S
@@ -1309,7 +1310,7 @@ class Block2x2DenseL2SSM(nn.Module):
 
         else:
             # ==========================================================
-            # SCAN (keep exactly as before, in z-basis)
+            # SCAN (in z-basis)
             # ==========================================================
             z0 = x0 @ S.T  # (B,dx)
 
@@ -1533,16 +1534,16 @@ class DeepSSM(nn.Module):
             self.encoder_w = nn.Parameter(torch.randn(self.config.d_model, self.d_input))
             self.decoder_w = nn.Parameter(torch.randn(self.d_output, self.config.d_model))
 
-            # config.ff is shared, so hasattr is constant across blocks
-            self.ff_has_lip = (self.config.ff in {"LGLU", "TLIP"}) or True  # or safer: set after blocks are built
+            # Set once after blocks are created (all blocks share the same FF type).
+            self.ff_has_lip = False
         else:
             self.encoder = nn.Linear(d_input, self.config.d_model, bias=False)
             self.decoder = nn.Linear(self.config.d_model, d_output, bias=False)
 
         self.blocks = nn.ModuleList([SSL(self.config) for _ in range(self.config.n_layers)])
 
-        if self.use_cert_scaling:
-            # now that blocks exist, we can check once
+        if self.use_cert_scaling and len(self.blocks) > 0:
+            # Check once; all blocks share the same FF implementation.
             self.ff_has_lip = hasattr(self.blocks[0].ff, "lip")
 
 
@@ -1569,19 +1570,22 @@ class DeepSSM(nn.Module):
         if self.use_cert_scaling:
             gamma_t = self.gamma_t.abs() if gamma is None else torch.as_tensor(gamma, device=x.device, dtype=x.dtype).abs()
 
-            # collect per-block gains
-            g = torch.stack([block.lru.gamma.abs() for block in self.blocks])
-            if self.ff_has_lip:
-                l = torch.stack([block.ff.lip.abs() for block in self.blocks])
-                g = g * l
+            if len(self.blocks) > 0:
+                # Collect per-block gains.
+                g = torch.stack([block.lru.gamma.abs() for block in self.blocks])
+                if self.ff_has_lip:
+                    ff_lips = torch.stack([block.ff.lip.abs() for block in self.blocks])
+                    g = g * ff_lips
 
-            # prod(1+g) in log-space
-            log_gamma_prod = torch.log1p(g).sum()
-            gamma_prod = torch.exp(log_gamma_prod)
+                # Compute prod(1 + g) in log-space for numerical stability.
+                log_gamma_prod = torch.log1p(g).sum()
+                gamma_prod = torch.exp(log_gamma_prod)
+            else:
+                gamma_prod = torch.ones((), device=x.device, dtype=x.dtype)
 
             # EXACT SVD norms with backward
-            enc_norm = torch.linalg.svdvals(self.encoder_w).max()
-            dec_norm = torch.linalg.svdvals(self.decoder_w).max()
+            enc_norm = torch.linalg.matrix_norm(self.encoder_w, ord=2)
+            dec_norm = torch.linalg.matrix_norm(self.decoder_w, ord=2)
 
             scale = gamma_t / (enc_norm * dec_norm * gamma_prod + 1e-12)
             decoder_scaled = self.decoder_w * scale
