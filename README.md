@@ -26,7 +26,7 @@ pip install git+https://github.com/LeoMassai/neural-ssm.git
 
 ## Architecture and robustness recipe
 
-![Robust Deep SSM architecture](docs/figures/robust_ssm_architecture.svg)
+[Open architecture figure (PDF)](docs/figures/l2_ssm.pdf)
 
 Reading the figure from left to right:
 
@@ -37,7 +37,6 @@ Reading the figure from left to right:
    - a static nonlinearity (`LGLU`, `LMLP`, `GLU`, ...)
    - a residual connection.
 4. Output is projected by a decoder.
-5. For `l2n`/`tv`, optional certified scaling with `gamma` is used to preserve prescribed L2 robustness behavior.
 
 Main message: `l2n` and `tv`, when used with a Lipschitz-bounded nonlinearity such as `LGLU`, enable robust deep SSMs with prescribed L2 bound.
 
@@ -53,6 +52,17 @@ All these parametrizations support both forward execution modes:
 - standard recurrence loop via `mode="loop"`
 
 You select the mode at call time, e.g. `model(u, mode="scan")` or `model(u, mode="loop")`.
+
+## Main SSM parameters
+
+- `d_input`: input feature dimension.
+- `d_output`: output feature dimension.
+- `d_model`: latent model dimension used inside each SSL block.
+- `d_state`: internal recurrent state dimension.
+- `n_layers`: number of stacked SSL blocks.
+- `param`: parametrization of the recurrent unit (`lru`, `l2n`, `tv`, ...).
+- `ff`: static nonlinearity type (`GLU`, `MLP`, `LMLP`, `LGLU`, `TLIP`).
+- `gamma`: desired L_2 bound of the overall SSM. If `gamma=None`, it is trainable.
 
 ## Where each component is in the code
 
@@ -72,28 +82,20 @@ You select the mode at call time, e.g. `model(u, mode="scan")` or `model(u, mode
 
 ## Quick tutorial
 
-### A) Create a model using `SSMConfig`
+### Tensor shapes and forward outputs
 
-```python
-import torch
-from neural_ssm import DeepSSM, SSMConfig
+- Input tensor shape is `u: (B, L, d_input)` where:
+  - `B` = batch size
+  - `L` = sequence length
+  - `d_input` = input dimension
+- Output tensor shape is `y: (B, L, d_output)`.
+- `DeepSSM` returns two objects:
+  - `y`: the model output sequence 
+  - `state`: the sequence/list of inner recurrent states (one state tensor per recurrent block), useful for stateful calls.
 
-cfg = SSMConfig(
-    d_model=16,
-    d_state=16,
-    n_layers=4,
-    param="l2n",      # lru | l2n | tv | ...
-    ff="LGLU",        # GLU | MLP | LMLP | LGLU | TLIP
-    gamma=2.0,
-    train_gamma=False,
-)
+### How to create and call a Deep SSM 
 
-model = DeepSSM(d_input=1, d_output=1, config=cfg)
-u = torch.randn(8, 200, 1)               # (batch, time, input_dim)
-y, state = model(u, mode="scan")         # or mode="loop"
-```
-
-### B) Create a model with direct constructor arguments
+Building and using the SSM is pretty easy:
 
 ```python
 import torch
@@ -108,11 +110,10 @@ model = DeepSSM(
     param="tv",
     ff="LGLU",
     gamma=2.0,
-    train_gamma=False,
 )
 
-u = torch.randn(8, 200, 1)
-y, state = model(u, mode="scan")
+u = torch.randn(8, 200, 1)               # (B, L, d_input)
+y, state = model(u, mode="scan")         # y shape: (B, L, d_output), state shape: list of (B, L, d_state)
 ```
 
 ## Top-level API
@@ -131,5 +132,3 @@ If you use this repository in research, please cite:
 
 **Free Parametrization of L2-bounded State Space Models**  
 https://arxiv.org/abs/2503.23818
-
-
