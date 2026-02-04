@@ -84,6 +84,9 @@ You select the mode at call time, e.g. `model(u, mode="scan")` or `model(u, mode
 
 ## Quick tutorial
 
+For a complete, runnable training example on a nonlinear benchmark dataset, see:
+`Test_files/Tutorial_DeepSSM.py`
+
 ### Tensor shapes and forward outputs
 
 - Input tensor shape is `u: (B, L, d_input)` where:
@@ -135,7 +138,8 @@ y_next, state = model(u_next, state=state, mode="scan")
 
 ## Examples
 
-Example and experiment scripts are available in `Test_files/`.
+Example and experiment scripts are available in `Test_files/`, including:
+- `Test_files/Tutorial_DeepSSM.py`: minimal end-to-end DeepSSM training tutorial.
 
 ## Citation
 
