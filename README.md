@@ -26,7 +26,7 @@ pip install git+https://github.com/LeoMassai/neural-ssm.git
 
 ## Architecture and robustness recipe
 
-[Open architecture figure (PDF)](docs/figures/l2_ssm.pdf)
+![L2 DeepSSM architecture](docs/figures/l2_deepssm.svg)
 
 Reading the figure from left to right:
 
@@ -91,7 +91,12 @@ You select the mode at call time, e.g. `model(u, mode="scan")` or `model(u, mode
 - Output tensor shape is `y: (B, L, d_output)`.
 - `DeepSSM` returns two objects:
   - `y`: the model output sequence 
-  - `state`: the sequence/list of inner recurrent states (one state tensor per recurrent block), useful for stateful calls.
+  - `state`: a list of recurrent states (one tensor per SSL block), useful for stateful calls.
+
+State initialization in `forward`:
+
+- You can pass `state=` as a list with one initial state tensor for each SSL block.
+- If `state` is not provided (`state=None`), internal recurrent states are initialized to zero.
 
 ### How to create and call a Deep SSM 
 
@@ -113,7 +118,11 @@ model = DeepSSM(
 )
 
 u = torch.randn(8, 200, 1)               # (B, L, d_input)
-y, state = model(u, mode="scan")         # y shape: (B, L, d_output), state shape: list of (B, L, d_state)
+y, state = model(u, mode="scan")         # zero-initialized internal states
+
+# Stateful call: pass one state per SSL block
+u_next = torch.randn(8, 200, 1)
+y_next, state = model(u_next, state=state, mode="scan")
 ```
 
 ## Top-level API
