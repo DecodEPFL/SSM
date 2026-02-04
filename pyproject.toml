@@ -61,9 +61,9 @@ docs = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/LeoMassai"
-Repository = "https://github.com/LeoMassai/neural-ssm"
-Issues = "https://github.com/LeoMassai/neural-ssm/issues"
+Homepage = "https://github.com/DecodEPFL/SSM"
+Repository = "https://github.com/DecodEPFL/SSM"
+Issues = "https://github.com/DecodEPFL/SSM/issues"
 
 [tool.setuptools]
 include-package-data = true
