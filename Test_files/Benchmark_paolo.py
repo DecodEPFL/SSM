@@ -6,7 +6,7 @@ from torch.utils.data import Dataset, DataLoader, TensorDataset
 import scipy.io as sio
 from pathlib import Path
 from typing import Dict, Tuple, Optional, Any
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from tqdm import tqdm
 import logging
 import math
@@ -39,7 +39,7 @@ class TrainingConfig:
     min_delta: float = 1e-6
 
     # Checkpointing
-    save_dir: Path = Path("../checkpoints")
+    save_dir: Path = field(default_factory=lambda: Path(__file__).resolve().parent / "checkpoints")
     save_best_only: bool = True
 
 
