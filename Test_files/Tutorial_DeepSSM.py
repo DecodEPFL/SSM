@@ -17,6 +17,7 @@ from dataclasses import dataclass
 
 import matplotlib.pyplot as plt
 import nonlinear_benchmarks
+from nonlinear_benchmarks.error_metrics import RMSE
 import numpy as np
 import torch
 import torch.nn as nn
@@ -37,17 +38,17 @@ class TutorialConfig:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Training
-    epochs: int = 200
-    learning_rate: float = 1e-2
+    epochs: int = 9000
+    learning_rate: float = 1.6568e-02
     log_every: int = 50
 
     # set up the DeepSSM architecture
     d_model: int = 8
-    d_state: int = 8
-    n_layers: int = 4
-    param: str = "tv"  # "lru" | "l2n" | "tv" | ...
+    d_state: int = 14
+    n_layers: int = 6
+    param: str = "l2n"  # "lru" | "l2n" | "tv" | ...
     ff: str = "LGLU"  # "GLU" | "MLP" | "LMLP" | "LGLU" | "TLIP"
-    gamma: float | None = 2.0  # set to None if you want gamma to be trainable
+    gamma: float | None = None  # set to None if you want gamma to be trainable
 
     # Forward execution mode
     train_mode: str = "scan"  # "scan" or "loop"
@@ -193,9 +194,9 @@ def main() -> None:
         test_losses.append(test_loss.item())
 
         if epoch % cfg.log_every == 0 or epoch == 1 or epoch == cfg.epochs:
-            test_rmse = RMSE(
-                y_test[:, n_init:, :].detach().cpu().numpy(),
-                y_test_pred[:, n_init:, :].detach().cpu().numpy(),
+            test_rmse = 1000*RMSE(
+                y_test[0, n_init:, 0].detach().cpu().numpy(),
+                y_test_pred[0, n_init:, 0].detach().cpu().numpy(),
             )
             print(
                 f"Epoch {epoch:4d}/{cfg.epochs} | "
@@ -205,9 +206,9 @@ def main() -> None:
             )
         best_val_rmse = min(
             best_val_rmse,
-            RMSE(
-                y_test[:, n_init:, :].detach().cpu().numpy(),
-                y_test_pred[:, n_init:, :].detach().cpu().numpy(),
+            1000*RMSE(
+                y_test[0, n_init:, 0].detach().cpu().numpy(),
+                y_test_pred[0, n_init:, 0].detach().cpu().numpy(),
             ),
         )
 
@@ -225,9 +226,9 @@ def main() -> None:
             mode=cfg.eval_mode,
         )
     max_diff = (y_full - y_stream).abs().max().item()
-    final_rmse = RMSE(
-        y_test[:, n_init:, :].detach().cpu().numpy(),
-        y_full[:, n_init:, :].detach().cpu().numpy(),
+    final_rmse = 1000*RMSE(
+        y_test[0, n_init:, 0].detach().cpu().numpy(),
+        y_full[0, n_init:, 0].detach().cpu().numpy(),
     )
 
     print("\nTraining complete.")

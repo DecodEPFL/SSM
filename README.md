@@ -26,19 +26,19 @@ pip install git+https://github.com/LeoMassai/neural-ssm.git
 ```
 
 ## Architecture and robustness recipe
-Let's see what is an SSM more in detail 
+Let's see what an SSM is more in detail 
 
 ![L2 DeepSSM architecture](docs/figures/l2_deepssm.svg)
 
 Reading the figure from left to right:
 
-1. Input is projected by an encoder.
+1. Input is projected by a linear encoder.
 2. A stack of SSL blocks is applied.
 3. Each block combines:
-   - a dynamic core with different state-space parametrizations (`lru`, `l2n`, or `tv`)
+   - a dynamic recurrent core with different state-space parametrizations (`lru`, `l2n`, or `tv`)
    - a static nonlinearity (`LGLU`, `LMLP`, `GLU`, ...)
    - a residual connection.
-4. Output is projected by a decoder.
+4. Output is projected by a linear decoder.
 
 Main message: `l2n` and `tv`, when used with a Lipschitz-bounded nonlinearity such as `LGLU`, enable robust deep SSMs with prescribed L2 bound.
 
@@ -57,13 +57,15 @@ You select the mode at call time, e.g. `model(u, mode="scan")` or `model(u, mode
 
 ## Main SSM parameters
 
+The SSM model is implemented by the class DeepSSM, which takes a number of input parameters, here are the most important ones:
+
 - `d_input`: input feature dimension.
 - `d_output`: output feature dimension.
 - `d_model`: latent model dimension used inside each SSL block.
 - `d_state`: internal recurrent state dimension.
 - `n_layers`: number of stacked SSL blocks.
 - `param`: parametrization of the recurrent unit (`lru`, `l2n`, `tv`, ...).
-- `ff`: static nonlinearity type (`GLU`, `MLP`, `LMLP`, `LGLU`, `TLIP`).
+- `ff`: static nonlinearity type, same for each SSL block (`GLU`, `MLP`, `LMLP`, `LGLU`, `TLIP`).
 - `gamma`: desired L_2 bound of the overall SSM. If `gamma=None`, it is trainable.
 
 ## Where each component is in the code
@@ -133,7 +135,7 @@ y_next, state = model(u_next, state=state, mode="scan")
 ## Top-level API
 
 - `DeepSSM`, `SSMConfig`
-- `LRU`, `L2RU`, `lruz`, `PureLRUR`, `SimpleRNN`
+- `LRU`, `L2RU`, `lruz`
 - static layers re-exported in `neural_ssm.layers`
 
 ## Examples
