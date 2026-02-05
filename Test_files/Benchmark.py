@@ -744,9 +744,9 @@ def main():
 
     # Initialize configurations
     model_config = ModelConfig(n_u=u_train.shape[1], n_y=y_train.shape[1], param='tv', d_model=8, d_state=8,
-                               gamma=None, ff='GLU', init='eye',
-                               n_layers=6, d_amp=3, rho=0.9, phase_center=0.0, max_phase_b=0.04, d_hidden=12, nl_layers=3)
-    train_config = TrainingConfig(num_epochs=6000, learning_rate=1.6568e-02)
+                               gamma=2, ff='LGLU', init='eye',
+                               n_layers=4, d_amp=3, rho=0.9, phase_center=0.0, max_phase_b=0.04, d_hidden=12, nl_layers=3)
+    train_config = TrainingConfig(num_epochs=600, learning_rate=1.6568e-02)
     hpo_config = HyperOptConfig(enabled=False, n_trials=20, num_epochs=250)
 
     # Hyperparameter search
