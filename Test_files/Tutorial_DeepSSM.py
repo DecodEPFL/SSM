@@ -20,6 +20,7 @@ import nonlinear_benchmarks
 import numpy as np
 import torch
 import torch.nn as nn
+from nonlinear_benchmarks.error_metrics import RMSE
 
 try:
     # Preferred package API (after pip install neural-ssm)
@@ -81,10 +82,6 @@ def to_bln(x: np.ndarray | torch.Tensor) -> torch.Tensor:
     if x_t.ndim == 3:  # already (B, L, N)
         return x_t
     raise ValueError(f"Unsupported tensor rank {x_t.ndim}; expected 1, 2 or 3.")
-
-
-def rmse(y_true: torch.Tensor, y_pred: torch.Tensor) -> float:
-    return torch.sqrt(torch.mean((y_true - y_pred) ** 2)).item()
 
 
 @torch.no_grad()
@@ -168,6 +165,7 @@ def main() -> None:
 
     train_losses: list[float] = []
     test_losses: list[float] = []
+    best_val_rmse = float("inf")
 
     # ------------------------------------------------------------------
     # 3) Simple training loop
@@ -195,13 +193,23 @@ def main() -> None:
         test_losses.append(test_loss.item())
 
         if epoch % cfg.log_every == 0 or epoch == 1 or epoch == cfg.epochs:
-            test_rmse = rmse(y_test[:, n_init:, :], y_test_pred[:, n_init:, :])
+            test_rmse = RMSE(
+                y_test[:, n_init:, :].detach().cpu().numpy(),
+                y_test_pred[:, n_init:, :].detach().cpu().numpy(),
+            )
             print(
                 f"Epoch {epoch:4d}/{cfg.epochs} | "
                 f"train_loss={train_loss.item():.4e} | "
                 f"test_loss={test_loss.item():.4e} | "
                 f"test_rmse={test_rmse:.4e}"
             )
+        best_val_rmse = min(
+            best_val_rmse,
+            RMSE(
+                y_test[:, n_init:, :].detach().cpu().numpy(),
+                y_test_pred[:, n_init:, :].detach().cpu().numpy(),
+            ),
+        )
 
     # ------------------------------------------------------------------
     # 4) Full vs stateful inference (same model, chunked evaluation)
@@ -217,10 +225,14 @@ def main() -> None:
             mode=cfg.eval_mode,
         )
     max_diff = (y_full - y_stream).abs().max().item()
-    final_rmse = rmse(y_test[:, n_init:, :], y_full[:, n_init:, :])
+    final_rmse = RMSE(
+        y_test[:, n_init:, :].detach().cpu().numpy(),
+        y_full[:, n_init:, :].detach().cpu().numpy(),
+    )
 
     print("\nTraining complete.")
     print(f"Final test RMSE (after warm-up): {final_rmse:.6e}")
+    print(f"Best validation RMSE (after warm-up): {best_val_rmse:.6e}")
     print(f"Max |full - streaming| difference: {max_diff:.6e}")
 
     # ------------------------------------------------------------------
