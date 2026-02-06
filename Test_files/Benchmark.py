@@ -35,7 +35,7 @@ class TrainingConfig:
     batch_size: int = 32
     num_epochs: int = 8590
     seed: int = 9
-    device: str = "cpu" if torch.cuda.is_available() else "cpu"
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
     num_workers: int = 4
     pin_memory: bool = True
 

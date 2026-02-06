@@ -43,12 +43,13 @@ class TutorialConfig:
     log_every: int = 50
 
     # set up the DeepSSM architecture
-    d_model: int = 8
-    d_state: int = 14
-    n_layers: int = 6
+    d_model: int = 2
+    d_state: int = 600
+    n_layers: int = 1
     param: str = "l2n"  # "lru" | "l2n" | "tv" | ...
     ff: str = "LGLU"  # "GLU" | "MLP" | "LMLP" | "LGLU" | "TLIP"
     gamma: float | None = None  # set to None if you want gamma to be trainable
+    max_phase_b: float = 2 * np.pi
 
     # Forward execution mode
     train_mode: str = "scan"  # "scan" or "loop"
@@ -149,6 +150,7 @@ def main() -> None:
         param=cfg.param,
         ff=cfg.ff,
         gamma=cfg.gamma,
+        max_phase_b=cfg.max_phase_b
     ).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.learning_rate)

@@ -1004,8 +1004,30 @@ class Block2x2DenseL2SSM(nn.Module):
         """
         Scale M so that ||M||_2 <= 1 (or ≈ 1 if exact_norm=True).
         """
-        # exact largest singular value
-        sigma = torch.linalg.matrix_norm(M, ord=2)
+        def _power_iteration_sigma(mat: torch.Tensor, iters: int) -> torch.Tensor:
+            # Simple power iteration to estimate spectral norm (largest singular value).
+            v = torch.randn(mat.shape[1], device=mat.device, dtype=mat.dtype)
+            v = v / (v.norm() + 1e-12)
+            iters = max(1, int(iters))
+            for _ in range(iters):
+                u = mat @ v
+                v = mat.T @ u
+                v_norm = v.norm()
+                if v_norm < 1e-12:
+                    break
+                v = v / v_norm
+            u = mat @ v
+            return u.norm()
+
+        if self.exact_norm:
+            try:
+                sigma = torch.linalg.matrix_norm(M, ord=2)
+            except RuntimeError:
+                # Fallback when SVD fails to converge (ill-conditioned / repeated values).
+                sigma = _power_iteration_sigma(M, self.power_iters)
+        else:
+            sigma = _power_iteration_sigma(M, self.power_iters)
+
         sigma = sigma.clamp(min=1e-5)
         M = M / (sigma + 0.002)
         return M
@@ -1133,7 +1155,7 @@ class Block2x2DenseL2SSM(nn.Module):
             same_phase_across_blocks: bool = False,
             random_phase: bool = True,  # if False -> all θ_i = phase_center
             # off-diagonal scale
-            offdiag_scale: float = .05,
+            offdiag_scale: float = .005,
     ):
         """
         Initialize such that A_z = K11 has eigenvalues
