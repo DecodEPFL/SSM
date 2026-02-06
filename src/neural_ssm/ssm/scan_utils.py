@@ -532,12 +532,89 @@ def binary_operator_block2x2(
     return A_out, b_out
 
 
-def compute_linear_recurrence_parallel_block2x2(
+def _scan_diag_complex(
+    lambdas: torch.Tensor,
+    Bu: torch.Tensor,
+    x0: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Parallel scan for diagonal (complex) recurrence:
+
+        x_{t+1} = lambdas * x_t + Bu[t]
+
+    Shapes:
+        lambdas: (N,) complex
+        Bu: (T, B, N) complex
+        x0: (B, N) complex
+
+    Returns:
+        states: (T+1, B, N) complex
+    """
+    T, B, N = Bu.shape
+    if T == 0:
+        return x0.unsqueeze(0)
+
+    Bu = Bu.clone()
+    Bu[0] = Bu[0] + lambdas.view(1, N) * x0
+
+    lam_seq = lambdas.view(1, 1, N).expand(T, B, N)
+    _, x_next = associative_scan(binary_operator_diag, (lam_seq, Bu), axis=0)
+
+    states = torch.empty(T + 1, B, N, device=Bu.device, dtype=Bu.dtype)
+    states[0] = x0
+    states[1:] = x_next
+    return states
+
+
+def compute_linear_recurrence_parallel_block2x2_complex(
     A: torch.Tensor,
     B: torch.Tensor,
     u: torch.Tensor,
     x0: torch.Tensor,
-):
+) -> torch.Tensor:
+    """
+    Complex-valued scan for 2x2 block-diagonal A.
+
+    Interprets each 2x2 block as a complex scalar:
+        [[a, -b],
+         [b,  a]]  <->  a + i b
+    and runs a diagonal complex scan.
+    """
+    T, Bsz, D_in = u.shape
+    D_state = A.shape[0]
+    assert A.shape[1] == D_state, "A must be square (D_state, D_state)"
+    assert D_state % 2 == 0, "D_state must be even for 2x2 blocks"
+    n_blocks = D_state // 2
+
+    # Extract per-block complex eigenvalues lambda = a + i b
+    a = A.diagonal()[0::2]
+    b = A[1::2, 0::2].diagonal()
+    lambdas = torch.complex(a, b)
+
+    # v_t = B @ u_t  (T, B, D_state)
+    v = torch.matmul(u, B.T)
+    v_blocks = v.view(T, Bsz, n_blocks, 2)
+    Bu = torch.complex(v_blocks[..., 0], v_blocks[..., 1])  # (T, B, n_blocks)
+
+    # Initial state in complex block form
+    x0_blocks = x0.view(Bsz, n_blocks, 2)
+    x0_c = torch.complex(x0_blocks[..., 0], x0_blocks[..., 1])  # (B, n_blocks)
+
+    # Complex diagonal scan
+    states_c = _scan_diag_complex(lambdas, Bu, x0_c)  # (T+1, B, n_blocks)
+
+    # Convert back to real block form: (T+1, B, D_state)
+    states_blocks = torch.stack([states_c.real, states_c.imag], dim=-1)
+    states = states_blocks.reshape(T + 1, Bsz, D_state)
+    return states
+
+
+def _compute_linear_recurrence_parallel_block2x2_real(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    u: torch.Tensor,
+    x0: torch.Tensor,
+) -> torch.Tensor:
     """
     Parallel solution of the linear recurrence with 2x2 block-diagonal A:
 
@@ -651,3 +728,18 @@ def compute_linear_recurrence_parallel_block2x2(
     states[1:] = x_next
 
     return states
+
+
+def compute_linear_recurrence_parallel_block2x2(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    u: torch.Tensor,
+    x0: torch.Tensor,
+    use_complex_scan: bool = True,
+) -> torch.Tensor:
+    """
+    Wrapper that selects between complex-scan and real 2x2 block scan.
+    """
+    if use_complex_scan:
+        return compute_linear_recurrence_parallel_block2x2_complex(A, B, u, x0)
+    return _compute_linear_recurrence_parallel_block2x2_real(A, B, u, x0)
