@@ -2,7 +2,7 @@
 
 Example:
     python scripts/run_lra_listops.py --train-steps 200 --eval-steps 50
-    python scripts/run_lra_listops.py --dataset-name long_range_arena --dataset-config listops
+    python scripts/run_lra_listops.py --dataset-name lra-benchmarks --dataset-config listops
 
 Requires:
     pip install datasets
@@ -96,7 +96,7 @@ def infer_num_classes(dataset) -> int:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run a minimal LRA ListOps benchmark with DeepSSM.")
-    parser.add_argument("--dataset-name", type=str, default="long_range_arena")
+    parser.add_argument("--dataset-name", type=str, default="lra-benchmarks")
     parser.add_argument("--dataset-config", type=str, default="listops")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--max-length", type=int, default=2048)

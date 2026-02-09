@@ -91,7 +91,7 @@ For a complete, runnable training example on a nonlinear benchmark dataset, see:
 
 For a minimal Long Range Arena (LRA) benchmark script (ListOps) using `DeepSSM`, see:
 `scripts/run_lra_listops.py` (requires `pip install datasets`). The script defaults to
-the Hugging Face dataset `long_range_arena` with config `listops`.
+the Hugging Face dataset `lra-benchmarks` with config `listops`.
 
 ### Tensor shapes and forward outputs
 
