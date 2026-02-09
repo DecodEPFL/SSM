@@ -25,6 +25,7 @@ except Exception:  # pragma: no cover - optional dependency in CI
 
 
 from src.neural_ssm.ssm.lru import Block2x2DenseL2SSM, LRU
+from src.neural_ssm.ssm.mamba import RobustMambaDiagSSM
 
 
 @dataclass
@@ -34,7 +35,7 @@ class TrainDictConfig:
     d_input: int = 1
     d_output: int = 1
 
-    # Model choice: "l2n" or "lru"
+    # Model choice: "l2n", "lru", or "tv"
     model: str = "l2n"
 
     # L2 gain
@@ -65,6 +66,10 @@ class TrainDictConfig:
 
     # Orthogonality test
     K: int = 900
+    tv_ref_steps: int = 512
+    tv_ref_batches: int = 1
+    track_orthogonality: bool = True
+    orthogonality_every: int = 10
 
     # Misc
     seed: int = 7
@@ -191,6 +196,43 @@ def build_lru_cell(
     )
 
 
+def build_tv_cell(
+    *,
+    d_state: int,
+    d_input: int,
+    d_output: int,
+    gamma: float,
+    train_gamma: bool,
+) -> RobustMambaDiagSSM:
+    return RobustMambaDiagSSM(
+        d_state=d_state,
+        d_model=d_input,
+        d_out=d_output,
+        gamma=gamma,
+        train_gamma=train_gamma,
+    )
+
+
+def compute_tv_effective_matrices(
+    model: RobustMambaDiagSSM,
+    u_ref: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    with torch.no_grad():
+        a_bt, b_bt, _, _ = model._compute_params(u_ref)
+        a_mean = a_bt.mean(dim=(0, 1))
+        b_mean = b_bt.mean(dim=(0, 1))
+
+        A = torch.diag(a_mean)
+
+        W_raw = model.in_proj.W_raw
+        sigma = torch.linalg.matrix_norm(W_raw, ord=2)
+        scale = torch.clamp(sigma / model.in_proj.bound, min=1.0)
+        W_norm = W_raw / scale
+        B = torch.diag(b_mean) @ (model.gamma.to(W_norm) * W_norm)
+
+    return A, B
+
+
 def compute_dictionary_stats(A: torch.Tensor, B: torch.Tensor, K: int):
     """
     Build dictionary D = [vec(A^0 B), ..., vec(A^{K-1} B)], normalize columns,
@@ -228,6 +270,9 @@ def forward_model(
     if model_type == "lru":
         y, _ = model(u, mode=mode)
         return y
+    if model_type == "tv":
+        y, _ = model(u, mode=mode)
+        return y
     raise ValueError(f"Unknown model type: {model_type}")
 
 
@@ -235,6 +280,7 @@ def extract_dense_matrices(
     model: nn.Module,
     *,
     model_type: str,
+    u_ref: torch.Tensor | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     if model_type == "l2n":
         A, B, _, _, _ = model.compute_dense_matrices()
@@ -242,6 +288,10 @@ def extract_dense_matrices(
     if model_type == "lru":
         A, B, _, _ = model.ss_real_matrices(to_numpy=False)
         return A, B
+    if model_type == "tv":
+        if u_ref is None:
+            raise ValueError("u_ref must be provided for tv parametrization.")
+        return compute_tv_effective_matrices(model, u_ref)
     raise ValueError(f"Unknown model type: {model_type}")
 
 
@@ -252,6 +302,18 @@ def plot_gram(G: np.ndarray, title: str) -> None:
     plt.title(title)
     plt.xlabel("k")
     plt.ylabel("k")
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_orthogonality(frob_history: list[float]) -> None:
+    plt.figure(figsize=(6, 4))
+    epochs = np.arange(1, len(frob_history) + 1)
+    plt.plot(epochs, frob_history, marker="o", linewidth=1.5)
+    plt.title("Orthogonality drift during training")
+    plt.xlabel("Epoch")
+    plt.ylabel("Frobenius ||G - I||")
+    plt.grid(True, linestyle="--", alpha=0.5)
     plt.tight_layout()
     plt.show()
 
@@ -312,14 +374,27 @@ def main() -> None:
             rmax=cfg.lru_rmax,
             max_phase=cfg.lru_max_phase,
         ).to(device)
+    elif cfg.model == "tv":
+        student = build_tv_cell(
+            d_state=cfg.d_state,
+            d_input=cfg.d_input,
+            d_output=cfg.d_output,
+            gamma=cfg.gamma,
+            train_gamma=cfg.train_gamma,
+        ).to(device)
     else:
-        raise ValueError(f"Unknown model '{cfg.model}'. Use 'l2n' or 'lru'.")
+        raise ValueError(f"Unknown model '{cfg.model}'. Use 'l2n', 'lru', or 'tv'.")
+
+    if cfg.model == "tv":
+        u_ref = u_train[: cfg.tv_ref_batches, : cfg.tv_ref_steps, :]
+    else:
+        u_ref = None
 
     # ------------------------------------------------------------------
     # 3) Orthogonality before training
     # ------------------------------------------------------------------
     with torch.no_grad():
-        A0, B0 = extract_dense_matrices(student, model_type=cfg.model)
+        A0, B0 = extract_dense_matrices(student, model_type=cfg.model, u_ref=u_ref)
         G0, max0, mean0, frob0 = compute_dictionary_stats(A0, B0, cfg.K)
 
     print("=== Orthogonality BEFORE training ===")
@@ -337,6 +412,7 @@ def main() -> None:
     dataset = TensorDataset(u_train, y_train)
     batch_size = min(cfg.batch_size, u_train.size(0))
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    frob_history: list[float] = []
 
     for epoch in range(1, cfg.n_epochs + 1):
         running = 0.0
@@ -348,9 +424,19 @@ def main() -> None:
             optimizer.step()
             running += loss.item() * u_batch.size(0)
 
+        frob_epoch = None
+        if cfg.track_orthogonality and (epoch % cfg.orthogonality_every == 0 or epoch == cfg.n_epochs):
+            with torch.no_grad():
+                A_epoch, B_epoch = extract_dense_matrices(student, model_type=cfg.model, u_ref=u_ref)
+                _, _, _, frob_epoch = compute_dictionary_stats(A_epoch, B_epoch, cfg.K)
+                frob_history.append(frob_epoch)
+
         if epoch % cfg.log_every == 0 or epoch == 1 or epoch == cfg.n_epochs:
             avg = running / len(loader.dataset)
-            print(f"Epoch {epoch:03d} | MSE = {avg:.6f}")
+            if frob_epoch is None:
+                print(f"Epoch {epoch:03d} | MSE = {avg:.6f}")
+            else:
+                print(f"Epoch {epoch:03d} | MSE = {avg:.6f} | Frobenius ||G-I|| = {frob_epoch:.4e}")
 
     # Quick test MSE (ignoring warm-up window if provided)
     student.eval()
@@ -369,7 +455,7 @@ def main() -> None:
     # 5) Orthogonality after training
     # ------------------------------------------------------------------
     with torch.no_grad():
-        A1, B1 = extract_dense_matrices(student, model_type=cfg.model)
+        A1, B1 = extract_dense_matrices(student, model_type=cfg.model, u_ref=u_ref)
         G1, max1, mean1, frob1 = compute_dictionary_stats(A1, B1, cfg.K)
 
     print("\n=== Orthogonality AFTER training ===")
@@ -383,6 +469,8 @@ def main() -> None:
     if cfg.show_plot:
         plot_gram(G0.detach().cpu().numpy(), "Gram matrix of lag terms (before training)")
         plot_gram(G1.detach().cpu().numpy(), "Gram matrix of lag terms (after training)")
+        if cfg.track_orthogonality and frob_history:
+            plot_orthogonality(frob_history)
 
 
 if __name__ == "__main__":
