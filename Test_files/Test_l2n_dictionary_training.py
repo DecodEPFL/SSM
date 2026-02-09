@@ -70,10 +70,6 @@ class TrainDictConfig:
     tv_ref_batches: int = 1
     track_orthogonality: bool = True
     orthogonality_every: int = 10
-    use_p_metric: bool = True
-    use_output_dictionary: bool = True
-    override_output_identity: bool = False
-    override_output_identity_model: bool = False
 
     # Misc
     seed: int = 7
@@ -220,12 +216,11 @@ def build_tv_cell(
 def compute_tv_effective_matrices(
     model: RobustMambaDiagSSM,
     u_ref: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     with torch.no_grad():
-        a_bt, b_bt, c_bt, _ = model._compute_params(u_ref)
+        a_bt, b_bt, _, _ = model._compute_params(u_ref)
         a_mean = a_bt.mean(dim=(0, 1))
         b_mean = b_bt.mean(dim=(0, 1))
-        c_mean = c_bt.mean(dim=(0, 1))
 
         A = torch.diag(a_mean)
 
@@ -235,26 +230,10 @@ def compute_tv_effective_matrices(
         W_norm = W_raw / scale
         B = torch.diag(b_mean) @ (model.gamma.to(W_norm) * W_norm)
 
-        W_out_raw = model.out_proj.W_raw
-        sigma_out = torch.linalg.matrix_norm(W_out_raw, ord=2)
-        scale_out = torch.clamp(sigma_out / model.out_proj.bound, min=1.0)
-        W_out_norm = W_out_raw / scale_out
-        C = W_out_norm @ torch.diag(c_mean)
-        D = torch.zeros(model.D_out, model.D, device=A.device, dtype=A.dtype)
-
-    return A, B, C, D
+    return A, B
 
 
-def compute_dictionary_stats(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    K: int,
-    *,
-    C: torch.Tensor | None = None,
-    P: torch.Tensor | None = None,
-    use_output: bool = False,
-    use_p_metric: bool = False,
-):
+def compute_dictionary_stats(A: torch.Tensor, B: torch.Tensor, K: int):
     """
     Build dictionary D = [vec(A^0 B), ..., vec(A^{K-1} B)], normalize columns,
     and return the Gram matrix and orthogonality stats.
@@ -318,6 +297,9 @@ def forward_model(
         if override_output_identity:
             return z_seq[:, :-1, :]
         return y
+    if model_type == "tv":
+        y, _ = model(u, mode=mode)
+        return y
     raise ValueError(f"Unknown model type: {model_type}")
 
 
@@ -326,8 +308,7 @@ def extract_dense_matrices(
     *,
     model_type: str,
     u_ref: torch.Tensor | None = None,
-    override_output_identity: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     if model_type == "l2n":
         A, B, C, D, P = model.compute_dense_matrices()
         if override_output_identity:
@@ -335,19 +316,12 @@ def extract_dense_matrices(
             D = torch.zeros(A.size(0), B.size(1), device=A.device, dtype=A.dtype)
         return A, B, C, D, P
     if model_type == "lru":
-        A, B, C, D = model.ss_real_matrices(to_numpy=False)
-        if override_output_identity:
-            C = torch.eye(A.size(0), device=A.device, dtype=A.dtype)
-            D = torch.zeros(A.size(0), B.size(1), device=A.device, dtype=A.dtype)
-        return A, B, C, D, None
+        A, B, _, _ = model.ss_real_matrices(to_numpy=False)
+        return A, B
     if model_type == "tv":
         if u_ref is None:
             raise ValueError("u_ref must be provided for tv parametrization.")
-        A, B, C, D = compute_tv_effective_matrices(model, u_ref)
-        if override_output_identity:
-            C = torch.eye(A.size(0), device=A.device, dtype=A.dtype)
-            D = torch.zeros(A.size(0), B.size(1), device=A.device, dtype=A.dtype)
-        return A, B, C, D, None
+        return compute_tv_effective_matrices(model, u_ref)
     raise ValueError(f"Unknown model type: {model_type}")
 
 
@@ -362,11 +336,11 @@ def plot_gram(G: np.ndarray, title: str) -> None:
     plt.show()
 
 
-def plot_orthogonality(frob_history: list[float], title: str) -> None:
+def plot_orthogonality(frob_history: list[float]) -> None:
     plt.figure(figsize=(6, 4))
     epochs = np.arange(1, len(frob_history) + 1)
     plt.plot(epochs, frob_history, marker="o", linewidth=1.5)
-    plt.title(title)
+    plt.title("Orthogonality drift during training")
     plt.xlabel("Epoch")
     plt.ylabel("Frobenius ||G - I||")
     plt.grid(True, linestyle="--", alpha=0.5)
@@ -455,12 +429,7 @@ def main() -> None:
     # 3) Orthogonality before training
     # ------------------------------------------------------------------
     with torch.no_grad():
-        A0, B0, C0, _, P0 = extract_dense_matrices(
-            student,
-            model_type=cfg.model,
-            u_ref=u_ref,
-            override_output_identity=cfg.override_output_identity_model,
-        )
+        A0, B0 = extract_dense_matrices(student, model_type=cfg.model, u_ref=u_ref)
         G0, max0, mean0, frob0 = compute_dictionary_stats(A0, B0, cfg.K)
 
         if cfg.use_p_metric and P0 is not None:
@@ -515,8 +484,6 @@ def main() -> None:
     batch_size = min(cfg.batch_size, u_train.size(0))
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
     frob_history: list[float] = []
-    frob_history_p: list[float] = []
-    frob_history_out: list[float] = []
 
     for epoch in range(1, cfg.n_epochs + 1):
         running = 0.0
@@ -535,54 +502,18 @@ def main() -> None:
             running += loss.item() * u_batch.size(0)
 
         frob_epoch = None
-        frob_epoch_p = None
-        frob_epoch_out = None
         if cfg.track_orthogonality and (epoch % cfg.orthogonality_every == 0 or epoch == cfg.n_epochs):
             with torch.no_grad():
-                A_epoch, B_epoch, C_epoch, _, P_epoch = extract_dense_matrices(
-                    student,
-                    model_type=cfg.model,
-                    u_ref=u_ref,
-                    override_output_identity=cfg.override_output_identity_model,
-                )
+                A_epoch, B_epoch = extract_dense_matrices(student, model_type=cfg.model, u_ref=u_ref)
                 _, _, _, frob_epoch = compute_dictionary_stats(A_epoch, B_epoch, cfg.K)
                 frob_history.append(frob_epoch)
-                if cfg.use_p_metric and P_epoch is not None:
-                    _, _, _, frob_epoch_p = compute_dictionary_stats(
-                        A_epoch,
-                        B_epoch,
-                        cfg.K,
-                        P=P_epoch,
-                        use_p_metric=True,
-                    )
-                    frob_history_p.append(frob_epoch_p)
-                if cfg.use_output_dictionary:
-                    if cfg.override_output_identity or cfg.override_output_identity_model:
-                        C_use = torch.eye(A_epoch.size(0), device=A_epoch.device, dtype=A_epoch.dtype)
-                    else:
-                        C_use = C_epoch
-                    if C_use is None:
-                        raise ValueError("C must be available for output dictionary tracking.")
-                    _, _, _, frob_epoch_out = compute_dictionary_stats(
-                        A_epoch,
-                        B_epoch,
-                        cfg.K,
-                        C=C_use,
-                        use_output=True,
-                    )
-                    frob_history_out.append(frob_epoch_out)
 
         if epoch % cfg.log_every == 0 or epoch == 1 or epoch == cfg.n_epochs:
             avg = running / len(loader.dataset)
             if frob_epoch is None:
                 print(f"Epoch {epoch:03d} | MSE = {avg:.6f}")
             else:
-                msg = f"Epoch {epoch:03d} | MSE = {avg:.6f} | Frobenius ||G-I|| = {frob_epoch:.4e}"
-                if frob_epoch_p is not None:
-                    msg += f" | (P) {frob_epoch_p:.4e}"
-                if frob_epoch_out is not None:
-                    msg += f" | (out) {frob_epoch_out:.4e}"
-                print(msg)
+                print(f"Epoch {epoch:03d} | MSE = {avg:.6f} | Frobenius ||G-I|| = {frob_epoch:.4e}")
 
     # Quick test MSE (ignoring warm-up window if provided)
     student.eval()
@@ -607,12 +538,7 @@ def main() -> None:
     # 5) Orthogonality after training
     # ------------------------------------------------------------------
     with torch.no_grad():
-        A1, B1, C1, _, P1 = extract_dense_matrices(
-            student,
-            model_type=cfg.model,
-            u_ref=u_ref,
-            override_output_identity=cfg.override_output_identity_model,
-        )
+        A1, B1 = extract_dense_matrices(student, model_type=cfg.model, u_ref=u_ref)
         G1, max1, mean1, frob1 = compute_dictionary_stats(A1, B1, cfg.K)
         if cfg.use_p_metric and P1 is not None:
             _, max1_p, mean1_p, frob1_p = compute_dictionary_stats(
@@ -662,11 +588,7 @@ def main() -> None:
         plot_gram(G0.detach().cpu().numpy(), "Gram matrix of lag terms (before training)")
         plot_gram(G1.detach().cpu().numpy(), "Gram matrix of lag terms (after training)")
         if cfg.track_orthogonality and frob_history:
-            plot_orthogonality(frob_history, "Orthogonality drift (state, Euclidean)")
-        if cfg.track_orthogonality and frob_history_p:
-            plot_orthogonality(frob_history_p, "Orthogonality drift (state, P-metric)")
-        if cfg.track_orthogonality and frob_history_out:
-            plot_orthogonality(frob_history_out, "Orthogonality drift (output)")
+            plot_orthogonality(frob_history)
 
 
 if __name__ == "__main__":
