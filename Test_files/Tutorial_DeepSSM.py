@@ -46,9 +46,9 @@ class TutorialConfig:
     d_model: int = 2
     d_state: int = 600
     n_layers: int = 1
-    param: str = "l2n"  # "lru" | "l2n" | "tv" | ...
-    ff: str = "LGLU"  # "GLU" | "MLP" | "LMLP" | "LGLU" | "TLIP"
-    gamma: float | None = None  # set to None if you want gamma to be trainable
+    param: str = "lru"  # "lru" | "l2n" | "tv" | ...
+    ff: str = "MLP"  # "GLU" | "MLP" | "LMLP" | "LGLU" | "TLIP"
+    gamma: float | None = 18.1  # set to None if you want gamma to be trainable
     max_phase_b: float = 2 * np.pi
 
     # Forward execution mode

@@ -36,14 +36,14 @@ class TrainDictConfig:
     d_output: int = 1
 
     # Model choice: "l2n", "lru", or "tv"
-    model: str = "l2n"
+    model: str = "tv"
 
     # L2 gain
     gamma: float = 99
     train_gamma: bool = True
 
     # L2N initialization (student only)
-    rho_student: float = 0.95
+    rho_student: float = 0.99
     max_phase_b: float = 2 * np.pi
     phase_center: float = 0.0
     random_phase: bool = True
@@ -59,13 +59,13 @@ class TrainDictConfig:
     dataset_fallback: str = "WienerHammer"
 
     # Training
-    n_epochs: int = 60
+    n_epochs: int = 2000
     batch_size: int = 16
     lr: float = 1e-3
     log_every: int = 10
 
     # Orthogonality test
-    K: int = 900
+    K: int = 500
     tv_ref_steps: int = 512
     tv_ref_batches: int = 1
     track_orthogonality: bool = True
