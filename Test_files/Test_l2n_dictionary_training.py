@@ -243,12 +243,28 @@ def compute_dictionary_stats(A: torch.Tensor, B: torch.Tensor, K: int):
     Ak = torch.eye(d_state, device=A.device, dtype=A.dtype)
     cols = []
     for _ in range(K):
-        cols.append((Ak @ B).reshape(-1))
+        if use_output:
+            if C is None:
+                raise ValueError("C must be provided when use_output=True.")
+            cols.append((C @ Ak @ B).reshape(-1))
+        else:
+            cols.append((Ak @ B).reshape(-1))
         Ak = Ak @ A
 
     D = torch.stack(cols, dim=1)  # (d_state * d_in, K)
-    D_norm = D / (D.norm(dim=0, keepdim=True) + 1e-12)
-    G = D_norm.T @ D_norm
+    if use_p_metric:
+        if P is None:
+            raise ValueError("P must be provided when use_p_metric=True.")
+        if use_output:
+            raise ValueError("P-metric is only defined for state dictionaries.")
+        D_state = D.view(d_state, -1, K)
+        D_state = D_state[:, 0, :]
+        norms = torch.sqrt((D_state * (P @ D_state)).sum(dim=0, keepdim=True)) + 1e-12
+        D_norm = D_state / norms
+        G = D_norm.T @ (P @ D_norm)
+    else:
+        D_norm = D / (D.norm(dim=0, keepdim=True) + 1e-12)
+        G = D_norm.T @ D_norm
 
     off = G - torch.eye(K, device=G.device, dtype=G.dtype)
     max_off = off.abs().max().item()
@@ -264,11 +280,22 @@ def forward_model(
     *,
     model_type: str,
     mode: str,
+    override_output_identity: bool,
 ) -> torch.Tensor:
     if model_type == "l2n":
+        if override_output_identity:
+            _, x_seq = model(u, return_state=True, mode=mode)
+            return x_seq[:, :-1, :]
         return model(u, return_state=False, mode=mode)
     if model_type == "lru":
-        y, _ = model(u, mode=mode)
+        y, states = model(u, mode=mode)
+        if override_output_identity:
+            return states[:, :-1, :]
+        return y
+    if model_type == "tv":
+        y, z_seq = model(u, mode=mode)
+        if override_output_identity:
+            return z_seq[:, :-1, :]
         return y
     if model_type == "tv":
         y, _ = model(u, mode=mode)
@@ -283,8 +310,11 @@ def extract_dense_matrices(
     u_ref: torch.Tensor | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     if model_type == "l2n":
-        A, B, _, _, _ = model.compute_dense_matrices()
-        return A, B
+        A, B, C, D, P = model.compute_dense_matrices()
+        if override_output_identity:
+            C = torch.eye(A.size(0), device=A.device, dtype=A.dtype)
+            D = torch.zeros(A.size(0), B.size(1), device=A.device, dtype=A.dtype)
+        return A, B, C, D, P
     if model_type == "lru":
         A, B, _, _ = model.ss_real_matrices(to_numpy=False)
         return A, B
@@ -322,6 +352,11 @@ def main() -> None:
     cfg = TrainDictConfig()
     if cfg.d_input != 1 or cfg.d_output != 1:
         raise ValueError("This script assumes scalar input/output (d_input=d_output=1).")
+    if cfg.override_output_identity_model and cfg.d_output != cfg.d_state:
+        raise ValueError(
+            "override_output_identity_model requires d_output == d_state so the "
+            "identity output is well-defined."
+        )
 
     torch.manual_seed(cfg.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -397,10 +432,46 @@ def main() -> None:
         A0, B0 = extract_dense_matrices(student, model_type=cfg.model, u_ref=u_ref)
         G0, max0, mean0, frob0 = compute_dictionary_stats(A0, B0, cfg.K)
 
+        if cfg.use_p_metric and P0 is not None:
+            _, max0_p, mean0_p, frob0_p = compute_dictionary_stats(
+                A0,
+                B0,
+                cfg.K,
+                P=P0,
+                use_p_metric=True,
+            )
+        else:
+            max0_p = mean0_p = frob0_p = None
+
+        if cfg.use_output_dictionary:
+            if cfg.override_output_identity or cfg.override_output_identity_model:
+                C0_use = torch.eye(A0.size(0), device=A0.device, dtype=A0.dtype)
+            else:
+                C0_use = C0
+            if C0_use is None:
+                raise ValueError("C must be available for output dictionary tracking.")
+            _, max0_out, mean0_out, frob0_out = compute_dictionary_stats(
+                A0,
+                B0,
+                cfg.K,
+                C=C0_use,
+                use_output=True,
+            )
+        else:
+            max0_out = mean0_out = frob0_out = None
+
     print("=== Orthogonality BEFORE training ===")
     print(f"max |off-diagonal| = {max0:.4e}")
     print(f"mean |off-diagonal| = {mean0:.4e}")
     print(f"frobenius ||G - I|| = {frob0:.4e}")
+    if frob0_p is not None:
+        print(f"max |off-diagonal| (P-metric) = {max0_p:.4e}")
+        print(f"mean |off-diagonal| (P-metric) = {mean0_p:.4e}")
+        print(f"frobenius ||G - I|| (P-metric) = {frob0_p:.4e}")
+    if frob0_out is not None:
+        print(f"max |off-diagonal| (output) = {max0_out:.4e}")
+        print(f"mean |off-diagonal| (output) = {mean0_out:.4e}")
+        print(f"frobenius ||G - I|| (output) = {frob0_out:.4e}")
 
     # ------------------------------------------------------------------
     # 4) Train the student LTI system on the benchmark data
@@ -418,7 +489,13 @@ def main() -> None:
         running = 0.0
         for u_batch, y_batch in loader:
             optimizer.zero_grad()
-            y_pred = forward_model(student, u_batch, model_type=cfg.model, mode=cfg.mode)
+            y_pred = forward_model(
+                student,
+                u_batch,
+                model_type=cfg.model,
+                mode=cfg.mode,
+                override_output_identity=cfg.override_output_identity_model,
+            )
             loss = loss_fn(y_pred, y_batch)
             loss.backward()
             optimizer.step()
@@ -441,7 +518,13 @@ def main() -> None:
     # Quick test MSE (ignoring warm-up window if provided)
     student.eval()
     with torch.no_grad():
-        y_test_pred = forward_model(student, u_test, model_type=cfg.model, mode=cfg.mode)
+        y_test_pred = forward_model(
+            student,
+            u_test,
+            model_type=cfg.model,
+            mode=cfg.mode,
+            override_output_identity=cfg.override_output_identity_model,
+        )
         if n_init > 0:
             y_test_eval = y_test[:, n_init:, :]
             y_pred_eval = y_test_pred[:, n_init:, :]
@@ -457,11 +540,46 @@ def main() -> None:
     with torch.no_grad():
         A1, B1 = extract_dense_matrices(student, model_type=cfg.model, u_ref=u_ref)
         G1, max1, mean1, frob1 = compute_dictionary_stats(A1, B1, cfg.K)
+        if cfg.use_p_metric and P1 is not None:
+            _, max1_p, mean1_p, frob1_p = compute_dictionary_stats(
+                A1,
+                B1,
+                cfg.K,
+                P=P1,
+                use_p_metric=True,
+            )
+        else:
+            max1_p = mean1_p = frob1_p = None
+
+        if cfg.use_output_dictionary:
+            if cfg.override_output_identity or cfg.override_output_identity_model:
+                C1_use = torch.eye(A1.size(0), device=A1.device, dtype=A1.dtype)
+            else:
+                C1_use = C1
+            if C1_use is None:
+                raise ValueError("C must be available for output dictionary tracking.")
+            _, max1_out, mean1_out, frob1_out = compute_dictionary_stats(
+                A1,
+                B1,
+                cfg.K,
+                C=C1_use,
+                use_output=True,
+            )
+        else:
+            max1_out = mean1_out = frob1_out = None
 
     print("\n=== Orthogonality AFTER training ===")
     print(f"max |off-diagonal| = {max1:.4e}")
     print(f"mean |off-diagonal| = {mean1:.4e}")
     print(f"frobenius ||G - I|| = {frob1:.4e}")
+    if frob1_p is not None:
+        print(f"max |off-diagonal| (P-metric) = {max1_p:.4e}")
+        print(f"mean |off-diagonal| (P-metric) = {mean1_p:.4e}")
+        print(f"frobenius ||G - I|| (P-metric) = {frob1_p:.4e}")
+    if frob1_out is not None:
+        print(f"max |off-diagonal| (output) = {max1_out:.4e}")
+        print(f"mean |off-diagonal| (output) = {mean1_out:.4e}")
+        print(f"frobenius ||G - I|| (output) = {frob1_out:.4e}")
 
     # ------------------------------------------------------------------
     # 6) Visualize Gram matrices (before/after)
