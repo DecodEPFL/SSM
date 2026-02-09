@@ -89,6 +89,9 @@ The SSM model is implemented by the class DeepSSM, which takes a number of input
 For a complete, runnable training example on a nonlinear benchmark dataset, see:
 `Test_files/Tutorial_DeepSSM.py`
 
+For a minimal Long Range Arena (LRA) benchmark script (ListOps) using `DeepSSM`, see:
+`scripts/run_lra_listops.py` (requires `pip install datasets`).
+
 ### Tensor shapes and forward outputs
 
 - Input tensor shape is `u: (B, L, d_input)` where:
