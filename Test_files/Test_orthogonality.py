@@ -23,6 +23,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
+
 import matplotlib.pyplot as plt
 
 # --- optional nonlinear_benchmarks ---
@@ -38,6 +39,21 @@ except Exception as e:
     Block2x2DenseL2SSM = None  # type: ignore
     _IMPORT_ERR = e
 
+
+def _power_iteration_sigma(mat: torch.Tensor, iters: int) -> torch.Tensor:
+    # Simple power iteration to estimate spectral norm (largest singular value).
+    v = torch.randn(mat.shape[1], device=mat.device, dtype=mat.dtype)
+    v = v / (v.norm() + 1e-12)
+    iters = max(1, int(iters))
+    for _ in range(iters):
+        u = mat @ v
+        v = mat.T @ u
+        v_norm = v.norm()
+        if v_norm < 1e-12:
+            break
+        v = v / v_norm
+    u = mat @ v
+    return u.norm()
 
 # ======================================================================================
 # Config
@@ -62,7 +78,7 @@ class Cfg:
     rho_init: float = 0.99
     full_phase: bool = True          # if True: theta ~ U(-pi, pi)
     max_phase: float = 0.25          # if full_phase=False: theta in [-max_phase, +max_phase]
-    offdiag_scale: float = 0.01
+    offdiag_scale: float = 0.05
 
     # training on windows
     win_len: int = 2048
@@ -292,7 +308,11 @@ def build_model(cfg: Cfg, device: torch.device) -> nn.Module:
     if cfg.detach_sigma_in_spectral_norm and hasattr(m, "_spectral_normalize"):
         import types
         def _spectral_normalize_detached(self, M: torch.Tensor) -> torch.Tensor:
-            sigma = torch.linalg.matrix_norm(M, ord=2).clamp(min=1e-6)
+            try:
+                sigma = torch.linalg.matrix_norm(M, ord=2)
+            except RuntimeError:
+                # Fallback when SVD fails to converge (ill-conditioned / repeated values).
+                sigma = _power_iteration_sigma(M, 4)
             scale = sigma.detach().clamp(min=1.0)
             return M / (scale + 0.002)
         m._spectral_normalize = types.MethodType(_spectral_normalize_detached, m)
