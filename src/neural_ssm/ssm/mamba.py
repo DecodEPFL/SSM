@@ -4,6 +4,10 @@ from typing import Optional, Literal, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from .state_utils import (
+    resolve_runtime_state as _resolve_runtime_state,
+    reset_runtime_state as _reset_runtime_state,
+)
 
 
 # ----------------------------
@@ -156,6 +160,7 @@ class RobustMambaDiagSSM(nn.Module):
         self.D = int(d_model)
         self.N = int(d_state if d_state is not None else d_model)
         self.D_out = int(d_out if d_out is not None else d_model)
+        self.state: Optional[torch.Tensor] = None
 
         # assert self.N == self.D, (
         #     "To keep the clean overall bound with proj_bound=1 and avoid extra bookkeeping, "
@@ -285,6 +290,8 @@ class RobustMambaDiagSSM(nn.Module):
             mode: Literal["scan", "loop"] = "scan",
             return_state: bool = True,
             return_last: bool = False,
+            reset_state: bool = True,
+            detach_state: bool = True,
     ):
         """
         Returns:
@@ -297,12 +304,15 @@ class RobustMambaDiagSSM(nn.Module):
         assert D == self.D
         device, dtype = u.device, u.dtype
 
-        # init z0
-        if state is None:
-            z0 = torch.zeros(B, self.N, device=device, dtype=dtype)
-        else:
-            z0 = state.unsqueeze(0).expand(B, -1) if state.dim() == 1 else state
-            z0 = z0.to(device=device, dtype=dtype)
+        z0 = _resolve_runtime_state(
+            explicit_state=state,
+            internal_state=self.state,
+            reset_state=reset_state,
+            batch_size=B,
+            n_state=self.N,
+            device=device,
+            dtype=dtype,
+        )
 
         a_bt, b_bt, c_bt, u_scaled_bt = self._compute_params(u)  # all (B,T,N)
         bu_bt = b_bt * u_scaled_bt  # (B,T,N)
@@ -348,6 +358,7 @@ class RobustMambaDiagSSM(nn.Module):
 
         # bounded output projection
         y = self.out_proj(y_hat)  # (B,T,D_out)
+        self.state = z_last.detach() if detach_state else z_last
 
         if return_state and return_last:
             return y, z_seq, z_last
@@ -357,3 +368,5 @@ class RobustMambaDiagSSM(nn.Module):
             return y, z_last
         return y
 
+    def reset(self):
+        self.state = _reset_runtime_state(self.state)
