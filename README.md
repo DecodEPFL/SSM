@@ -104,10 +104,16 @@ the Hugging Face dataset `lra-benchmarks` with config `listops`.
   - `y`: the model output sequence 
   - `state`: a list of recurrent states (one tensor per SSL block), useful for stateful calls.
 
-State initialization in `forward`:
+State handling in `forward` (DeepSSM and recurrent cores):
 
-- You can pass `state=` as a list with one initial state tensor for each SSL block.
-- If `state` is not provided (`state=None`), internal recurrent states are initialized to zero.
+- `state`: optional explicit initial state (or state list for `DeepSSM`).
+- `reset_state`: defaults to `True`.
+  - `True`: start from zero state for this call.
+  - `False`: reuse internal state if `state` is not provided.
+- `detach_state`: defaults to `True`.
+  - `True`: internal state is detached at the end of the call (no cross-call BPTT).
+  - `False`: internal state keeps gradient history (for true BPTT across calls).
+- `reset()`: manually resets internal state to zero.
 
 ### How to create and call a Deep SSM 
 
@@ -129,11 +135,17 @@ model = DeepSSM(
 )
 
 u = torch.randn(8, 200, 1)               # (B, L, d_input)
-y, state = model(u, mode="scan")         # zero-initialized internal states
+y, state = model(u, mode="scan")         # reset_state=True by default
 
 # Stateful call: pass one state per SSL block
 u_next = torch.randn(8, 200, 1)
-y_next, state = model(u_next, state=state, mode="scan")
+y_next, state = model(u_next, state=state, mode="scan", reset_state=False)
+
+# Stateful call without passing explicit state (reuse internal state)
+y_stream, state = model(u_next, mode="scan", reset_state=False)
+
+# True BPTT across calls: keep state in graph
+y_bptt, state = model(u_next, mode="scan", reset_state=False, detach_state=False)
 ```
 
 ## Top-level API

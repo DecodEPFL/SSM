@@ -6,6 +6,10 @@ from typing import TypedDict, Dict
 from torch import Tensor
 from dataclasses import fields
 from .scan_utils import *
+from .state_utils import (
+    resolve_runtime_state as _resolve_runtime_state,
+    reset_runtime_state as _reset_runtime_state,
+)
 from ..static_layers.generic_layers import *
 from ..static_layers.lipschitz_mlps import *
 from .experimental import ExpertSelectiveTimeVaryingSSM, Block2x2SelectiveBCDExpertsL2SSM
@@ -23,32 +27,6 @@ def _normalize_to_3d(x: torch.Tensor) -> torch.Tensor:
     if x.dim() == 3:
         return x
     raise ValueError(f"Invalid input dimensions {x.dim()}, expected 1, 2, or 3.")
-
-
-def _init_or_cast_state(
-    state: Optional[torch.Tensor],
-    batch_size: int,
-    n_state: int,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    if state is None:
-        return torch.zeros(batch_size, n_state, device=device, dtype=dtype)
-
-    # accept (N,) or (B,N)
-    if state.dim() == 1:
-        state = state.unsqueeze(0).expand(batch_size, -1)
-    elif state.dim() == 2:
-        if state.size(0) == 1 and batch_size > 1:
-            state = state.expand(batch_size, -1)
-    else:
-        raise ValueError("state must have shape (N,) or (B,N)")
-
-    if state.shape != (batch_size, n_state):
-        raise ValueError(f"state has shape {tuple(state.shape)}, expected {(batch_size, n_state)}")
-
-    return state.to(device=device, dtype=dtype)
-
 
 
 def _scan_diag_linear(lambdas: torch.Tensor, Bu: torch.Tensor, x0: torch.Tensor) -> torch.Tensor:
@@ -249,14 +227,14 @@ class LRU(nn.Module):
             mats = [m.detach().cpu().numpy() for m in mats]
         return tuple(mats)
 
-    def forward_loop(self, input: torch.Tensor, state: torch.Tensor):
+    def forward_loop(self, input: torch.Tensor, state: torch.Tensor, detach_state: bool = True):
         self.set_param()
         output, states = lru_forward_loop(input, state, self.lambdas, self.B, self.C, self.D)
-        self.state = states[:, -1].detach()
+        self.state = states[:, -1].detach() if detach_state else states[:, -1]
         return output, states
 
     @torch.compiler.disable
-    def forward_scan(self, input: torch.Tensor, state: Optional[torch.Tensor] = None):
+    def forward_scan(self, input: torch.Tensor, state: Optional[torch.Tensor] = None, detach_state: bool = True):
         lambdas, B, C, D = self.set_param()
 
         x0 = state.to(B.dtype)
@@ -264,21 +242,36 @@ class LRU(nn.Module):
         # compute state trajectory [x_0, ..., x_L]
         states = _scan_diag_linear(lambdas, Bu, x0)  # (B, L+1, N)
 
-        self.state = states[:, -1, :].detach()
+        self.state = states[:, -1, :].detach() if detach_state else states[:, -1, :]
         output = (states[:, :-1, :] @ C.mT).real + input @ D.T
         return output, states
 
-    def forward(self, input: torch.Tensor, gamma: Optional[float] = None, state: Optional[torch.Tensor] = None,
-                mode: str = "loop"):
-        self.state = _init_or_cast_state(state, input.shape[0], self.state_features, input.device, self.B.dtype)
+    def forward(
+            self,
+            input: torch.Tensor,
+            gamma: Optional[float] = None,
+            state: Optional[torch.Tensor] = None,
+            mode: str = "loop",
+            reset_state: bool = True,
+            detach_state: bool = True,
+    ):
+        self.state = _resolve_runtime_state(
+            explicit_state=state,
+            internal_state=self.state,
+            reset_state=reset_state,
+            batch_size=input.shape[0],
+            n_state=self.state_features,
+            device=input.device,
+            dtype=self.B.dtype,
+        )
         if mode == "scan":
-            return self.forward_scan(input, self.state)
+            return self.forward_scan(input, self.state, detach_state=detach_state)
         if mode in ("loop", "loop_efficient"):
-            return self.forward_loop(input, self.state)
+            return self.forward_loop(input, self.state, detach_state=detach_state)
         raise ValueError(f"Unknown mode: {mode}. Expected 'scan', 'loop', or 'loop_efficient'.")
 
     def reset(self):
-        self.state = None
+        self.state = _reset_runtime_state(self.state)
 
 
 # python
@@ -382,11 +375,26 @@ class L2RU(nn.Module):
         self.A, self.B, self.D = A, B, D
         return A, B, C, D
 
-    def forward(self, input: torch.Tensor, state: Optional[torch.Tensor] = None, set_param: bool = True,
-                mode: str = "scan"):
+    def forward(
+            self,
+            input: torch.Tensor,
+            state: Optional[torch.Tensor] = None,
+            set_param: bool = True,
+            mode: str = "scan",
+            reset_state: bool = True,
+            detach_state: bool = True,
+    ):
         input = _normalize_to_3d(input)
         # real-valued state for L2RU
-        self.state = _init_or_cast_state(state, input.shape[0], self.state_features, input.device, input.dtype)
+        self.state = _resolve_runtime_state(
+            explicit_state=state,
+            internal_state=self.state,
+            reset_state=reset_state,
+            batch_size=input.shape[0],
+            n_state=self.state_features,
+            device=input.device,
+            dtype=input.dtype,
+        )
 
         x0 = self.state
         if set_param:
@@ -395,18 +403,18 @@ class L2RU(nn.Module):
         if mode == "scan":
             u = input.permute(1, 0, 2)  # (L,B,H) == (T,B,D)
             states = compute_linear_recurrence_parallel_scan(self.A, self.B, u, x0).transpose(0, 1)
-            self.state = states[:, -1, :].detach()
+            self.state = states[:, -1, :].detach() if detach_state else states[:, -1, :]
             outputs = states[:, :-1, :] @ self.C.transpose(-1, -2) + input @ self.D.transpose(-1, -2)
             return outputs, states
         elif mode in ("loop", "loop_efficient"):
             output, states = lru_forward_loop(input, self.state, self.A, self.B, self.C, self.D)
-            self.state = states[:, -1].detach()
+            self.state = states[:, -1].detach() if detach_state else states[:, -1]
             return output, states
         else:
             raise ValueError(f"Unknown mode: {mode}. Expected 'scan', 'loop', or 'loop_efficient'.")
 
     def reset(self):
-        self.state = None
+        self.state = _reset_runtime_state(self.state)
 
 
 # python
@@ -517,16 +525,28 @@ class lruz(nn.Module):
         self.A, self.B, self.C, self.D = A, B, C, D
         return A, B, C, D
 
-    def forward_loop(self, input: torch.Tensor, state: Optional[torch.Tensor] = None, set_param: bool = True):
+    def forward_loop(
+            self,
+            input: torch.Tensor,
+            state: Optional[torch.Tensor] = None,
+            set_param: bool = True,
+            detach_state: bool = True,
+    ):
         if set_param:
             self.set_param()
         lambdas = torch.diagonal(self.A)
         output, states = lru_forward_loop(input, state, lambdas, self.B, self.C, self.D)
-        self.state = states[:, -1].detach()
+        self.state = states[:, -1].detach() if detach_state else states[:, -1]
         return output, states
 
     @torch.compiler.disable
-    def forward_scan(self, input: torch.Tensor, state: Optional[torch.Tensor] = None, set_param: bool = True):
+    def forward_scan(
+            self,
+            input: torch.Tensor,
+            state: Optional[torch.Tensor] = None,
+            set_param: bool = True,
+            detach_state: bool = True,
+    ):
         BATCH, SEQ, _ = input.shape
         A, B, C, D = self.set_param() if set_param else (self.A, self.B, self.C, self.D)
         lambdas = torch.diagonal(A)
@@ -536,24 +556,40 @@ class lruz(nn.Module):
         # compute state trajectory [x_0, ..., x_L]
         states = _scan_diag_linear(lambdas, Bu, x0)  # (B, L+1, N)
 
-        self.state = states[:, -1, :].detach()
+        self.state = states[:, -1, :].detach() if detach_state else states[:, -1, :]
         output = (states[:, :-1, :] @ C.mT).real + input @ D.T
         return output, states
 
-    def forward(self, input: torch.Tensor, gamma=None, state: Optional[torch.Tensor] = None, set_param: bool = True,
-                mode: str = "scan"):
+    def forward(
+            self,
+            input: torch.Tensor,
+            gamma=None,
+            state: Optional[torch.Tensor] = None,
+            set_param: bool = True,
+            mode: str = "scan",
+            reset_state: bool = True,
+            detach_state: bool = True,
+    ):
         input = _normalize_to_3d(input)
         # complex-valued state for ZAK
-        self.state = _init_or_cast_state(state, input.shape[0], self.state_features, input.device, torch.complex64)
+        self.state = _resolve_runtime_state(
+            explicit_state=state,
+            internal_state=self.state,
+            reset_state=reset_state,
+            batch_size=input.shape[0],
+            n_state=self.state_features,
+            device=input.device,
+            dtype=torch.complex64,
+        )
 
         if mode == "scan":
-            return self.forward_scan(input, self.state, set_param)
+            return self.forward_scan(input, self.state, set_param, detach_state=detach_state)
         if mode in ("loop", "loop_efficient"):
-            return self.forward_loop(input, self.state, set_param)
+            return self.forward_loop(input, self.state, set_param, detach_state=detach_state)
         raise ValueError(f"Unknown mode: {mode}. Expected 'scan', 'loop', or 'loop_efficient'.")
 
     def reset(self):
-        self.state = None
+        self.state = _reset_runtime_state(self.state)
 
 
 import torch
@@ -575,6 +611,7 @@ class L2BoundedLTICell(nn.Module):
         self.d_state = d_state
         self.d_input = d_input
         self.d_output = d_output
+        self.state: Optional[torch.Tensor] = None
 
         # S: energy transform (invertible with prob. 1)
         self.S = nn.Parameter(0.1 * torch.randn(d_state, d_state))
@@ -774,16 +811,26 @@ class L2BoundedLTICell(nn.Module):
             u: torch.Tensor,
             state: torch.Tensor | None = None,
             *,
-            mode: str = None
+            mode: str = None,
+            reset_state: bool = True,
+            detach_state: bool = True,
     ):
-
-        # Prepare state
-        if state is None:
-            state = torch.zeros(u.shape[0], self.d_state, device=u.device, dtype=u.dtype)
+        u = _normalize_to_3d(u)
+        state = _resolve_runtime_state(
+            explicit_state=state,
+            internal_state=self.state,
+            reset_state=reset_state,
+            batch_size=u.shape[0],
+            n_state=self.d_state,
+            device=u.device,
+            dtype=u.dtype,
+        )
 
         A, B, C, D, _ = self.compute_ssm_matrices()
         output, states = lru_forward_loop(u, state, A, B, C, D)
+        self.state = states[:, -1, :].detach() if detach_state else states[:, -1, :]
         return output, states
+
     def forward_original(
             self,
             u: torch.Tensor,
@@ -791,7 +838,9 @@ class L2BoundedLTICell(nn.Module):
             *,
             time_first: bool = False,
             return_state: bool = True,
-            mode: str = None
+            mode: str = None,
+            reset_state: bool = True,
+            detach_state: bool = True,
     ):
         """
         Sequential state-space recurrence (loop version), similar to your L2RU.
@@ -833,15 +882,15 @@ class L2BoundedLTICell(nn.Module):
         # Build A,B,C,D once per sequence (important for speed)
         A, Bm, C, D, _ = self.compute_ssm_matrices()
 
-        # Prepare state
-        if state is None:
-            x = u.new_zeros(B_sz, self.d_state)
-        else:
-            if state.dim() == 1:
-                x = state.unsqueeze(0).expand(B_sz, -1)
-            else:
-                x = state
-                assert x.shape == (B_sz, self.d_state)
+        x = _resolve_runtime_state(
+            explicit_state=state,
+            internal_state=self.state,
+            reset_state=reset_state,
+            batch_size=B_sz,
+            n_state=self.d_state,
+            device=u.device,
+            dtype=u.dtype,
+        )
 
         # Precompute transposes for efficient GEMV
         At = A.T
@@ -864,6 +913,7 @@ class L2BoundedLTICell(nn.Module):
             x = x @ At + u_t @ Bt  # (B, d_state)
 
         x_last = x
+        self.state = x_last.detach() if detach_state else x_last
 
         if time_first:
             y_seq = y_seq.transpose(0, 1)
@@ -872,6 +922,9 @@ class L2BoundedLTICell(nn.Module):
         if return_state:
             return y_seq, x_seq
         return y_seq, x_last
+
+    def reset(self):
+        self.state = _reset_runtime_state(self.state)
 
 
 class Block2x2DenseL2SSM(nn.Module):
@@ -940,6 +993,7 @@ class Block2x2DenseL2SSM(nn.Module):
         self.eps_radius = eps_radius
         self.power_iters = power_iters
         self.exact_norm = exact_norm
+        self.state: Optional[torch.Tensor] = None
 
         n_pairs = d_state // 2
 
@@ -1256,6 +1310,8 @@ class Block2x2DenseL2SSM(nn.Module):
             return_state: bool = True,  # if True return x_seq (x0..x_{T+1})
             mode: str = "scan",  # "loop" or "scan"
             return_last: bool = False,  # if True return x_last (= x_{T+1})
+            reset_state: bool = True,
+            detach_state: bool = True,
     ):
         """
         Input:
@@ -1283,11 +1339,15 @@ class Block2x2DenseL2SSM(nn.Module):
         A_z, B_z, C_z, D_z, _ = self.compute_z_matrices()
 
         # ---- initial x0 in x-basis ----
-        if state is None:
-            x0 = u_bt.new_zeros(B_sz, dx)
-        else:
-            x0 = state.unsqueeze(0).expand(B_sz, -1) if state.dim() == 1 else state
-            x0 = x0.to(device=u_bt.device, dtype=u_bt.dtype)
+        x0 = _resolve_runtime_state(
+            explicit_state=state,
+            internal_state=self.state,
+            reset_state=reset_state,
+            batch_size=B_sz,
+            n_state=dx,
+            device=u_bt.device,
+            dtype=u_bt.dtype,
+        )
 
         # S used for x<->z
         S = self.S.to(device=u_bt.device, dtype=u_bt.dtype)
@@ -1359,6 +1419,8 @@ class Block2x2DenseL2SSM(nn.Module):
                 x_seq = None
                 x_last = torch.linalg.solve(S.T, z_last.T).T  # (B,dx)
 
+        self.state = x_last.detach() if detach_state else x_last
+
         # ---- restore time_first ----
         if time_first:
             y_seq = y_seq.transpose(0, 1).contiguous()  # (L,B,dy)
@@ -1373,6 +1435,9 @@ class Block2x2DenseL2SSM(nn.Module):
         if return_last:
             return y_seq, x_last
         return y_seq
+
+    def reset(self):
+        self.state = _reset_runtime_state(self.state)
 
 """ SSM models ----------------------------------------- """
 
@@ -1496,10 +1561,23 @@ class SSL(nn.Module):
 
         self.dropout = nn.Dropout(config.dropout)
 
-    def forward(self, x3d: torch.Tensor, state: Optional[torch.Tensor] = None, mode: str = "loop"):
+    def forward(
+            self,
+            x3d: torch.Tensor,
+            state: Optional[torch.Tensor] = None,
+            mode: str = "loop",
+            reset_state: bool = True,
+            detach_state: bool = True,
+    ):
         # assume x is already [B,T,D]
         #xn = self.ln(x3d)
-        z, st = self.lru(x3d, state=state, mode=mode)
+        z, st = self.lru(
+            x3d,
+            state=state,
+            mode=mode,
+            reset_state=reset_state,
+            detach_state=detach_state,
+        )
         z = self.ff(z)
         z = self.dropout(z)
         return x3d + z, st
@@ -1569,8 +1647,18 @@ class DeepSSM(nn.Module):
             self.ff_has_lip = hasattr(self.blocks[0].ff, "lip")
 
 
-    def forward(self, u: torch.Tensor, state: Optional[List[torch.Tensor]] = None, gamma=None, mode: str = "scan"):
+    def forward(
+            self,
+            u: torch.Tensor,
+            state: Optional[List[torch.Tensor]] = None,
+            gamma=None,
+            mode: str = "scan",
+            reset_state: bool = True,
+            detach_state: bool = True,
+    ):
         u3d = _normalize_to_3d(u)
+        if reset_state:
+            self.reset()
 
         if state is None:
             layer_states: List[Optional[torch.Tensor]] = [None] * len(self.blocks)
@@ -1585,7 +1673,13 @@ class DeepSSM(nn.Module):
 
         # Blocks
         for i, block in enumerate(self.blocks):
-            x, st = block(x, state=layer_states[i], mode=mode)
+            x, st = block(
+                x,
+                state=layer_states[i],
+                mode=mode,
+                reset_state=reset_state,
+                detach_state=detach_state,
+            )
             layer_states[i] = st[:, -1, :]
 
         # Decode
@@ -1637,9 +1731,25 @@ class PureLRUR(nn.Module):
         else:
             raise ValueError("Unsupported param")
 
-    def forward(self, x: torch.Tensor, state: Optional[torch.Tensor] = None, mode: str = "scan"):
-        y, st = self.lru(_normalize_to_3d(x), state=state, mode=mode)
+    def forward(
+            self,
+            x: torch.Tensor,
+            state: Optional[torch.Tensor] = None,
+            mode: str = "scan",
+            reset_state: bool = True,
+            detach_state: bool = True,
+    ):
+        y, st = self.lru(
+            _normalize_to_3d(x),
+            state=state,
+            mode=mode,
+            reset_state=reset_state,
+            detach_state=detach_state,
+        )
         return y, st
+
+    def reset(self):
+        self.lru.reset()
 
 
 
@@ -1694,6 +1804,7 @@ class SimpleRNN(nn.Module):
 
         # Project RNN outputs to d_output
         self.out_proj = nn.Linear(self.d_hidden * self.num_directions, self.d_output, bias=bias)
+        self.state: Optional[torch.Tensor] = None
 
     def _format_h0(self, h0: Optional[torch.Tensor], B: int, device, dtype) -> torch.Tensor:
         """
@@ -1739,6 +1850,8 @@ class SimpleRNN(nn.Module):
         *,
         return_state: bool = False,
         return_last: bool = False,
+        reset_state: bool = True,
+        detach_state: bool = True,
     ) -> Union[
         Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
         Tuple[torch.Tensor, torch.Tensor],
@@ -1750,10 +1863,14 @@ class SimpleRNN(nn.Module):
         if D != self.d_input:
             raise ValueError(f"Expected input dim {self.d_input}, got {D}")
 
-        h0 = self._format_h0(state, B, u3d.device, u3d.dtype)
+        source_state = state if state is not None else self.state
+        if reset_state:
+            source_state = None
+        h0 = self._format_h0(source_state, B, u3d.device, u3d.dtype)
 
         # Run RNN
         out, hT = self.rnn(u3d, h0)  # out: (B,T,H*num_dir), hT: (L,B,H)
+        self.state = hT.detach() if detach_state else hT
 
         # Project to output dim
         y = self.out_proj(out)       # (B,T,d_output)
@@ -1788,3 +1905,6 @@ class SimpleRNN(nn.Module):
         if return_last:
             return y, h_last
         return y, a
+
+    def reset(self):
+        self.state = _reset_runtime_state(self.state)
