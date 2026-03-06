@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import math
-from typing import TypedDict, Dict
+from typing import TypedDict, Dict, Optional, List, Union, Tuple
 from torch import Tensor
 from dataclasses import fields
 from .scan_utils import *
@@ -15,6 +15,10 @@ from ..static_layers.lipschitz_mlps import *
 from .experimental import ExpertSelectiveTimeVaryingSSM, Block2x2SelectiveBCDExpertsL2SSM
 from .mamba import  RobustMambaDiagSSM
 
+# Margin applied when normalizing K to a strict contraction (||K||_2 < 1).
+# Both L2BoundedLTICell and Block2x2DenseL2SSM divide by (sigma + _CONTRACTION_EPS)
+# instead of plain sigma, so the resulting spectral norm is strictly below 1.
+_CONTRACTION_EPS: float = 0.002
 
 # --------- Small utilities (DRY helpers) ---------
 
@@ -363,8 +367,14 @@ class L2RU(nn.Module):
         R = 0.5 * (R + R.T)
 
         negR = -R + 1e-6 * ID
-        CR = torch.linalg.cholesky(negR)
-        CRH = torch.linalg.cholesky(negR + H11)
+        try:
+            CR = torch.linalg.cholesky(negR)
+            CRH = torch.linalg.cholesky(negR + H11)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "L2RU.set_param: Cholesky decomposition failed — the LMI constraint may be "
+                "violated. Try reducing gamma or allowing alpha to adjust further."
+            ) from exc
 
         A = torch.linalg.inv(CRH).T @ Qm @ CR.T
         Xsolve = torch.linalg.solve(H12.T, V.T)  # (H12^T) X = V^T
@@ -571,7 +581,8 @@ class lruz(nn.Module):
             detach_state: bool = True,
     ):
         input = _normalize_to_3d(input)
-        # complex-valued state for ZAK
+        # complex-valued state for ZAK — match precision of the input
+        _cplx_dtype = torch.complex64 if input.dtype in (torch.float16, torch.float32) else torch.complex128
         self.state = _resolve_runtime_state(
             explicit_state=state,
             internal_state=self.state,
@@ -579,7 +590,7 @@ class lruz(nn.Module):
             batch_size=input.shape[0],
             n_state=self.state_features,
             device=input.device,
-            dtype=torch.complex64,
+            dtype=_cplx_dtype,
         )
 
         if mode == "scan":
@@ -590,10 +601,6 @@ class lruz(nn.Module):
 
     def reset(self):
         self.state = _reset_runtime_state(self.state)
-
-
-import torch
-from torch import nn
 
 
 class L2BoundedLTICell(nn.Module):
@@ -640,7 +647,7 @@ class L2BoundedLTICell(nn.Module):
         # exact largest singular value
         sigma = torch.linalg.matrix_norm(K_raw, ord=2)
         sigma = sigma.clamp(min=1e-5)
-        K = K_raw / (sigma + 0.002)
+        K = K_raw / (sigma + _CONTRACTION_EPS)
         return K
 
     # ---- map (S,K) -> (A,B,C,D,P) correctly ----
@@ -703,8 +710,7 @@ class L2BoundedLTICell(nn.Module):
         M = torch.cat([top, bottom], dim=0)
         return M
 
-        # ---------- initialization with eig(A) ≈ eigvals ----------
-
+    # ---------- initialization with eig(A) ≈ eigvals ----------
     @torch.no_grad()
     def init_orthogonal_spectrum(
             self,
@@ -1059,12 +1065,18 @@ class Block2x2DenseL2SSM(nn.Module):
         Scale M so that ||M||_2 <= 1 (or ≈ 1 if exact_norm=True).
         """
         def _power_iteration_sigma(mat: torch.Tensor, iters: int) -> torch.Tensor:
-            # Simple power iteration to estimate spectral norm (largest singular value).
+            # Power iteration to estimate the spectral norm (largest singular value).
+            # Both u and v are normalized at each step so estimates remain accurate
+            # for any number of iterations.
             v = torch.randn(mat.shape[1], device=mat.device, dtype=mat.dtype)
             v = v / (v.norm() + 1e-12)
             iters = max(1, int(iters))
             for _ in range(iters):
                 u = mat @ v
+                u_norm = u.norm()
+                if u_norm < 1e-12:
+                    break
+                u = u / u_norm
                 v = mat.T @ u
                 v_norm = v.norm()
                 if v_norm < 1e-12:
@@ -1083,7 +1095,7 @@ class Block2x2DenseL2SSM(nn.Module):
             sigma = _power_iteration_sigma(M, self.power_iters)
 
         sigma = sigma.clamp(min=1e-5)
-        M = M / (sigma + 0.002)
+        M = M / (sigma + _CONTRACTION_EPS)
         return M
 
     def _build_K_blocks(self):
@@ -1209,7 +1221,7 @@ class Block2x2DenseL2SSM(nn.Module):
             same_phase_across_blocks: bool = False,
             random_phase: bool = True,  # if False -> all θ_i = phase_center
             # off-diagonal scale
-            offdiag_scale: float = .005,
+            offdiag_scale: float = .05,
     ):
         """
         Initialize such that A_z = K11 has eigenvalues
@@ -1311,7 +1323,7 @@ class Block2x2DenseL2SSM(nn.Module):
             mode: str = "scan",  # "loop" or "scan"
             return_last: bool = False,  # if True return x_last (= x_{T+1})
             reset_state: bool = True,
-            detach_state: bool = True,
+            detach_state: bool = False,
     ):
         """
         Input:
@@ -1459,9 +1471,9 @@ class SSMConfig:
     dim_amp: int = 4  # controls the hidden layer's dimension of the MLP
     d_hidden: int = 4  # controls the hidden layer's dimension of the non-linear layer
     nl_layers: int = 2 # number of hidden layers of the non-linear layers (static nonlinearities)
-    param: str = None  # pick the parametrization you want to use for the LRU. Default = LRU, other options are L2RU
+    param: Optional[str] = None  # pick the parametrization you want to use for the LRU. Default = LRU, other options are L2RU
     # and ZAK
-    gamma: float = 1  # set the overall l2 gain value for the SSM. If set to None, the l2 gain will be trainable and
+    gamma: Optional[float] = 1.0  # set the overall l2 gain value for the SSM. If set to None, the l2 gain will be trainable and
     # not specified.
     train_gamma: bool = True # choose weather the l2 gain of the dynamical systems should be trainable or fixed.
     init: str = 'eye'  # controls the initialization of the parameters when the L2RU param is chosen.
@@ -1470,6 +1482,7 @@ class SSMConfig:
     max_phase_b: float = 0.04          # small spread
     phase_center: float = 0        # center angle
     random_phase: bool = True
+    offdiag_scale: float = 0.05  # init std for K12/K21/K22 in l2n (old default was 0.005)
 
     # Parallel scan must be selected in the forward call of the SSM.
 
@@ -1488,8 +1501,6 @@ class SSL(nn.Module):
     y = FF(LRU(u))+u """
     def __init__(self, config: SSMConfig):
         super().__init__()
-        self.ln = nn.LayerNorm(config.d_model, bias=config.bias)
-
         # --- SSM selection ---
         if config.param is None or config.param == "lru":
             self.lru = LRU(
@@ -1512,10 +1523,19 @@ class SSL(nn.Module):
                 max_phase=config.max_phase,
             )
         elif config.param == "l2n":
+            # Initialise per-block gamma so that gamma_prod = prod(1+gamma_i)^n_layers
+            # starts close to config.gamma rather than 2^n_layers.
+            # With gamma_t^(1/n) - 1 per block: prod(1 + gamma_i) ≈ gamma_t at init,
+            # making scale = gamma_t / (enc_norm * dec_norm * gamma_prod) ≈ O(1).
+            if config.gamma is not None and config.n_layers > 0:
+                init_block_gamma = max(float(config.gamma) ** (1.0 / config.n_layers) - 1.0, 0.01)
+            else:
+                init_block_gamma = 1.0
             self.lru = Block2x2DenseL2SSM(
                 d_state=config.d_state,
                 d_input=config.d_model,
                 d_output=config.d_model,
+                gamma=init_block_gamma,
                 train_gamma=config.train_gamma,
             )
             self.lru.init_on_circle(
@@ -1523,6 +1543,7 @@ class SSL(nn.Module):
                 max_phase=config.max_phase_b,
                 phase_center=config.phase_center,
                 random_phase=config.random_phase,
+                offdiag_scale=config.offdiag_scale,
             )
         elif config.param == "l2nt":
             self.lru = L2BoundedLTICell(
@@ -1547,6 +1568,7 @@ class SSL(nn.Module):
         l_config.d_output = config.d_model
         l_config.d_hidden = config.d_hidden
         l_config.n_layers = config.nl_layers
+        l_config.lip = config.scale
 
         ff_layers = {
             "GLU": GLU,
@@ -1567,10 +1589,8 @@ class SSL(nn.Module):
             state: Optional[torch.Tensor] = None,
             mode: str = "loop",
             reset_state: bool = True,
-            detach_state: bool = True,
+            detach_state: bool = False,
     ):
-        # assume x is already [B,T,D]
-        #xn = self.ln(x3d)
         z, st = self.lru(
             x3d,
             state=state,
@@ -1631,8 +1651,13 @@ class DeepSSM(nn.Module):
 
         if self.use_cert_scaling:
             self.register_buffer("gamma_t", torch.tensor(float(self.config.gamma)))
-            self.encoder_w = nn.Parameter(torch.randn(self.config.d_model, self.d_input))
-            self.decoder_w = nn.Parameter(torch.randn(self.d_output, self.config.d_model))
+            # Initialise with unit-norm scale so enc_norm * dec_norm ≈ 1 at the start.
+            # With per-block gamma_i = gamma_t^(1/n)-1, gamma_prod ≈ gamma_t, giving
+            # scale = gamma_t / (1 * 1 * gamma_t) ≈ 1 instead of ≈ 0 with randn init.
+            enc_std = 1.0 / math.sqrt(self.config.d_model)
+            dec_std = 1.0 / math.sqrt(self.config.d_model)
+            self.encoder_w = nn.Parameter(torch.randn(self.config.d_model, self.d_input) * enc_std)
+            self.decoder_w = nn.Parameter(torch.randn(self.d_output, self.config.d_model) * dec_std)
 
             # Set once after blocks are created (all blocks share the same FF type).
             self.ff_has_lip = False
@@ -1654,7 +1679,7 @@ class DeepSSM(nn.Module):
             gamma=None,
             mode: str = "scan",
             reset_state: bool = True,
-            detach_state: bool = True,
+            detach_state: bool = False,
     ):
         u3d = _normalize_to_3d(u)
         if reset_state:
@@ -1687,10 +1712,14 @@ class DeepSSM(nn.Module):
             gamma_t = self.gamma_t.abs() if gamma is None else torch.as_tensor(gamma, device=x.device, dtype=x.dtype).abs()
 
             if len(self.blocks) > 0:
-                # Collect per-block gains.
-                g = torch.stack([block.lru.gamma.abs() for block in self.blocks])
+                # Collect per-block gains — detach so the certificate normalization
+                # does not create a gradient path back into gamma/lip_vec.  Each
+                # parameter already receives a meaningful gradient through its direct
+                # role in the SSM dynamics / FF output; allowing it to also optimize
+                # by shrinking gamma_prod (inflating `scale`) is pathological.
+                g = torch.stack([block.lru.gamma.abs().detach() for block in self.blocks])
                 if self.ff_has_lip:
-                    ff_lips = torch.stack([block.ff.lip.abs() for block in self.blocks])
+                    ff_lips = torch.stack([block.ff.lip.detach() for block in self.blocks])
                     g = g * ff_lips
 
                 # Compute prod(1 + g) in log-space for numerical stability.
@@ -1879,7 +1908,6 @@ class SimpleRNN(nn.Module):
         # nn.RNN doesn't return all hidden states per step directly,
         # but `out` *is* the last-layer hidden state at each time.
         # For multi-layer RNNs, this corresponds to the top layer only.
-        a = 0
         h_seq = None
         if return_state:
             # top-layer h_t sequence is out; prepend the top-layer initial state
@@ -1904,7 +1932,8 @@ class SimpleRNN(nn.Module):
             return y, h_seq
         if return_last:
             return y, h_last
-        return y, a
+        return y, self.state
 
     def reset(self):
         self.state = _reset_runtime_state(self.state)
+

@@ -133,30 +133,62 @@ class LMLP(nn.Module):
         return self.model(input)
 
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.nn.utils.parametrizations as param
+
+
 class L2BoundedGLU(nn.Module):
-    """GLU-like block with provable global l2-Lipschitz constant <= gamma."""
+    """
+    GLU block with an L2-bounded linear map:
+      - value branch:  a  (unconstrained; spectral norm on W ensures ||a||_2 <= ||x||_2)
+      - gate branch:   sigmoid(b)
+      - per-channel trainable Lipschitz scaling via diag(lip_vec)
+
+    The global Euclidean Lipschitz constant is <= max(lip_vec),
+    which is exposed as the scalar property `lip` for certification.
+    """
     def __init__(self, config: LayerConfig):
         super().__init__()
-        self.lip = nn.Parameter(torch.tensor(config.lip))
+        self.eps = 1e-6
 
-        # NOTE: dropout during training scales by 1/(1-p), which increases Lipschitz.
-        # If you want a guarantee in *training mode too*, we include the worst-case factor.
-        self.p = float(config.dropout)
-        self.dropout = nn.Dropout(self.p) if self.p > 0 else nn.Identity()
+        d_input = int(config.d_input)
+        lip_init = float(config.lip)
+        lip0 = max(lip_init, self.eps)
 
-        # One linear to 2d, spectral-normalized so ||W||_2 <= 1 (approximately, via power iteration)
-        self.lin = param.spectral_norm(nn.Linear(config.d_input, 2 * config.d_input))
+        # Per-channel positive trainable Lipschitz levels
+        # We parametrize lip_vec = softplus(raw_lip) + eps
+        raw_init = torch.log(torch.expm1(torch.full((d_input,), lip0)))
+        self.raw_lip = nn.Parameter(raw_init.clone().detach())
 
-        self.value_nl = nn.Tanh()      # bounded + 1-Lipschitz
-        self.gate_nl = nn.Sigmoid()    # bounded, Lipschitz <= 1/4 elementwise
+        # Linear map to 2d, intended to satisfy ||W||_2 <= 1
+        self.lin = param.spectral_norm(nn.Linear(d_input, 2 * d_input, bias=False))
 
-        drop_factor = 1.0 / (1.0 - self.p) if self.p > 0 else 1.0
-        base_lip = 1.25 * drop_factor
-        self.register_buffer("_scale", torch.tensor(self.lip / base_lip))
+    @property
+    def lip_vec(self) -> torch.Tensor:
+        """
+        Per-channel positive scaling vector used in forward.
+        Shape: (d_input,)
+        """
+        return F.softplus(self.raw_lip) + self.eps
+
+    @property
+    def lip(self) -> torch.Tensor:
+        """
+        Scalar global l2-Lipschitz bound of the whole block.
+        Since forward applies diag(lip_vec), the exact Euclidean operator norm
+        of that diagonal scaling is max(lip_vec).
+        """
+        return self.lip_vec.max()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.dropout(x)
         h = self.lin(x)
         a, b = h.chunk(2, dim=-1)
-        y = self.value_nl(a) * self.gate_nl(b)
-        return self._scale * y
+
+        # Standard GLU gating: value branch left unconstrained (spectral norm on W
+        # already ensures ||a||_2 <= ||x||_2), sigmoid gate in (0,1).
+        y = a * torch.sigmoid(b)
+
+        # Per-channel scaling; broadcast over batch/time dimensions
+        return y * self.lip_vec

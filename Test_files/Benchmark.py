@@ -13,8 +13,6 @@ import math
 import nonlinear_benchmarks
 from nonlinear_benchmarks.error_metrics import RMSE, NRMSE, R_squared, MAE, fit_index
 import json
-#from SSM.utility import SimpleLSTM
-#from neural_ssm import DeepSSM, SSMConfig
 from src.neural_ssm.ssm.lru import DeepSSM, SSMConfig, SimpleRNN
 
 try:
@@ -33,11 +31,11 @@ class TrainingConfig:
     """Configuration for training parameters."""
     learning_rate: float = 1e-3
     batch_size: int = 32
-    num_epochs: int = 8590
+    num_epochs: int = 2000
     seed: int = 9
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    num_workers: int = 4
-    pin_memory: bool = True
+    # Validation init window (timesteps skipped in loss computation)
+    init_window: int = 50
 
     # Early stopping
     patience: int = 50
@@ -69,7 +67,7 @@ class ModelConfig:
     rho: float = 0.9
     max_phase_b: float = 0.5  # small spread
     phase_center: float = 0  # center angle ≈ 17°
-    random_phase = True
+    random_phase: bool = True
 
     def to_ssm_config(self) -> SSMConfig:
         """Convert to SSMConfig object."""
@@ -335,7 +333,7 @@ class SystemIDTrainer:
                 min_delta=self.config.min_delta
             )
 
-        # Single progress bar
+        # Progress bar
         pbar = tqdm(range(self.config.num_epochs), desc="Training", ncols=100)
         early_stop_epoch = None
 
@@ -345,7 +343,7 @@ class SystemIDTrainer:
             self.train_losses.append(train_loss)
 
             # Validate
-            val_loss = self.validate(u_val, y_val)
+            val_loss = self.validate(u_val, y_val, n=self.config.init_window)
             self.val_losses.append(val_loss)
 
             # Update best validation loss
@@ -434,7 +432,7 @@ class SystemIDTrainer:
         Args:
             filepath: Path to checkpoint file
         """
-        checkpoint = torch.load(filepath, map_location=self.device)
+        checkpoint = torch.load(filepath, map_location=self.device, weights_only=True)
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.train_losses = checkpoint['train_losses']
@@ -627,7 +625,7 @@ def optimize_hyperparameters(
     Tune n_layers, d_model, d_state, learning_rate, and gamma with Optuna.
 
     Returns:
-        Dictionary with best hyperparameters and objective value.
+        Dictionary with the best hyperparameters and objective value.
     """
     if optuna is None:
         raise ImportError("Optuna is not installed. Install it with: pip install optuna")
@@ -711,7 +709,7 @@ def main():
     # Load data
     print("Loading data...")
 
-    train_val, test = nonlinear_benchmarks.WienerHammerBenchMark()
+    train_val, test = nonlinear_benchmarks.Cascaded_Tanks()
     print(test.state_initialization_window_length)  # = 50
     u_train, y_train = train_val
     u_val, y_val = test
@@ -722,31 +720,13 @@ def main():
     y_train = torch.tensor(y_train, dtype=torch.float32).unsqueeze(-1)
     u_val = torch.tensor(u_val, dtype=torch.float32).unsqueeze(-1)
     y_val = torch.tensor(y_val, dtype=torch.float32).unsqueeze(-1)
-    #
-    # u_train = _normalize_to_3d(u_train)
-    # u_val = _normalize_to_3d(u_val)
-    # y_val = _normalize_to_3d(y_val)
-    # y_train = _normalize_to_3d(y_train)
-
-    # # data normalization
-    # mu_u = u_train.mean(dim=0)  # over all time + trajectories
-    # mu_y = y_train.mean(dim=0)
-    # u_center = u_train - mu_u
-    # y_center = y_train - mu_y
-    # sigma_u = u_train.sub(mu_u).pow(2).mean(dim=0).sqrt()
-    # sigma_y = y_train.sub(mu_y).pow(2).mean(dim=0).sqrt()
-    # u_norm = u_center / sigma_u
-    # y_norm = y_center / sigma_y
-    #
-    # u_val_norm = (u_val - mu_u) / (sigma_u + 1e-8)
-    # y_val_norm = (y_val - mu_y) / (sigma_y + 1e-8)
-
 
     # Initialize configurations
-    model_config = ModelConfig(n_u=u_train.shape[1], n_y=y_train.shape[1], param='l2n', d_model=12, d_state=66,
-                               gamma=2, ff='LGLU', init='eye',
-                               n_layers=1, d_amp=3, rho=0.9, phase_center=0.0, max_phase_b=0.04, d_hidden=12, nl_layers=3)
-    train_config = TrainingConfig(num_epochs=600, learning_rate=1.6568e-02)
+    model_config = ModelConfig(n_u=u_train.shape[1], n_y=y_train.shape[1], param='lru', d_model=8, d_state=8,
+                               gamma= 99, ff='LGLU', init='eye',
+                               n_layers=4, d_amp=3, rho=0.99, phase_center=0.0, max_phase_b=.04, d_hidden=12, nl_layers=3)
+    train_config = TrainingConfig(num_epochs=2000, learning_rate=1.6568e-02,
+                                  init_window=test.state_initialization_window_length)
     hpo_config = HyperOptConfig(enabled=False, n_trials=20, num_epochs=250)
 
     # Hyperparameter search
@@ -793,12 +773,6 @@ def main():
     ssm_config = model_config.to_ssm_config()
     model = DeepSSM(d_input=model_config.n_u, d_output=model_config.n_y, config=ssm_config)
 
-    #model = SimpleRNN(d_input=1, d_hidden=20, num_layers=1, d_output= 1, nonlinearity='tanh')
-
-
-    # Try RNN
-    #model = SimpleLSTM(hidden_dim=32, bidirectional=False, num_layers=2)
-
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Number of parameters: {total_params}")
 
@@ -807,9 +781,6 @@ def main():
 
     # Train model
     history = trainer.fit(u_train, y_train, u_val, y_val, use_early_stopping=False)
-
-    # Train model (normalized)
-    #history = trainer.fit(u_norm, y_norm, u_val_norm, y_val_norm, use_early_stopping=False)
 
     # load best model if available
     best_path = train_config.save_dir / "best_model.pth"
@@ -825,7 +796,7 @@ def main():
     y_val_pred = trainer.predict(u_val)
     n = test.state_initialization_window_length
 
-    RMSE_result = 1000*RMSE(test.y[n:], y_val_pred[n:].cpu().detach().numpy())  # skip the first n
+    RMSE_result = RMSE(test.y[n:], y_val_pred[n:].cpu().detach().numpy())  # skip the first n
     print(RMSE_result)  # report this number
 
     # Visualize results
@@ -850,9 +821,6 @@ def main():
     loss_file = train_config.save_dir / "loss_history.npy"
     np.save(loss_file, np.array(history['train_losses']))
     print(f"Saved loss history to {loss_file}\n")
-
-    x = DeepSSM(d_input=4, d_output=3, d_model=3)
-
 
 if __name__ == "__main__":
     main()
