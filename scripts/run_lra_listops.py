@@ -20,7 +20,7 @@ from torch import nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from neural_ssm import DeepSSM
+from src.neural_ssm import DeepSSM
 
 
 class SSMListOpsClassifier(nn.Module):
