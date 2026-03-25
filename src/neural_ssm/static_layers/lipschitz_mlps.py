@@ -6,6 +6,78 @@ from deel import torchlip
 from ..static_layers.generic_layers import LayerConfig
 
 
+
+class L2BoundedLinearExact(nn.Module):
+    """
+    Linear map y = x @ W^T with ||W||_2 <= bound.
+
+    Supports:
+      - exact spectral norm via SVD
+      - optional power iteration fallback
+      - inputs of shape (..., d_in)
+    """
+
+    def __init__(
+        self,
+        d_in: int,
+        d_out: int,
+        *,
+        bound: float = 1.0,
+        exact_norm: bool = True,
+        power_iters: int = 1,
+        eps: float = 1e-6,
+    ):
+        super().__init__()
+        self.d_in = int(d_in)
+        self.d_out = int(d_out)
+        self.bound = float(bound)
+        self.exact_norm = bool(exact_norm)
+        self.power_iters = max(1, int(power_iters))
+        self.eps = float(eps)
+
+        self.W_raw = nn.Parameter(torch.empty(self.d_out, self.d_in))
+        nn.init.orthogonal_(self.W_raw)
+
+        if not self.exact_norm:
+            self.register_buffer("_u", F.normalize(torch.randn(self.d_out), dim=0))
+
+    def _sigma_exact(self, W: torch.Tensor) -> torch.Tensor:
+        # SVD is more version-compatible than matrix_norm(ord=2)
+        try:
+            return torch.linalg.svdvals(W)[0].clamp_min(self.eps)
+        except Exception:
+            # Older PyTorch fallback
+            return torch.svd(W).S[0].clamp_min(self.eps)
+
+    def _sigma_power_iter(self, W: torch.Tensor) -> torch.Tensor:
+        u = self._u
+        for _ in range(self.power_iters):
+            v = F.normalize(W.T @ u, dim=0, eps=self.eps)
+            u = F.normalize(W @ v, dim=0, eps=self.eps)
+        sigma = torch.abs(u @ (W @ v)).clamp_min(self.eps)
+        with torch.no_grad():
+            self._u.copy_(u)
+        return sigma
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        W = self.W_raw
+
+        # Safer for some GPU/dtype combinations
+        W_for_norm = W.float() if W.dtype in (torch.float16, torch.bfloat16) else W
+
+        if self.exact_norm:
+            sigma = self._sigma_exact(W_for_norm).to(dtype=W.dtype, device=W.device)
+        else:
+            sigma = self._sigma_power_iter(W_for_norm).to(dtype=W.dtype, device=W.device)
+
+        scale = torch.clamp(sigma / self.bound, min=1.0)
+        W_eff = W / scale
+
+        return F.linear(x, W_eff, bias=None)
+
+
+
+
 class TLIP(nn.Module):
     """ Standard MLP with Lipschitz-bounded static_layers """
 
@@ -191,4 +263,49 @@ class L2BoundedGLU(nn.Module):
         y = a * torch.sigmoid(b)
 
         # Per-channel scaling; broadcast over batch/time dimensions
+        return y * self.lip_vec
+
+
+class L2BoundedGLUv2(nn.Module):
+    """
+    GLU-like FF with a rigorous global l2 bound.
+
+    y = tanh(Ax) * sigmoid(Bx)
+    with
+        ||A||_2 <= a_bound
+        ||B||_2 <= b_bound
+        a_bound + 0.25 * b_bound <= 1
+
+    Then the pre-scaled block is 1-Lipschitz, and after multiplying by
+    diag(lip_vec), the global Lipschitz constant is <= max(lip_vec).
+    """
+    def __init__(self, config: LayerConfig, a_bound: float = 0.75, b_bound: float = 1.0):
+        super().__init__()
+        self.eps = 1e-6
+
+        d_input = int(config.d_input)
+        lip_init = float(config.lip)
+        lip0 = max(lip_init, self.eps)
+
+        if a_bound + 0.25 * b_bound > 1.0 + 1e-8:
+            raise ValueError("Need a_bound + 0.25 * b_bound <= 1 for a 1-Lipschitz pre-block.")
+
+        raw_init = torch.log(torch.expm1(torch.full((d_input,), lip0)))
+        self.raw_lip = nn.Parameter(raw_init.clone().detach())
+
+        self.A = L2BoundedLinearExact(d_input, d_input, bound=a_bound, exact_norm=True)
+        self.B = L2BoundedLinearExact(d_input, d_input, bound=b_bound, exact_norm=True)
+
+    @property
+    def lip_vec(self) -> torch.Tensor:
+        return F.softplus(self.raw_lip) + self.eps
+
+    @property
+    def lip(self) -> torch.Tensor:
+        return self.lip_vec.max()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        a = torch.tanh(self.A(x))
+        b = torch.sigmoid(self.B(x))
+        y = a * b
         return y * self.lip_vec
