@@ -1591,6 +1591,7 @@ class SSL(nn.Module):
             "LGLU2": L2BoundedGLUv2,
             "LMLP": LMLP,
             "TLIP": TLIP,
+            "MBLIP": MultiBranchLipMixer,
         }
         if config.ff not in ff_layers:
             raise ValueError(f"Unknown feedforward type: {config.ff}")

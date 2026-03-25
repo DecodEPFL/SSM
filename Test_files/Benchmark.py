@@ -723,7 +723,7 @@ def main():
 
     # Initialize configurations
     model_config = ModelConfig(n_u=u_train.shape[1], n_y=y_train.shape[1], param='tv', d_model=8, d_state=8,
-                               gamma= 7, ff='LGLU', init='eye',
+                               gamma= 7, ff='MBLIP', init='eye',
                                n_layers=6, d_amp=3, rho=0.99, phase_center=0.0, max_phase_b=.04, d_hidden=12, nl_layers=3)
     train_config = TrainingConfig(num_epochs=2000, learning_rate=1.6568e-02,
                                   init_window=test.state_initialization_window_length)
