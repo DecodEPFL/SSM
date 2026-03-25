@@ -309,3 +309,183 @@ class L2BoundedGLUv2(nn.Module):
         b = torch.sigmoid(self.B(x))
         y = a * b
         return y * self.lip_vec
+
+
+
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+# ---------------------------------------------------------------------
+# 1-Lipschitz GroupSort activation
+# ---------------------------------------------------------------------
+class GroupSort(nn.Module):
+    """
+    GroupSort with group size 2.
+    1-Lipschitz under the Euclidean norm.
+    """
+    def __init__(self, group_size: int = 2):
+        super().__init__()
+        if group_size != 2:
+            raise NotImplementedError("This implementation currently supports group_size=2 only.")
+        self.group_size = group_size
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        d = x.shape[-1]
+        if d % self.group_size != 0:
+            raise ValueError(f"Last dimension {d} must be divisible by group_size={self.group_size}.")
+        xg = x.view(*x.shape[:-1], d // self.group_size, self.group_size)
+        xs, _ = torch.sort(xg, dim=-1)
+        return xs.view(*x.shape)
+
+
+# ---------------------------------------------------------------------
+# 1-Lipschitz GroupSort MLP branch
+# ---------------------------------------------------------------------
+class LipGroupSortBranch(nn.Module):
+    """
+    A 1-Lipschitz branch:
+        x -> W1 -> GroupSort -> W2 -> GroupSort
+    with ||W1||_2 <= 1 and ||W2||_2 <= 1.
+    """
+    def __init__(self, d_in: int, width: int):
+        super().__init__()
+        if width % 2 != 0:
+            width += 1
+        self.width = width
+        self.lin1 = L2BoundedLinearExact(d_in, width, bound=1.0, exact_norm=True)
+        self.lin2 = L2BoundedLinearExact(width, width, bound=1.0, exact_norm=True)
+        self.act = GroupSort(group_size=2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.act(self.lin1(x))
+        x = self.act(self.lin2(x))
+        return x
+
+
+# ---------------------------------------------------------------------
+# Certified multi-branch FF block
+# ---------------------------------------------------------------------
+class MultiBranchLipMixer(nn.Module):
+    """
+    Maximally expressive certified FF block.
+
+    Branches:
+      h1 = GroupSortMLP(x)                          (1-Lipschitz)
+      h2 = tanh(Ax) * sigmoid(Bx)                  (<= ||A|| + 0.25||B||)
+      h3 = tanh(Cx)                                (<= ||C||)
+      h4 = D x                                     (<= ||D||)
+
+    We choose:
+      ||A|| <= 0.75
+      ||B|| <= 1.00
+      ||C|| <= 1.00
+      ||D|| <= 1.00
+
+    so each branch is <= 1-Lipschitz.
+
+    Then we learn nonnegative branch weights w_i with sum_i w_i^2 = 1 by:
+      p = softmax(branch_logits)
+      w_i = sqrt(p_i)
+
+    Thus concatenation of scaled branches is still <= 1-Lipschitz.
+
+    Finally:
+      z = W_out [ w1*h1 ; w2*h2 ; w3*h3 ; w4*h4 ]
+    with ||W_out|| <= 1, so the pre-scaled block is <= 1-Lipschitz.
+
+    We then multiply by a learnable positive scalar `lip`,
+    so the whole block satisfies:
+        Lip(block) <= lip
+
+    This is much more expressive than a single GLU while keeping a clean bound.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        self.eps = 1e-6
+
+        d_input = int(config.d_input)
+
+        # For maximal expressivity, interpret d_hidden as a width multiplier if small,
+        # otherwise as an absolute width if already large.
+        raw_hidden = int(config.d_hidden)
+        if raw_hidden <= 16:
+            width = max(2 * d_input, raw_hidden * d_input)
+        else:
+            width = max(2 * d_input, raw_hidden)
+        if width % 2 != 0:
+            width += 1
+
+        self.width = width
+
+        lip_init = float(config.lip)
+        lip0 = max(lip_init, self.eps)
+        raw_lip_init = math.log(math.expm1(lip0))
+        self.raw_lip = nn.Parameter(torch.tensor(raw_lip_init))
+
+        # Learn branch allocation under an l2 budget:
+        # w_i = sqrt(softmax(logits)_i), so sum_i w_i^2 = 1
+        self.branch_logits = nn.Parameter(torch.zeros(4))
+
+        # Branch 1: expressive 1-Lipschitz GroupSort MLP
+        self.branch1 = LipGroupSortBranch(d_input, width)
+
+        # Branch 2: certified gated product
+        # Lip <= ||A|| + 0.25 ||B|| <= 0.75 + 0.25*1 = 1
+        self.A = L2BoundedLinearExact(d_input, width, bound=0.75, exact_norm=True)
+        self.B = L2BoundedLinearExact(d_input, width, bound=1.00, exact_norm=True)
+
+        # Branch 3: smooth saturating branch
+        self.C = L2BoundedLinearExact(d_input, width, bound=1.00, exact_norm=True)
+
+        # Branch 4: linear branch
+        self.D = L2BoundedLinearExact(d_input, width, bound=1.00, exact_norm=True)
+
+        # Output mixer: concatenated width -> d_input, bounded by 1
+        self.out = L2BoundedLinearExact(4 * width, d_input, bound=1.00, exact_norm=True)
+
+    @property
+    def lip(self) -> torch.Tensor:
+        """
+        Exact scalar global l2-Lipschitz bound of the whole block.
+        """
+        return F.softplus(self.raw_lip) + self.eps
+
+    @property
+    def branch_weights(self) -> torch.Tensor:
+        """
+        Nonnegative branch scales w_i with sum_i w_i^2 = 1.
+        """
+        p = F.softmax(self.branch_logits, dim=0)
+        return torch.sqrt(p.clamp_min(self.eps))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        w = self.branch_weights  # shape (4,)
+
+        # Branch 1: GroupSort MLP
+        h1 = self.branch1(x)
+
+        # Branch 2: certified gated product
+        h2 = torch.tanh(self.A(x)) * torch.sigmoid(self.B(x))
+
+        # Branch 3: smooth saturating branch
+        h3 = torch.tanh(self.C(x))
+
+        # Branch 4: linear branch
+        h4 = self.D(x)
+
+        # Scale branches under sqrt-softmax budget
+        h = torch.cat([
+            w[0] * h1,
+            w[1] * h2,
+            w[2] * h3,
+            w[3] * h4,
+        ], dim=-1)
+
+        z = self.out(h)
+
+        # Final learnable global Lipschitz level
+        return self.lip * z
