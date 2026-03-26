@@ -8,7 +8,7 @@ from . import rens as rens
 from . import static_layers as layers  # public alias
 
 # Top-level classes and configs
-from .ssm.lru import LRU, L2RU, lruz, SSMConfig, SSL, DeepSSM, PureLRUR
+from .ssm.layers import LRU, L2RU, lruz, SSMConfig, SSL, DeepSSM, PureLRUR
 from .rens.ren import REN
 
 # Common layers exposed at top-level for convenience
