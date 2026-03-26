@@ -93,6 +93,18 @@ class ModelConfig:
 
 
 @dataclass
+class LivePlotConfig:
+    """Configuration for real-time training animation (scalar outputs only)."""
+    enabled: bool = False
+    update_interval: int = 1    # redraw every N epochs
+    n_points: int = 1200        # max time steps shown (subsample for speed)
+    figsize: tuple = (13, 6)
+    show_validation: bool = True
+    transition_frames: int = 4
+    transition_pause: float = 0.0015
+
+
+@dataclass
 class HyperOptConfig:
     """Configuration for Optuna hyperparameter optimization."""
     enabled: bool = True
@@ -217,7 +229,8 @@ class SystemIDTrainer:
             model: nn.Module,
             train_config: TrainingConfig,
             criterion: Optional[nn.Module] = None,
-            optimizer: Optional[torch.optim.Optimizer] = None
+            optimizer: Optional[torch.optim.Optimizer] = None,
+            live_plot_config: Optional[LivePlotConfig] = None,
     ):
         """
         Args:
@@ -225,10 +238,13 @@ class SystemIDTrainer:
             train_config: Training configuration
             criterion: Loss function (defaults to MSELoss)
             optimizer: Optimizer (defaults to Adam)
+            live_plot_config: If provided and enabled, shows a real-time
+                animated plot of predictions vs target (scalar outputs only).
         """
         self.model = model
         self.config = train_config
         self.device = torch.device(train_config.device)
+        self.live_plot_config = live_plot_config
         self.model.to(self.device)
 
         # Set up loss and optimizer
@@ -245,7 +261,7 @@ class SystemIDTrainer:
         # Create checkpoint directory
         self.config.save_dir.mkdir(parents=True, exist_ok=True)
 
-    def train_epoch(self, u: torch.Tensor, y: torch.Tensor) -> float:
+    def train_epoch(self, u: torch.Tensor, y: torch.Tensor) -> Tuple[float, torch.Tensor]:
         """
         Train for one epoch.
 
@@ -254,7 +270,7 @@ class SystemIDTrainer:
             y: Target tensor
 
         Returns:
-            Average training loss
+            Average training loss and model predictions for the current epoch
         """
         self.model.train()
 
@@ -275,10 +291,10 @@ class SystemIDTrainer:
         loss.backward()
         self.optimizer.step()
 
-        return loss.item()
+        return loss.item(), y_pred.detach().cpu()
 
     @torch.no_grad()
-    def validate(self, u: torch.Tensor, y: torch.Tensor, n: int = 50) -> float:
+    def validate(self, u: torch.Tensor, y: torch.Tensor, n: int = 50) -> Tuple[float, torch.Tensor]:
         """
         Validate the model.
 
@@ -288,7 +304,7 @@ class SystemIDTrainer:
             y: Target tensor
 
         Returns:
-            Validation loss
+            Validation loss and validation predictions
         """
         self.model.eval()
 
@@ -304,7 +320,7 @@ class SystemIDTrainer:
         # Compute loss
         loss = self.criterion(y_pred[n:], y[n:])
 
-        return loss.item()
+        return loss.item(), y_pred.detach().cpu()
 
     def fit(
             self,
@@ -333,17 +349,29 @@ class SystemIDTrainer:
                 min_delta=self.config.min_delta
             )
 
+        # Live plot (scalar outputs only — disable via LivePlotConfig.enabled=False)
+        live_plotter = None
+        cfg = self.live_plot_config
+        if cfg is not None and cfg.enabled:
+            live_plotter = LivePlotter(
+                config=cfg,
+                y_train_true=y_train,
+                y_val_true=y_val,
+                total_epochs=self.config.num_epochs,
+                init_window=self.config.init_window,
+            )
+
         # Progress bar
         pbar = tqdm(range(self.config.num_epochs), desc="Training", ncols=100)
         early_stop_epoch = None
 
         for epoch in pbar:
             # Train
-            train_loss = self.train_epoch(u_train, y_train)
+            train_loss, train_pred = self.train_epoch(u_train, y_train)
             self.train_losses.append(train_loss)
 
             # Validate
-            val_loss = self.validate(u_val, y_val, n=self.config.init_window)
+            val_loss, val_pred = self.validate(u_val, y_val, n=self.config.init_window)
             self.val_losses.append(val_loss)
 
             # Update best validation loss
@@ -359,6 +387,17 @@ class SystemIDTrainer:
                 'best': f'{self.best_val_loss:.4e}'
             })
 
+            # Live plot update
+            if live_plotter is not None and epoch % cfg.update_interval == 0:
+                live_plotter.update(
+                    epoch=epoch,
+                    train_pred=train_pred,
+                    val_pred=val_pred,
+                    train_losses=self.train_losses,
+                    val_losses=self.val_losses,
+                    best_val_loss=self.best_val_loss,
+                )
+
             # Early stopping
             if use_early_stopping:
                 if early_stopping(val_loss, self.model):
@@ -366,6 +405,20 @@ class SystemIDTrainer:
                     early_stopping.load_best_model(self.model)
                     pbar.close()
                     break
+
+        # Final live plot update and close
+        if live_plotter is not None:
+            final_train_pred = self.predict(u_train).detach().cpu()
+            final_val_pred = self.predict(u_val).detach().cpu()
+            live_plotter.update(
+                epoch=epoch,
+                train_pred=final_train_pred,
+                val_pred=final_val_pred,
+                train_losses=self.train_losses,
+                val_losses=self.val_losses,
+                best_val_loss=self.best_val_loss,
+            )
+            live_plotter.close()
 
         # Save final checkpoint
         self.save_checkpoint(epoch, is_best=False)
@@ -599,6 +652,347 @@ class Visualizer:
 
 
 # ============================================================================
+# Live Training Plotter
+# ============================================================================
+
+class LivePlotter:
+    """
+    Real-time animated plot of train/validation predictions and losses.
+    Only meaningful for scalar (n_y=1) outputs; disable for multi-output datasets.
+
+    Uses blitting for smooth updates: static axes are drawn once and cached;
+    only the animated artists are redrawn each frame. Prediction updates are
+    tweened across a few subframes so the motion feels less abrupt.
+    """
+
+    def __init__(
+        self,
+        config: LivePlotConfig,
+        y_train_true: torch.Tensor,
+        y_val_true: Optional[torch.Tensor],
+        total_epochs: int,
+        init_window: int = 0,
+    ):
+        self.config = config
+        self.y_train_true = y_train_true.squeeze().detach().cpu().numpy()
+        self.y_val_true = (
+            y_val_true.squeeze().detach().cpu().numpy()
+            if y_val_true is not None else None
+        )
+        self._total_epochs = total_epochs
+        self._init_window = init_window
+        self._show_validation = config.show_validation and self.y_val_true is not None
+
+        self._idx_train, self._y_train_plot, self._train_ylim = self._prepare_series(self.y_train_true)
+        if self._show_validation:
+            self._idx_val, self._y_val_plot, self._val_ylim = self._prepare_series(self.y_val_true)
+        else:
+            self._idx_val, self._y_val_plot, self._val_ylim = None, None, None
+
+        # Loss y-limits: track the running range, expand-only (never shrink)
+        self._loss_ylim = (np.inf, -np.inf)
+        self._prev_train_pred = None
+        self._prev_val_pred = None
+
+        try:
+            # Force a real GUI window — PyCharm's inline backend captures figures
+            # statically and cannot update live. switch_backend() is safe to call
+            # after pyplot is already imported. MacOSX is the native macOS backend;
+            # TkAgg/Qt5Agg are cross-platform fallbacks.
+            for _backend in ("MacOSX", "TkAgg", "Qt5Agg", "QtAgg"):
+                try:
+                    plt.switch_backend(_backend)
+                    break
+                except Exception:
+                    continue
+
+            plt.ion()
+            self._fig = plt.figure(figsize=config.figsize)
+            self._fig.patch.set_facecolor("#0b1118")
+            self._fig.suptitle("Live Training Progress", fontsize=11, color="#f6f7fb")
+
+            gs = self._fig.add_gridspec(2, 2, height_ratios=[2.2, 1.0], hspace=0.28, wspace=0.18)
+            if self._show_validation:
+                self._ax_train = self._fig.add_subplot(gs[0, 0])
+                self._ax_val = self._fig.add_subplot(gs[0, 1])
+            else:
+                self._ax_train = self._fig.add_subplot(gs[0, :])
+                self._ax_val = None
+            self._ax_loss = self._fig.add_subplot(gs[1, :])
+
+            self._line_train_glow, self._line_train = self._configure_prediction_axis(
+                self._ax_train,
+                title="Training Sequence",
+                idx=self._idx_train,
+                y_true=self._y_train_plot,
+                ylim=self._train_ylim,
+                pred_color="#5ec8e5",
+            )
+            if self._ax_val is not None:
+                self._line_val_glow, self._line_val = self._configure_prediction_axis(
+                    self._ax_val,
+                    title="Validation Sequence",
+                    idx=self._idx_val,
+                    y_true=self._y_val_plot,
+                    ylim=self._val_ylim,
+                    pred_color="#ff7a90",
+                    show_init_window=True,
+                )
+            else:
+                self._line_val_glow = None
+                self._line_val = None
+
+            self._configure_loss_axis(total_epochs)
+
+            self._epoch_text = self._ax_train.text(
+                0.02, 0.96, "", transform=self._ax_train.transAxes,
+                fontsize=9, va="top", color="#e8edf6", animated=True,
+                bbox=dict(boxstyle="round,pad=0.28", facecolor="#101826", edgecolor="none", alpha=0.82),
+            )
+            self._stats_text = self._ax_loss.text(
+                0.015, 0.94, "", transform=self._ax_loss.transAxes,
+                fontsize=8, va="top", color="#e8edf6", animated=True,
+                bbox=dict(boxstyle="round,pad=0.28", facecolor="#101826", edgecolor="none", alpha=0.82),
+            )
+
+            self._fig.tight_layout()
+
+            # Full draw once to render the static content (axes, labels, target line)
+            self._fig.canvas.draw()
+            self._fig.canvas.flush_events()
+
+            # Cache the static background for blitting
+            self._bg = self._fig.canvas.copy_from_bbox(self._fig.bbox)
+            self._fig.canvas.mpl_connect("resize_event", lambda _event: self._redraw_background())
+            self._active = True
+        except Exception as e:
+            print(f"[LivePlotter] Could not initialise interactive plot: {e}")
+            self._active = False
+
+    def _prepare_series(self, series: np.ndarray) -> Tuple[np.ndarray, np.ndarray, Tuple[float, float]]:
+        """Subsample a scalar series and compute fixed y-limits for plotting."""
+        T = len(series)
+        idx = (
+            np.linspace(0, T - 1, self.config.n_points, dtype=int)
+            if T > self.config.n_points else np.arange(T)
+        )
+        series_plot = series[idx]
+        series_min = float(series_plot.min())
+        series_max = float(series_plot.max())
+        margin = max((series_max - series_min) * 0.12, 1e-4)
+        return idx, series_plot, (series_min - margin, series_max + margin)
+
+    def _style_axis(self, ax: plt.Axes):
+        ax.set_facecolor("#111925")
+        ax.grid(True, color="#425066", alpha=0.24, linewidth=0.6)
+        ax.tick_params(colors="#d7dde8", labelsize=8)
+        ax.xaxis.label.set_color("#eef2f7")
+        ax.yaxis.label.set_color("#eef2f7")
+        ax.title.set_color("#f6f7fb")
+        for spine in ("top", "right"):
+            ax.spines[spine].set_visible(False)
+        for spine in ("left", "bottom"):
+            ax.spines[spine].set_color("#5d6c80")
+
+    def _configure_prediction_axis(
+        self,
+        ax: plt.Axes,
+        title: str,
+        idx: np.ndarray,
+        y_true: np.ndarray,
+        ylim: Tuple[float, float],
+        pred_color: str,
+        show_init_window: bool = False,
+    ):
+        self._style_axis(ax)
+        ax.set_title(title, fontsize=10)
+        ax.set_xlabel("Time step")
+        ax.set_ylabel("Output")
+        ax.set_xlim(int(idx[0]), int(idx[-1]))
+        ax.set_ylim(*ylim)
+
+        ax.plot(idx, y_true, color="#f6bd60", lw=1.1, alpha=0.88, label="Target")
+        if show_init_window and self._init_window > 0:
+            ax.axvspan(0, self._init_window, color="#d7dde8", alpha=0.08, lw=0)
+            ax.text(
+                0.02, 0.08, f"warm-up ignored in loss: {self._init_window}",
+                transform=ax.transAxes, fontsize=7, color="#b5c0cf",
+            )
+        ax.legend(fontsize=7, loc="upper right", facecolor="#111925", edgecolor="#334155", labelcolor="#eef2f7")
+
+        glow_line = ax.plot(
+            idx, np.full_like(y_true, np.nan),
+            color=pred_color, lw=4.5, alpha=0.14, animated=True,
+            solid_capstyle="round",
+        )[0]
+        pred_line = ax.plot(
+            idx, np.full_like(y_true, np.nan),
+            color=pred_color, lw=1.8, alpha=0.97, animated=True,
+            solid_capstyle="round",
+        )[0]
+        return glow_line, pred_line
+
+    def _configure_loss_axis(self, total_epochs: int):
+        self._style_axis(self._ax_loss)
+        self._ax_loss.set_title("Loss Trajectory", fontsize=10)
+        self._ax_loss.set_ylabel("Loss")
+        self._ax_loss.set_xlabel("Epoch")
+        self._ax_loss.set_yscale("log")
+        self._ax_loss.set_xlim(0, max(1, total_epochs - 1))
+
+        (self._line_tloss_glow,) = self._ax_loss.plot(
+            [], [], color="#5ec8e5", lw=4.0, alpha=0.12, animated=True,
+        )
+        (self._line_tloss,) = self._ax_loss.plot(
+            [], [], color="#5ec8e5", lw=1.3, animated=True, label="Train",
+        )
+        (self._line_vloss_glow,) = self._ax_loss.plot(
+            [], [], color="#ff7a90", lw=4.0, alpha=0.12, animated=True,
+        )
+        (self._line_vloss,) = self._ax_loss.plot(
+            [], [], color="#ff7a90", lw=1.3, linestyle="--", animated=True, label="Val",
+        )
+        (self._best_marker,) = self._ax_loss.plot(
+            [], [], linestyle="None", marker="o", markersize=5.5,
+            color="#9bffb0", markeredgecolor="#ffffff", markeredgewidth=0.5,
+            animated=True, label="Best val",
+        )
+        self._ax_loss.legend(fontsize=7, loc="upper right", facecolor="#111925", edgecolor="#334155", labelcolor="#eef2f7")
+
+    def _redraw_background(self):
+        """Full redraw + re-cache background (called only when axes limits change)."""
+        self._fig.canvas.draw()
+        self._fig.canvas.flush_events()
+        self._bg = self._fig.canvas.copy_from_bbox(self._fig.bbox)
+
+    def _to_plot_values(self, pred: torch.Tensor, idx: np.ndarray) -> np.ndarray:
+        pred_np = pred.squeeze().detach().cpu().numpy() if isinstance(pred, torch.Tensor) else np.asarray(pred).squeeze()
+        return pred_np[idx]
+
+    def _blend(self, previous: Optional[np.ndarray], current: np.ndarray, alpha: float) -> np.ndarray:
+        if previous is None or previous.shape != current.shape:
+            return current
+        return previous + alpha * (current - previous)
+
+    def _draw_artists(
+        self,
+        train_plot: np.ndarray,
+        val_plot: Optional[np.ndarray],
+        epoch: int,
+        train_losses: list,
+        val_losses: list,
+        best_val_loss: float,
+    ):
+        self._fig.canvas.restore_region(self._bg)
+
+        self._line_train_glow.set_ydata(train_plot)
+        self._line_train.set_ydata(train_plot)
+        self._ax_train.draw_artist(self._line_train_glow)
+        self._ax_train.draw_artist(self._line_train)
+
+        if self._ax_val is not None and val_plot is not None:
+            self._line_val_glow.set_ydata(val_plot)
+            self._line_val.set_ydata(val_plot)
+            self._ax_val.draw_artist(self._line_val_glow)
+            self._ax_val.draw_artist(self._line_val)
+
+        epochs_x = np.arange(len(train_losses))
+        self._line_tloss_glow.set_data(epochs_x, train_losses)
+        self._line_tloss.set_data(epochs_x, train_losses)
+        self._line_vloss_glow.set_data(epochs_x, val_losses)
+        self._line_vloss.set_data(epochs_x, val_losses)
+
+        best_epoch = int(np.argmin(val_losses)) if val_losses else 0
+        best_value = float(val_losses[best_epoch]) if val_losses else best_val_loss
+        self._best_marker.set_data([best_epoch], [best_value])
+
+        self._epoch_text.set_text(f"Epoch {epoch + 1}/{self._total_epochs}")
+        self._stats_text.set_text(
+            f"train {train_losses[-1]:.2e}   val {val_losses[-1]:.2e}\n"
+            f"best {best_val_loss:.2e} @ epoch {best_epoch + 1}"
+        )
+
+        self._ax_loss.draw_artist(self._line_tloss_glow)
+        self._ax_loss.draw_artist(self._line_tloss)
+        self._ax_loss.draw_artist(self._line_vloss_glow)
+        self._ax_loss.draw_artist(self._line_vloss)
+        self._ax_loss.draw_artist(self._best_marker)
+        self._ax_train.draw_artist(self._epoch_text)
+        self._ax_loss.draw_artist(self._stats_text)
+
+        self._fig.canvas.blit(self._fig.bbox)
+        self._fig.canvas.flush_events()
+
+    def _pause_between_frames(self):
+        if self.config.transition_pause <= 0:
+            return
+        try:
+            self._fig.canvas.start_event_loop(self.config.transition_pause)
+        except Exception:
+            plt.pause(self.config.transition_pause)
+
+    @torch.no_grad()
+    def update(
+        self,
+        epoch: int,
+        train_pred: torch.Tensor,
+        val_pred: Optional[torch.Tensor],
+        train_losses: list,
+        val_losses: list,
+        best_val_loss: float,
+    ):
+        if not self._active:
+            return
+
+        train_plot = self._to_plot_values(train_pred, self._idx_train)
+        val_plot = (
+            self._to_plot_values(val_pred, self._idx_val)
+            if self._show_validation and val_pred is not None else None
+        )
+
+        # Check if loss ylim needs expanding (expand-only, never shrink)
+        finite = [v for v in train_losses + val_losses if np.isfinite(v) and v > 0]
+        needs_bg_refresh = False
+        if finite:
+            new_ymin = min(finite) * 0.5
+            new_ymax = max(finite) * 2.0
+            lo, hi = self._loss_ylim
+            if new_ymin < lo or new_ymax > hi:
+                lo = min(lo, new_ymin)
+                hi = max(hi, new_ymax)
+                self._loss_ylim = (lo, hi)
+                self._ax_loss.set_ylim(lo, hi)
+                needs_bg_refresh = True
+
+        if needs_bg_refresh:
+            self._redraw_background()
+
+        n_frames = max(1, int(self.config.transition_frames))
+        for frame_idx in range(1, n_frames + 1):
+            alpha = frame_idx / n_frames
+            frame_train = self._blend(self._prev_train_pred, train_plot, alpha)
+            frame_val = self._blend(self._prev_val_pred, val_plot, alpha) if val_plot is not None else None
+            self._draw_artists(
+                train_plot=frame_train,
+                val_plot=frame_val,
+                epoch=epoch,
+                train_losses=train_losses,
+                val_losses=val_losses,
+                best_val_loss=best_val_loss,
+            )
+            if frame_idx < n_frames:
+                self._pause_between_frames()
+
+        self._prev_train_pred = train_plot.copy()
+        self._prev_val_pred = val_plot.copy() if val_plot is not None else None
+
+    def close(self):
+        if self._active:
+            plt.ioff()
+            self._active = False
+
+
+# ============================================================================
 # Main Training Script
 # ============================================================================
 
@@ -721,10 +1115,19 @@ def main():
     u_val = torch.tensor(u_val, dtype=torch.float32).unsqueeze(-1)
     y_val = torch.tensor(y_val, dtype=torch.float32).unsqueeze(-1)
 
+    # ---- Toggle live plot here (disable for multi-output datasets) ----
+    live_plot_config = LivePlotConfig(
+        enabled=True,          # <-- set to False to turn off
+        update_interval=1,     # redraw every epoch for the smoothest motion
+        n_points=1200,         # max time steps shown
+        transition_frames=5,
+        transition_pause=0.002,
+    )
+
     # Initialize configurations
     model_config = ModelConfig(n_u=u_train.shape[1], n_y=y_train.shape[1], param='tvc', d_model=8, d_state=8,
                                gamma= 7, ff='MBLIP', init='eye',
-                               n_layers=6, d_amp=3, rho=0.99, phase_center=0.0, max_phase_b=.04, d_hidden=12, nl_layers=3)
+                               n_layers=6, d_amp=3, rho=0.99, phase_center=0.0, max_phase_b=2*np.pi, d_hidden=12, nl_layers=3)
     train_config = TrainingConfig(num_epochs=2000, learning_rate=1.6568e-02,
                                   init_window=test.state_initialization_window_length)
     hpo_config = HyperOptConfig(enabled=False, n_trials=20, num_epochs=250)
@@ -777,7 +1180,8 @@ def main():
     print(f"Number of parameters: {total_params}")
 
     # Initialize trainer
-    trainer = SystemIDTrainer(model, train_config, criterion=nn.MSELoss())
+    trainer = SystemIDTrainer(model, train_config, criterion=nn.MSELoss(),
+                              live_plot_config=live_plot_config)
 
     # Train model
     history = trainer.fit(u_train, y_train, u_val, y_val, use_early_stopping=False)
