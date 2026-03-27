@@ -9,14 +9,25 @@ Models follow:
 instantiated as:
   model = DeepSSM(
       d_input=1, d_output=1, d_model=10, d_state=8, n_layers=4,
-      param='lru', ff='LGLU', gamma=4, max_phase_b=None
+      param='l2n', ff='LGLU', gamma=4, max_phase_b=0.5, learn_x0=False
   ).to(device)
+
+Valid param values:
+  'lru'   — standard LRU (no L2 gain constraint)
+  'zak'   — lruz variant
+  'l2ru'  — L2-bounded LRU (uses d_model as state dim)
+  'l2n'   — Block2x2 dense L2 SSM (needs even d_state)
+  'l2nt'  — L2-bounded LTI cell
+  'tv'    — RobustMambaDiagSSM (time-varying)
+  'tvc'   — RobustMambaDiagLTI (time-varying / LTI-coupled)
+
+Valid ff values: 'GLU', 'MLP', 'LGLU', 'LGLU2', 'LMLP', 'MBLIP'
 
 This script:
   - Generates synthetic sequences with a faint long-memory cue + bounded-energy disturbance.
   - Trains/evaluates:
       * baseline(s): param='lru' (gamma ignored)
-      * L2RU sweep:  param='l2n'  with gamma in a list
+      * L2-constrained sweep: param='l2n' (or any certified param) with gamma in a list
   - Produces:
       * results.jsonl
       * heatmaps (clean + noisy + degradation + gain-sensitivity) over (T x eps)
@@ -262,6 +273,7 @@ def build_model(
     max_phase_b: Optional[float] = None,
     train_gamma: bool = False,
     ff_scale: float = 1.0,
+    learn_x0: bool = False,
 ) -> nn.Module:
     core = DeepSSM(
         d_input=d_input,
@@ -275,6 +287,7 @@ def build_model(
         max_phase_b=max_phase_b,
         train_gamma=train_gamma,
         scale=ff_scale,
+        learn_x0=learn_x0,
     ).to(device)
     return LastStepWrapper(core).to(device)
 
@@ -719,15 +732,22 @@ def main():
     ap.add_argument("--burst_frac", type=float, default=0.1)
 
     # Models
-    ap.add_argument("--baselines", type=str, default="lru")
-    ap.add_argument("--l2ru_param_name", type=str, default="l2n")
+    ap.add_argument("--baselines", type=str, default="lru",
+                    help="Comma-separated list of unconstrained param names to use as baselines. "
+                         "Valid values: lru, zak, l2ru, l2n, l2nt, tv, tvc.")
+    ap.add_argument("--l2ru_param_name", type=str, default="l2n",
+                    help="Param name for the certified sweep over --gammas. "
+                         "Valid values: l2n (Block2x2, needs even d_state), l2nt, tv, tvc, l2ru.")
     ap.add_argument("--gammas", type=str, default="0.5,1.0,2.0,4.0")
     ap.add_argument("--max_phase_b", type=float, default=float("nan"))
     ap.add_argument("--train_gamma", type=int, default=0, choices=[0, 1],
                     help="Set to 1 to make internal L2-SSM gammas trainable. "
                          "Default 0 keeps the prescribed-gain interpretation cleaner.")
     ap.add_argument("--ff_scale", type=float, default=1.0,
-                    help="Lipschitz scale passed to FF blocks (e.g. LGLU/LMLP).")
+                    help="Lipschitz scale passed to FF blocks (LGLU, LGLU2, LMLP, MBLIP).")
+    ap.add_argument("--learn_x0", type=int, default=0, choices=[0, 1],
+                    help="Set to 1 to make the initial hidden state a learnable parameter. "
+                         "Default 0 starts from zeros (does not affect L2 gain certificate).")
 
     # DeepSSM hyperparams
     ap.add_argument("--d_model", type=int, default=8)
@@ -761,8 +781,9 @@ def main():
 
     args = ap.parse_args()
 
-    # l2n / l2ru require even d_state (2×2 block structure). Round up silently.
-    _l2_params = {"l2n", "l2ru", "lruz"}
+    # l2n / lruz require even d_state (2×2 block structure). Round up silently.
+    # Note: l2ru uses d_model (not d_state) as its state dim, so no constraint there.
+    _l2_params = {"l2n", "lruz"}
     l2ru_needs_even = args.l2ru_param_name in _l2_params
     baseline_needs_even = any(p in _l2_params for p in args.baselines.split(","))
     if (l2ru_needs_even or baseline_needs_even) and args.d_state % 2 != 0:
@@ -867,6 +888,7 @@ def main():
                 max_phase_b=max_phase_b,
                 train_gamma=bool(args.train_gamma),
                 ff_scale=args.ff_scale,
+                learn_x0=bool(args.learn_x0),
             )
             train_metrics = train_one(
                 model=model,
@@ -909,6 +931,7 @@ def main():
                     "max_phase_b": max_phase_b,
                     "train_gamma": bool(args.train_gamma),
                     "ff_scale": args.ff_scale,
+                    "learn_x0": bool(args.learn_x0),
                 },
                 "train": train_metrics,
                 "test_clean": test_clean,

@@ -18,7 +18,10 @@ def init_or_cast_state(
     if state.dim() == 1:
         state = state.unsqueeze(0).expand(batch_size, -1)
     elif state.dim() == 2:
-        if state.size(0) == 1 and batch_size > 1:
+        if state.size(0) == 1:
+            # Always expand (even when batch_size==1) so that if x0 is an nn.Parameter,
+            # expand() returns a plain Tensor view instead of the Parameter itself.
+            # Autograd still tracks the view, so gradients reach x0_param.
             state = state.expand(batch_size, -1)
     else:
         raise ValueError("state must have shape (N,) or (B,N)")
@@ -38,25 +41,33 @@ def resolve_runtime_state(
     n_state: int,
     device: torch.device,
     dtype: torch.dtype,
+    x0: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     if reset_state:
-        internal_state = None
+        # Use learnable x0 if provided, otherwise fall back to zeros via init_or_cast_state.
+        internal_state = x0
     source_state = explicit_state if explicit_state is not None else internal_state
     if explicit_state is None and source_state is not None:
         # Internal state is best-effort: if shape no longer matches current batch,
-        # reinitialize from zeros instead of crashing.
+        # fall back to x0 (or zeros) instead of crashing.
         if source_state.dim() == 1:
             if source_state.shape[0] != n_state:
-                source_state = None
+                source_state = x0
         elif source_state.dim() == 2:
             if source_state.shape[1] != n_state or source_state.shape[0] not in (1, batch_size):
-                source_state = None
+                source_state = x0
         else:
-            source_state = None
+            source_state = x0
     return init_or_cast_state(source_state, batch_size, n_state, device, dtype)
 
 
-def reset_runtime_state(state: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+def reset_runtime_state(
+    state: Optional[torch.Tensor],
+    x0: Optional[torch.Tensor] = None,
+) -> Optional[torch.Tensor]:
+    """Reset state to x0 (if learnable) or zeros."""
+    if x0 is not None:
+        return x0.detach()  # (1, n_state) — broadcast to (B, n_state) on next forward
     if state is None:
         return None
     return torch.zeros_like(state)

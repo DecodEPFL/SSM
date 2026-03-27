@@ -162,6 +162,7 @@ class LRU(nn.Module):
             rmin: float = 0.9,
             rmax: float = 1.0,
             max_phase: float = 6.283,
+            learn_x0: bool = False,
     ):
         super().__init__()
         self.in_features = in_features
@@ -204,6 +205,12 @@ class LRU(nn.Module):
 
         # Runtime state
         self.state: Optional[torch.Tensor] = None
+
+        # Learnable initial condition (complex, shape (1, N))
+        if learn_x0:
+            self.x0_param = nn.Parameter(torch.zeros(1, state_features, dtype=torch.complex64))
+        else:
+            self.register_buffer('x0_param', None)
 
         # Small cache for complex->real transform 2x2 blocks
         self._T_cache: Dict[str, torch.Tensor] = {}
@@ -276,6 +283,7 @@ class LRU(nn.Module):
             n_state=self.state_features,
             device=input.device,
             dtype=self.B.dtype,
+            x0=self.x0_param,
         )
         if mode == "scan":
             return self.forward_scan(input, self.state, detach_state=detach_state)
@@ -284,7 +292,7 @@ class LRU(nn.Module):
         raise ValueError(f"Unknown mode: {mode}. Expected 'scan', 'loop', or 'loop_efficient'.")
 
     def reset(self):
-        self.state = _reset_runtime_state(self.state)
+        self.state = _reset_runtime_state(self.state, x0=self.x0_param)
 
 
 # python
@@ -292,7 +300,7 @@ class L2RU(nn.Module):
     """LRU with learnable or fixed l2 gain gamma."""
 
     def __init__(self, state_features: int, gamma: float = None, init: str = "eye", q: int = 1, eye_scale=0.01,
-                 rand_scale=1):
+                 rand_scale=1, learn_x0: bool = False):
         super().__init__()
         self.state_features = state_features
         if gamma is not None:
@@ -336,6 +344,13 @@ class L2RU(nn.Module):
 
         # Runtime LTI
         self.state: Optional[torch.Tensor] = None
+
+        # Learnable initial condition (real, shape (1, N))
+        if learn_x0:
+            self.x0_param = nn.Parameter(torch.zeros(1, state_features))
+        else:
+            self.register_buffer('x0_param', None)
+
         self.set_param()
 
     def _get_lower_triangular(self, params: torch.Tensor) -> torch.Tensor:
@@ -413,6 +428,7 @@ class L2RU(nn.Module):
             n_state=self.state_features,
             device=input.device,
             dtype=input.dtype,
+            x0=self.x0_param,
         )
 
         x0 = self.state
@@ -433,7 +449,7 @@ class L2RU(nn.Module):
             raise ValueError(f"Unknown mode: {mode}. Expected 'scan', 'loop', or 'loop_efficient'.")
 
     def reset(self):
-        self.state = _reset_runtime_state(self.state)
+        self.state = _reset_runtime_state(self.state, x0=self.x0_param)
 
 
 # python
@@ -441,7 +457,7 @@ class lruz(nn.Module):
     """LRU (ZAK parametrization) with learnable or fixed l2 gain gamma."""
 
     def __init__(self, input_features: int, output_features: int, state_features: int, rmin=0.9, rmax=1.0,
-                 max_phase=6.283, gamma: float = None):
+                 max_phase=6.283, gamma: float = None, learn_x0: bool = False):
         super().__init__()
         self.state_features = state_features
         self.input_features = input_features
@@ -473,6 +489,12 @@ class lruz(nn.Module):
 
         self.X2b = nn.Parameter(torch.randn(2 * state_features, input_features + output_features))
         self.Dp = nn.Parameter(torch.randn(output_features, input_features))
+
+        # Learnable initial condition (complex, shape (1, N))
+        if learn_x0:
+            self.x0_param = nn.Parameter(torch.zeros(1, state_features, dtype=torch.complex64))
+        else:
+            self.register_buffer('x0_param', None)
 
         # Runtime SSM params initialization
         self.set_param()
@@ -600,6 +622,7 @@ class lruz(nn.Module):
             n_state=self.state_features,
             device=input.device,
             dtype=_cplx_dtype,
+            x0=self.x0_param,
         )
 
         if mode == "scan":
@@ -609,7 +632,7 @@ class lruz(nn.Module):
         raise ValueError(f"Unknown mode: {mode}. Expected 'scan', 'loop', or 'loop_efficient'.")
 
     def reset(self):
-        self.state = _reset_runtime_state(self.state)
+        self.state = _reset_runtime_state(self.state, x0=self.x0_param)
 
 
 class L2BoundedLTICell(nn.Module):
@@ -622,7 +645,7 @@ class L2BoundedLTICell(nn.Module):
     with ||K||_2 <= 1 (enforced via SVD).
     """
 
-    def __init__(self, d_state, d_input, d_output, gamma=1.0, train_gamma=False):
+    def __init__(self, d_state, d_input, d_output, gamma=1.0, train_gamma=False, learn_x0: bool = False):
         super().__init__()
         self.d_state = d_state
         self.d_input = d_input
@@ -642,6 +665,12 @@ class L2BoundedLTICell(nn.Module):
             self.log_gamma = nn.Parameter(g0.log())
         else:
             self.register_buffer("log_gamma", g0.log())
+
+        # Learnable initial condition (real, shape (1, d_state))
+        if learn_x0:
+            self.x0_param = nn.Parameter(torch.zeros(1, d_state))
+        else:
+            self.register_buffer('x0_param', None)
 
         eigvals_target = 0.98 * torch.ones(d_state, dtype=torch.float64)
         self.init_orthogonal_spectrum(eigvals_target, offdiag_scale=0.8)
@@ -839,6 +868,7 @@ class L2BoundedLTICell(nn.Module):
             n_state=self.d_state,
             device=u.device,
             dtype=u.dtype,
+            x0=self.x0_param,
         )
 
         A, B, C, D, _ = self.compute_ssm_matrices()
@@ -905,6 +935,7 @@ class L2BoundedLTICell(nn.Module):
             n_state=self.d_state,
             device=u.device,
             dtype=u.dtype,
+            x0=self.x0_param,
         )
 
         # Precompute transposes for efficient GEMV
@@ -939,7 +970,7 @@ class L2BoundedLTICell(nn.Module):
         return y_seq, x_last
 
     def reset(self):
-        self.state = _reset_runtime_state(self.state)
+        self.state = _reset_runtime_state(self.state, x0=self.x0_param)
 
 
 class Block2x2DenseL2SSM(nn.Module):
@@ -998,6 +1029,7 @@ class Block2x2DenseL2SSM(nn.Module):
         eps_radius: float = 1e-3,
         power_iters: int = 1,
         exact_norm: bool = True,
+        learn_x0: bool = False,
     ):
         super().__init__()
         assert d_state % 2 == 0, "d_state must be even (2x2 blocks)."
@@ -1033,6 +1065,11 @@ class Block2x2DenseL2SSM(nn.Module):
         else:
             self.register_buffer("log_gamma", g0.log())
 
+        # Learnable initial condition in x-basis (real, shape (1, d_state))
+        if learn_x0:
+            self.x0_param = nn.Parameter(torch.zeros(1, d_state))
+        else:
+            self.register_buffer('x0_param', None)
 
     @property
     def gamma(self) -> torch.Tensor:
@@ -1368,6 +1405,7 @@ class Block2x2DenseL2SSM(nn.Module):
             n_state=dx,
             device=u_bt.device,
             dtype=u_bt.dtype,
+            x0=self.x0_param,
         )
 
         # S used for x<->z
@@ -1458,4 +1496,4 @@ class Block2x2DenseL2SSM(nn.Module):
         return y_seq
 
     def reset(self):
-        self.state = _reset_runtime_state(self.state)
+        self.state = _reset_runtime_state(self.state, x0=self.x0_param)

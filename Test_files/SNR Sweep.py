@@ -2,7 +2,7 @@ import numpy as np
 import torch
 import matplotlib.pyplot as plt
 from typing import Callable, Dict, List
-from src.neural_ssm.ssm.lru import DeepSSM, SSMConfig
+from src.neural_ssm.ssm import DeepSSM, SSMConfig
 import math
 from argparse import Namespace
 

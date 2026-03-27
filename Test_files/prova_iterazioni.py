@@ -3,7 +3,7 @@ import torch
 from pathlib import Path
 import neural_ssm
 from torch.utils.data import DataLoader, random_split, Subset, SubsetRandomSampler, Dataset
-from src.neural_ssm.ssm.lru import DeepSSM
+from src.neural_ssm.ssm import DeepSSM
 import matplotlib.pyplot as plt
 torch.manual_seed(2)
 

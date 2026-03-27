@@ -157,6 +157,7 @@ class RobustMambaDiagSSM(nn.Module):
         proj_bound: float = 1.0,
         exact_norm: bool = True,
         power_iters: int = 1,
+        learn_x0: bool = False,
     ):
         super().__init__()
         self.D = int(d_model)
@@ -208,6 +209,12 @@ class RobustMambaDiagSSM(nn.Module):
         self.reset_parameters(
             init_rho=init_rho, init_delta0=init_delta0, init_param_scale=init_param_scale
         )
+
+        # Learnable initial condition (real, shape (1, N))
+        if learn_x0:
+            self.x0_param = nn.Parameter(torch.zeros(1, self.N))
+        else:
+            self.register_buffer('x0_param', None)
 
     @property
     def gamma(self) -> torch.Tensor:
@@ -299,6 +306,7 @@ class RobustMambaDiagSSM(nn.Module):
             n_state=self.N,
             device=device,
             dtype=dtype,
+            x0=self.x0_param,
         )
 
         a_bt, b_bt, c_bt, u_scaled_bt = self._compute_params(u)   # (B,T,N)
@@ -347,7 +355,7 @@ class RobustMambaDiagSSM(nn.Module):
         return y
 
     def reset(self):
-        self.state = _reset_runtime_state(self.state)
+        self.state = _reset_runtime_state(self.state, x0=self.x0_param)
 
 
 class RobustMambaDiagLTI(nn.Module):
@@ -391,6 +399,7 @@ class RobustMambaDiagLTI(nn.Module):
         exact_norm: bool = True,
         power_iters: int = 1,
         output_uses_post_state: bool = False,
+        learn_x0: bool = False,
     ):
         super().__init__()
         self.D = int(d_model)
@@ -467,6 +476,12 @@ class RobustMambaDiagLTI(nn.Module):
             init_c=init_c,
             init_d=init_d,
         )
+
+        # Learnable initial condition (real, shape (1, N))
+        if learn_x0:
+            self.x0_param = nn.Parameter(torch.zeros(1, self.N))
+        else:
+            self.register_buffer('x0_param', None)
 
     @property
     def gamma(self) -> torch.Tensor:
@@ -596,6 +611,7 @@ class RobustMambaDiagLTI(nn.Module):
             n_state=self.N,
             device=device,
             dtype=dtype,
+            x0=self.x0_param,
         )
 
         a_bt, b_bt, c_bt, d_bt, u_scaled_bt = self._compute_params(u)
@@ -657,4 +673,4 @@ class RobustMambaDiagLTI(nn.Module):
         return y
 
     def reset(self):
-        self.state = _reset_runtime_state(self.state)
+        self.state = _reset_runtime_state(self.state, x0=self.x0_param)
