@@ -2,7 +2,7 @@ import numpy as np
 import torch
 import time
 from l2cell import L2BoundedLTICell
-from src.neural_ssm.ssm.lru import DeepSSM, SSMConfig, PureLRUR
+from src.neural_ssm.ssm import DeepSSM, SSMConfig, PureLRUR
 from l2cellblocks import Block2x2DenseL2SSM
 import matplotlib.pyplot as plt
 

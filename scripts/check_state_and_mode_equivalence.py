@@ -24,7 +24,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from neural_ssm.ssm.lru import LRU, Block2x2DenseL2SSM
+from neural_ssm.ssm import LRU, Block2x2DenseL2SSM
 
 
 def parse_chunks(spec: str | None, seq_len: int) -> list[int]:

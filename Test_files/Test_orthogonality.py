@@ -34,7 +34,7 @@ except Exception:
 
 # --- your model (required) ---
 try:
-    from src.neural_ssm.ssm.lru import Block2x2DenseL2SSM  # type: ignore
+    from src.neural_ssm.ssm import Block2x2DenseL2SSM  # type: ignore
 except Exception as e:
     Block2x2DenseL2SSM = None  # type: ignore
     _IMPORT_ERR = e

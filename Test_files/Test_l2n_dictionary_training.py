@@ -24,8 +24,7 @@ except Exception:  # pragma: no cover - optional dependency in CI
     nonlinear_benchmarks = None
 
 
-from src.neural_ssm.ssm.lru import Block2x2DenseL2SSM, LRU
-from src.neural_ssm.ssm.mamba import RobustMambaDiagSSM
+from src.neural_ssm.ssm import Block2x2DenseL2SSM, LRU, RobustMambaDiagSSM
 
 
 @dataclass

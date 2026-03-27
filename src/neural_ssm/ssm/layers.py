@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, fields
-from typing import TypedDict, Optional, List, Union, Tuple
+from typing import TypedDict, Optional, List, Union, Tuple, Sequence
 
 import torch
 import torch.nn as nn
@@ -58,6 +58,7 @@ class SSMConfig:
     phase_center: float = 0        # center angle
     random_phase: bool = True
     offdiag_scale: float = 0.05  # init std for K12/K21/K22 in l2n (old default was 0.005)
+    learn_x0: bool = False  # if True, the initial hidden state is a learnable parameter
 
     # Parallel scan must be selected in the forward call of the SSM.
 
@@ -86,9 +87,10 @@ class SSL(nn.Module):
                 rmin=config.rmin,
                 rmax=config.rmax,
                 max_phase=config.max_phase,
+                learn_x0=config.learn_x0,
             )
         elif config.param == "l2ru":
-            self.lru = L2RU(state_features=config.d_model, init=config.init)
+            self.lru = L2RU(state_features=config.d_model, init=config.init, learn_x0=config.learn_x0)
         elif config.param == "zak":
             self.lru = lruz(
                 input_features=config.d_model,
@@ -97,6 +99,7 @@ class SSL(nn.Module):
                 rmin=config.rmin,
                 rmax=config.rmax,
                 max_phase=config.max_phase,
+                learn_x0=config.learn_x0,
             )
         elif config.param == "l2n":
             if config.gamma is not None and config.n_layers > 0:
@@ -109,6 +112,7 @@ class SSL(nn.Module):
                 d_output=config.d_model,
                 gamma=init_block_gamma,
                 train_gamma=config.train_gamma,
+                learn_x0=config.learn_x0,
             )
             self.lru.init_on_circle(
                 rho=config.rho,
@@ -123,6 +127,7 @@ class SSL(nn.Module):
                 d_input=config.d_model,
                 d_output=config.d_model,
                 train_gamma=config.train_gamma,
+                learn_x0=config.learn_x0,
             )
         elif config.param == "tv":
             self.lru = RobustMambaDiagSSM(
@@ -130,23 +135,25 @@ class SSL(nn.Module):
                 d_model=config.d_model,
                 d_out=config.d_model,
                 train_gamma=config.train_gamma,
+                learn_x0=config.learn_x0,
             )
         elif config.param == "tvc":
             self.lru = RobustMambaDiagLTI(
-            d_state=config.d_state,
-            d_model=config.d_model,
-            d_out=config.d_model,
-            train_gamma=config.train_gamma,
-            param_net="mlp",
-            hidden=max(64, 2 * config.d_model),
-            init_rho=config.rho,
-            init_sign=0.995,
-            init_b=0.10,
-            init_c=0.10,
-            init_d=0.10,
-            bcd_nonlinearity="tanh",
-            output_uses_post_state=False,  # keeps the exact simple certificate
-        )
+                d_state=config.d_state,
+                d_model=config.d_model,
+                d_out=config.d_model,
+                train_gamma=config.train_gamma,
+                param_net="mlp",
+                hidden=max(64, 2 * config.d_model),
+                init_rho=config.rho,
+                init_sign=0.995,
+                init_b=0.10,
+                init_c=0.10,
+                init_d=0.10,
+                bcd_nonlinearity="tanh",
+                output_uses_post_state=False,  # keeps the exact simple certificate
+                learn_x0=config.learn_x0,
+            )
         else:
             raise ValueError("Invalid parametrization")
 
@@ -229,6 +236,7 @@ class DeepSSM(nn.Module):
         max_phase_b: float = 0.5,
         phase_center: float = 0,
         random_phase: bool = True,
+        learn_x0: bool = False,
         config: Optional[SSMConfig] = None,
     ):
         super().__init__()
@@ -257,6 +265,7 @@ class DeepSSM(nn.Module):
             max_phase_b=max_phase_b,
             phase_center=phase_center,
             random_phase=random_phase,
+            learn_x0=learn_x0,
         )
 
         self.use_cert_scaling = (self.config.param != "lru") and (self.config.gamma is not None)
@@ -318,7 +327,7 @@ class DeepSSM(nn.Module):
     def forward(
         self,
         u: torch.Tensor,
-        state: Optional[List[torch.Tensor]] = None,
+        state: Optional[Union[torch.Tensor, Sequence[Optional[torch.Tensor]]]] = None,
         gamma=None,
         mode: str = "scan",
         reset_state: bool = True,
@@ -328,10 +337,19 @@ class DeepSSM(nn.Module):
         if reset_state:
             self.reset()
 
+        n_blocks = len(self.blocks)
         if state is None:
-            layer_states: List[Optional[torch.Tensor]] = [None] * len(self.blocks)
+            layer_states: List[Optional[torch.Tensor]] = [None] * n_blocks
+        elif isinstance(state, (list, tuple)):
+            if len(state) != n_blocks:
+                raise ValueError(
+                    f"state must provide exactly one entry per SSL block: "
+                    f"expected {n_blocks}, got {len(state)}"
+                )
+            layer_states = list(state)
         else:
-            layer_states = state if isinstance(state, list) else [state] * len(self.blocks)
+            # Convenience path: broadcast one state tensor to every block.
+            layer_states = [state] * n_blocks
 
         # Encode
         if self.use_cert_scaling:
@@ -424,12 +442,12 @@ class DeepSSM(nn.Module):
 class PureLRUR(nn.Module):
     """Pure LRU block without scaffolding."""
 
-    def __init__(self, n: int, gamma: float = None, param: str = "l2ru", init: str = "eye"):
+    def __init__(self, n: int, gamma: float = None, param: str = "l2ru", init: str = "eye", learn_x0: bool = False):
         super().__init__()
         if param == "l2ru":
-            self.lru = L2RU(state_features=n, gamma=gamma, init=init)
+            self.lru = L2RU(state_features=n, gamma=gamma, init=init, learn_x0=learn_x0)
         elif param == "lru":
-            self.lru = LRU(in_features=n, out_features=n, state_features=n)
+            self.lru = LRU(in_features=n, out_features=n, state_features=n, learn_x0=learn_x0)
         else:
             raise ValueError("Unsupported param")
 
@@ -482,6 +500,7 @@ class SimpleRNN(nn.Module):
         bias: bool = True,
         dropout: float = 0.0,        # only applied if num_layers > 1 (PyTorch behavior)
         bidirectional: bool = False, # for simplicity, we keep return shapes as-is
+        learn_x0: bool = False,
     ):
         super().__init__()
         self.d_input = int(d_input)
@@ -505,6 +524,13 @@ class SimpleRNN(nn.Module):
         # Project RNN outputs to d_output
         self.out_proj = nn.Linear(self.d_hidden * self.num_directions, self.d_output, bias=bias)
         self.state: Optional[torch.Tensor] = None
+
+        # Learnable initial hidden state: shape (num_layers * num_directions, 1, d_hidden)
+        L = self.num_layers * self.num_directions
+        if learn_x0:
+            self.x0_param = nn.Parameter(torch.zeros(L, 1, self.d_hidden))
+        else:
+            self.register_buffer('x0_param', None)
 
     def _format_h0(self, h0: Optional[torch.Tensor], B: int, device, dtype) -> torch.Tensor:
         """
@@ -565,7 +591,7 @@ class SimpleRNN(nn.Module):
 
         source_state = state if state is not None else self.state
         if reset_state:
-            source_state = None
+            source_state = self.x0_param  # None when learn_x0=False → zeros
         h0 = self._format_h0(source_state, B, u3d.device, u3d.dtype)
 
         # Run RNN
@@ -607,4 +633,4 @@ class SimpleRNN(nn.Module):
 
     def reset(self):
         from .state_utils import reset_runtime_state as _reset_runtime_state
-        self.state = _reset_runtime_state(self.state)
+        self.state = _reset_runtime_state(self.state, x0=self.x0_param)

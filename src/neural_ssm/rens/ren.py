@@ -73,7 +73,7 @@ class REN(nn.Module):
 
         # initialize internal state
         if internal_state_init is None:
-            self.x = torch.zeros(1, 1, self.dim_internal, device="cuda")
+            self.x = torch.zeros(1, 1, self.dim_internal)
         else:
             assert isinstance(internal_state_init, torch.Tensor)
             self.x = internal_state_init.reshape(1, 1, self.dim_internal)
@@ -137,25 +137,39 @@ class REN(nn.Module):
         # Matrix P
         #self.P = torch.matmul(self.E.T, torch.matmul(torch.inverse(self.P_cal), self.E))
 
+        # Precompute effective state-update matrices so E.inverse() is not
+        # called inside the time loop (saves T inverse() calls per forward).
+        E_inv = torch.inverse(self.E)
+        self.A_eff  = E_inv @ self.F    # E^{-1} F
+        self.B1_eff = E_inv @ self.B1   # E^{-1} B1
+        self.B2_eff = E_inv @ self.B2   # E^{-1} B2
+
     def forward(self, u):
-        decay_rate = 0.95
-        batch_size = u.shape[0]
-        w = torch.zeros(batch_size, 1, self.dim_nl, device=u.device)
-        # update each row of w using Eq. (8) with a lower triangular D11
-        for i in range(self.dim_nl):
-            #  v is element i of v with dim (batch_size, 1)
-            v = F.linear(self.x, self.C1[i, :]) + F.linear(w, self.D11[i, :]) + F.linear(u, self.D12[i, :])
-            w = w + (self.eye_mask_w[i, :] * torch.tanh(v / self.Lambda[i])).reshape(batch_size, 1, self.dim_nl)
+        # u: (B, T, n_u) — rebuild constrained matrices once, then loop over T
+        self.set_param()
+        batch_size, T, _ = u.shape
 
-        # compute next state using Eq. 18
-        self.x = F.linear(
-            F.linear(self.x, self.F) + F.linear(w, self.B1) + F.linear(u, self.B2),
-            self.E.inverse())
+        # Batch all input-linear projections across the full sequence at once,
+        # so they are computed with a single matmul instead of one per timestep.
+        u_D12  = u @ self.D12.T    # (B, T, dim_nl)  — v_base input part
+        u_B2   = u @ self.B2_eff.T # (B, T, n_state) — state input part
+        u_D22  = u @ self.D22.T    # (B, T, n_y)     — output feedthrough
 
-        # compute output
-        y = F.linear(self.x, self.C2) + F.linear(w, self.D21) + F.linear(u, self.D22)
-
-        return y
+        outputs = []
+        for t in range(T):
+            w = torch.zeros(batch_size, 1, self.dim_nl, device=u.device, dtype=u.dtype)
+            # Precompute the x- and u-dependent parts of v once per timestep
+            # (saves dim_nl redundant matmuls in the inner loop below).
+            v_base = F.linear(self.x, self.C1) + u_D12[:, t:t+1, :]  # (B,1,dim_nl)
+            # update each row of w — must stay sequential (lower-triangular D11).
+            # Use out-of-place w = w + masked_update to keep autograd graph intact.
+            for i in range(self.dim_nl):
+                v_i = v_base[:, :, i:i+1] + F.linear(w, self.D11[i:i+1, :])
+                w = w + (self.eye_mask_w[i] * torch.tanh(v_i / self.Lambda[i])).view(batch_size, 1, self.dim_nl)
+            # state update (no inverse — uses precomputed effective matrices)
+            self.x = F.linear(self.x, self.A_eff) + F.linear(w, self.B1_eff) + u_B2[:, t:t+1, :]
+            outputs.append(F.linear(self.x, self.C2) + F.linear(w, self.D21) + u_D22[:, t:t+1, :])
+        return torch.cat(outputs, dim=1)  # (B, T, n_y)
 
     def _set_mode(self, mode, gamma, Q, R, S, eps: float = 1e-4):
         # We set Q to be negative definite. If Q is nsd we set: Q - \epsilon I.

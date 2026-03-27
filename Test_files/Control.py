@@ -22,7 +22,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
-from src.neural_ssm.ssm.lru import DeepSSM, SSMConfig
+from src.neural_ssm.ssm import DeepSSM, SSMConfig
 from src.neural_ssm.ssm.scan_utils import binary_operator_diag, associative_scan
 
 import control  # python-control

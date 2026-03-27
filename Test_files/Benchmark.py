@@ -7,13 +7,15 @@ import scipy.io as sio
 from pathlib import Path
 from typing import Dict, Tuple, Optional, Any
 from dataclasses import dataclass, replace, field
+import copy
 from tqdm import tqdm
 import logging
 import math
 import nonlinear_benchmarks
 from nonlinear_benchmarks.error_metrics import RMSE, NRMSE, R_squared, MAE, fit_index
 import json
-from src.neural_ssm.ssm.lru import DeepSSM, SSMConfig, SimpleRNN
+from src.neural_ssm.ssm import DeepSSM, SSMConfig, SimpleRNN
+from src.neural_ssm.rens.ren import REN
 
 try:
     import optuna
@@ -45,6 +47,84 @@ class TrainingConfig:
     save_dir: Path = field(default_factory=lambda: Path(__file__).resolve().parent / "checkpoints")
     save_best_only: bool = True
 
+    # Data normalization
+    normalize_data: bool = False
+    normalization_eps: float = 1e-6
+
+
+class RENWrapper(nn.Module):
+    """Adapts REN to the (B, T, n_u) → (y, None) interface expected by SystemIDTrainer.
+
+    REN.forward() processes one timestep at a time using internal state self.x.
+    This wrapper resets the state, rebuilds the constrained matrices from the
+    current learnable parameters, then loops over the time axis.
+    """
+
+    def __init__(self, dim_in: int, dim_out: int, dim_internal: int, dim_nl: int,
+                 **kwargs):
+        super().__init__()
+        self.ren = REN(dim_in=dim_in, dim_out=dim_out,
+                       dim_internal=dim_internal, dim_nl=dim_nl, **kwargs)
+
+    def forward(self, u: torch.Tensor):
+        # Accept (T, n_u) or (B, T, n_u); always run as (B, T, n_u).
+        if u.dim() == 2:
+            u = u.unsqueeze(0)  # (T, n_u) → (1, T, n_u)
+        B = u.shape[0]
+        self.ren.x = torch.zeros(B, 1, self.ren.dim_internal, device=u.device, dtype=u.dtype)
+        y = self.ren(u)  # (B, T, n_y)
+        if B == 1:
+            y = y.squeeze(0)  # back to (T, n_y) to match DeepSSM's output convention
+        return y, None
+
+
+class LSTMWrapper(nn.Module):
+    """Thin PyTorch LSTM baseline with the same interface as DeepSSM."""
+
+    def __init__(
+            self,
+            dim_in: int,
+            dim_out: int,
+            dim_hidden: int = 64,
+            num_layers: int = 2,
+            dropout: float = 0.0,
+            bias: bool = True,
+            bidirectional: bool = False,
+    ):
+        super().__init__()
+        self.dim_in = dim_in
+        self.dim_out = dim_out
+        self.dim_hidden = dim_hidden
+        self.num_layers = num_layers
+        self.bidirectional = bidirectional
+        self.num_directions = 2 if bidirectional else 1
+
+        self.lstm = nn.LSTM(
+            input_size=dim_in,
+            hidden_size=dim_hidden,
+            num_layers=num_layers,
+            bias=bias,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0,
+            bidirectional=bidirectional,
+        )
+        self.out_proj = nn.Linear(dim_hidden * self.num_directions, dim_out, bias=bias)
+
+    def forward(self, u: torch.Tensor):
+        # Accept (T, n_u) or (B, T, n_u); always run as (B, T, n_u).
+        squeeze_batch = False
+        if u.dim() == 2:
+            u = u.unsqueeze(0)
+            squeeze_batch = True
+
+        y_seq, _ = self.lstm(u)
+        y = self.out_proj(y_seq)
+
+        if squeeze_batch:
+            y = y.squeeze(0)
+
+        return y, None
+
 
 @dataclass
 class ModelConfig:
@@ -68,6 +148,7 @@ class ModelConfig:
     max_phase_b: float = 0.5  # small spread
     phase_center: float = 0  # center angle ≈ 17°
     random_phase: bool = True
+    learn_x0: bool = True
 
     def to_ssm_config(self) -> SSMConfig:
         """Convert to SSMConfig object."""
@@ -89,6 +170,7 @@ class ModelConfig:
             max_phase_b = self.max_phase_b,
             phase_center = self.phase_center,
             random_phase=self.random_phase,
+            learn_x0= self.learn_x0
         )
 
 
@@ -148,6 +230,73 @@ class SystemIDDataset(Dataset):
         return self.u[idx], self.y[idx]
 
 
+@dataclass
+class ChannelwiseStandardizer:
+    """Per-channel affine normalization using training-split statistics only."""
+    u_mean: torch.Tensor
+    u_std: torch.Tensor
+    y_mean: torch.Tensor
+    y_std: torch.Tensor
+
+    @staticmethod
+    def _reduce_dims(x: torch.Tensor) -> Tuple[int, ...]:
+        if x.dim() < 2:
+            raise ValueError(
+                "Expected input with at least one sample axis and one feature axis; "
+                f"got shape {tuple(x.shape)}"
+            )
+        return tuple(range(x.dim() - 1))
+
+    @classmethod
+    def fit(
+            cls,
+            u_train: torch.Tensor,
+            y_train: torch.Tensor,
+            eps: float = 1e-6,
+    ) -> "ChannelwiseStandardizer":
+        reduce_u = cls._reduce_dims(u_train)
+        reduce_y = cls._reduce_dims(y_train)
+        u_mean = u_train.mean(dim=reduce_u, keepdim=True)
+        u_std = u_train.std(dim=reduce_u, keepdim=True, unbiased=False).clamp_min(eps)
+        y_mean = y_train.mean(dim=reduce_y, keepdim=True)
+        y_std = y_train.std(dim=reduce_y, keepdim=True, unbiased=False).clamp_min(eps)
+        return cls(
+            u_mean=u_mean.detach().cpu(),
+            u_std=u_std.detach().cpu(),
+            y_mean=y_mean.detach().cpu(),
+            y_std=y_std.detach().cpu(),
+        )
+
+    def _match(self, tensor: torch.Tensor, stats: torch.Tensor) -> torch.Tensor:
+        return stats.to(device=tensor.device, dtype=tensor.dtype)
+
+    def transform_u(self, u: torch.Tensor) -> torch.Tensor:
+        return (u - self._match(u, self.u_mean)) / self._match(u, self.u_std)
+
+    def transform_y(self, y: torch.Tensor) -> torch.Tensor:
+        return (y - self._match(y, self.y_mean)) / self._match(y, self.y_std)
+
+    def inverse_transform_y(self, y: torch.Tensor) -> torch.Tensor:
+        return y * self._match(y, self.y_std) + self._match(y, self.y_mean)
+
+    def state_dict(self) -> Dict[str, torch.Tensor]:
+        return {
+            "u_mean": self.u_mean,
+            "u_std": self.u_std,
+            "y_mean": self.y_mean,
+            "y_std": self.y_std,
+        }
+
+    @classmethod
+    def from_state_dict(cls, state: Dict[str, torch.Tensor]) -> "ChannelwiseStandardizer":
+        return cls(
+            u_mean=state["u_mean"].detach().cpu(),
+            u_std=state["u_std"].detach().cpu(),
+            y_mean=state["y_mean"].detach().cpu(),
+            y_std=state["y_std"].detach().cpu(),
+        )
+
+
 def load_mat_data(filepath: str) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Load system identification data from MATLAB file.
@@ -199,14 +348,14 @@ class EarlyStopping:
         """
         if self.best_loss is None:
             self.best_loss = val_loss
-            self.best_model_state = model.state_dict()
+            self.best_model_state = copy.deepcopy(model.state_dict())
         elif val_loss > self.best_loss - self.min_delta:
             self.counter += 1
             if self.counter >= self.patience:
                 self.early_stop = True
         else:
             self.best_loss = val_loss
-            self.best_model_state = model.state_dict()
+            self.best_model_state = copy.deepcopy(model.state_dict())
             self.counter = 0
 
         return self.early_stop
@@ -231,6 +380,7 @@ class SystemIDTrainer:
             criterion: Optional[nn.Module] = None,
             optimizer: Optional[torch.optim.Optimizer] = None,
             live_plot_config: Optional[LivePlotConfig] = None,
+            normalizer: Optional[ChannelwiseStandardizer] = None,
     ):
         """
         Args:
@@ -245,6 +395,7 @@ class SystemIDTrainer:
         self.config = train_config
         self.device = torch.device(train_config.device)
         self.live_plot_config = live_plot_config
+        self.normalizer = normalizer
         self.model.to(self.device)
 
         # Set up loss and optimizer
@@ -260,6 +411,15 @@ class SystemIDTrainer:
 
         # Create checkpoint directory
         self.config.save_dir.mkdir(parents=True, exist_ok=True)
+
+    def _normalize_u(self, u: torch.Tensor) -> torch.Tensor:
+        return self.normalizer.transform_u(u) if self.normalizer is not None else u
+
+    def _normalize_y(self, y: torch.Tensor) -> torch.Tensor:
+        return self.normalizer.transform_y(y) if self.normalizer is not None else y
+
+    def _denormalize_y(self, y: torch.Tensor) -> torch.Tensor:
+        return self.normalizer.inverse_transform_y(y) if self.normalizer is not None else y
 
     def train_epoch(self, u: torch.Tensor, y: torch.Tensor) -> Tuple[float, torch.Tensor]:
         """
@@ -277,14 +437,16 @@ class SystemIDTrainer:
         # Move data to device
         u = u.to(self.device)
         y = y.to(self.device)
+        u_norm = self._normalize_u(u)
+        y_norm = self._normalize_y(y)
 
         # Forward pass
-        y_pred, _ = self.model(u)
-        y_pred = y_pred.squeeze()
-        y = y.squeeze()
+        y_pred_norm, _ = self.model(u_norm)
+        y_pred = self._denormalize_y(y_pred_norm).squeeze()
+        y_norm = y_norm.squeeze()
 
         # Compute loss
-        loss = self.criterion(y_pred, y)
+        loss = self.criterion(y_pred_norm.squeeze(), y_norm)
 
         # Backward pass
         self.optimizer.zero_grad()
@@ -311,14 +473,16 @@ class SystemIDTrainer:
         # Move data to device
         u = u.to(self.device)
         y = y.to(self.device)
+        u_norm = self._normalize_u(u)
+        y_norm = self._normalize_y(y)
 
         # Forward pass
-        y_pred, _ = self.model(u)
-        y_pred = y_pred.squeeze()
-        y = y.squeeze()
+        y_pred_norm, _ = self.model(u_norm)
+        y_pred = self._denormalize_y(y_pred_norm).squeeze()
+        y_norm = y_norm.squeeze()
 
         # Compute loss
-        loss = self.criterion(y_pred[n:], y[n:])
+        loss = self.criterion(y_pred_norm.squeeze()[n:], y_norm[n:])
 
         return loss.item(), y_pred.detach().cpu()
 
@@ -454,7 +618,9 @@ class SystemIDTrainer:
         """
         self.model.eval()
         u = u.to(self.device)
-        y_pred, _ = self.model(u)
+        u_norm = self._normalize_u(u)
+        y_pred_norm, _ = self.model(u_norm)
+        y_pred = self._denormalize_y(y_pred_norm)
         return y_pred.squeeze()
 
     def save_checkpoint(self, epoch: int, is_best: bool = False):
@@ -471,7 +637,8 @@ class SystemIDTrainer:
             'optimizer_state_dict': self.optimizer.state_dict(),
             'train_losses': self.train_losses,
             'val_losses': self.val_losses,
-            'best_val_loss': self.best_val_loss
+            'best_val_loss': self.best_val_loss,
+            'normalizer_state_dict': None if self.normalizer is None else self.normalizer.state_dict(),
         }
 
         filename = 'best_model.pth' if is_best else f'checkpoint_epoch_{epoch}.pth'
@@ -491,6 +658,9 @@ class SystemIDTrainer:
         self.train_losses = checkpoint['train_losses']
         self.val_losses = checkpoint['val_losses']
         self.best_val_loss = checkpoint['best_val_loss']
+        normalizer_state = checkpoint.get('normalizer_state_dict')
+        if normalizer_state is not None:
+            self.normalizer = ChannelwiseStandardizer.from_state_dict(normalizer_state)
 
 
 # ============================================================================
@@ -1014,6 +1184,7 @@ def optimize_hyperparameters(
         base_model_config: ModelConfig,
         base_train_config: TrainingConfig,
         hpo_config: HyperOptConfig,
+        normalizer: Optional[ChannelwiseStandardizer] = None,
 ) -> Dict[str, Any]:
     """
     Tune n_layers, d_model, d_state, learning_rate, and gamma with Optuna.
@@ -1064,7 +1235,12 @@ def optimize_hyperparameters(
             d_output=model_config.n_y,
             config=model_config.to_ssm_config(),
         )
-        trainer = SystemIDTrainer(model, train_config, criterion=nn.MSELoss())
+        trainer = SystemIDTrainer(
+            model,
+            train_config,
+            criterion=nn.MSELoss(),
+            normalizer=normalizer,
+        )
         trainer.fit(u_train, y_train, u_val, y_val, use_early_stopping=True)
 
         y_val_target = y_val.squeeze().cpu().detach().numpy()
@@ -1103,7 +1279,7 @@ def main():
     # Load data
     print("Loading data...")
 
-    train_val, test = nonlinear_benchmarks.Cascaded_Tanks()
+    train_val, test = nonlinear_benchmarks.EMPS()
     print(test.state_initialization_window_length)  # = 50
     u_train, y_train = train_val
     u_val, y_val = test
@@ -1125,12 +1301,36 @@ def main():
     )
 
     # Initialize configurations
-    model_config = ModelConfig(n_u=u_train.shape[1], n_y=y_train.shape[1], param='tvc', d_model=8, d_state=8,
-                               gamma= 7, ff='MBLIP', init='eye',
-                               n_layers=6, d_amp=3, rho=0.99, phase_center=0.0, max_phase_b=2*np.pi, d_hidden=12, nl_layers=3)
-    train_config = TrainingConfig(num_epochs=2000, learning_rate=1.6568e-02,
-                                  init_window=test.state_initialization_window_length)
+    model_config = ModelConfig(n_u=u_train.shape[1], n_y=y_train.shape[1], param='tv', d_model=3, d_state=16,
+                               gamma= None, ff='MBLIP', init='eye',
+                               n_layers=9, d_amp=3, rho=0.99, phase_center=0.0, max_phase_b=2*np.pi, d_hidden=12, nl_layers=3, learn_x0=True)
+    train_config = TrainingConfig(
+        num_epochs=2000,
+        learning_rate=1.6568e-03,
+        init_window=test.state_initialization_window_length,
+        normalize_data=False,  # set True to enable train-split z-score normalization
+    )
     hpo_config = HyperOptConfig(enabled=False, n_trials=20, num_epochs=250)
+
+    normalizer = None
+    if train_config.normalize_data:
+        normalizer = ChannelwiseStandardizer.fit(
+            u_train,
+            y_train,
+            eps=train_config.normalization_eps,
+        )
+
+        def _fmt_stats(t: torch.Tensor) -> str:
+            values = t.squeeze().detach().cpu().numpy()
+            return np.array2string(np.atleast_1d(values), precision=4, separator=", ")
+
+        print("Using training-split z-score normalization:")
+        print(f"  u_mean = {_fmt_stats(normalizer.u_mean)}")
+        print(f"  u_std  = {_fmt_stats(normalizer.u_std)}")
+        print(f"  y_mean = {_fmt_stats(normalizer.y_mean)}")
+        print(f"  y_std  = {_fmt_stats(normalizer.y_std)}")
+    else:
+        print("Using raw signals without dataset normalization.")
 
     # Hyperparameter search
     if hpo_config.enabled:
@@ -1144,6 +1344,7 @@ def main():
             base_model_config=model_config,
             base_train_config=train_config,
             hpo_config=hpo_config,
+            normalizer=normalizer,
         )
         model_config = replace(
             model_config,
@@ -1174,14 +1375,35 @@ def main():
     # Build model
     print("Building model...")
     ssm_config = model_config.to_ssm_config()
+
+    # --- DeepSSM (comment out to use REN instead) ---
     model = DeepSSM(d_input=model_config.n_u, d_output=model_config.n_y, config=ssm_config)
+
+    # --- LSTM reference baseline (comment out to use DeepSSM instead) ---
+    # model = LSTMWrapper(
+    #     dim_in=model_config.n_u,
+    #     dim_out=model_config.n_y,
+    #     dim_hidden=32,
+    #     num_layers=2,
+    #     dropout=0.1,
+    #     bidirectional=False,
+    # )
+
+    #--- REN (comment out to use DeepSSM instead) ---
+    # model = RENWrapper(
+    #     dim_in=model_config.n_u,
+    #     dim_out=model_config.n_y,
+    #     dim_internal=model_config.d_state,
+    #     dim_nl=model_config.d_state,
+    # )
 
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Number of parameters: {total_params}")
 
     # Initialize trainer
     trainer = SystemIDTrainer(model, train_config, criterion=nn.MSELoss(),
-                              live_plot_config=live_plot_config)
+                              live_plot_config=live_plot_config,
+                              normalizer=normalizer)
 
     # Train model
     history = trainer.fit(u_train, y_train, u_val, y_val, use_early_stopping=False)
