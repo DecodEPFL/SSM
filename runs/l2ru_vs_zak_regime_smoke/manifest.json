@@ -1,0 +1,98 @@
+{
+  "datasets": [
+    "Cascaded_Tanks"
+  ],
+  "seeds": [
+    0
+  ],
+  "robustness_gamma": 2.0,
+  "accuracy_gamma_init": 1.0,
+  "device": "cpu",
+  "train_cfg": {
+    "epochs": 1,
+    "batch_size": 16,
+    "lr": 0.002,
+    "weight_decay": 0.0,
+    "grad_clip": 1.0,
+    "patience": 30,
+    "min_delta": 1e-05,
+    "val_interval": 1,
+    "window_len": 256,
+    "normalize_data": true,
+    "train_mode": "scan",
+    "eval_mode": "scan",
+    "use_early_stopping": false
+  },
+  "model_shape": {
+    "d_model": 8,
+    "d_state": 16,
+    "n_layers": 1,
+    "ff": "LMLP",
+    "d_hidden": 12,
+    "nl_layers": 3,
+    "scale": 1.0,
+    "init": "eye",
+    "rho": 0.95,
+    "rmin": 0.7,
+    "rmax": 0.98,
+    "max_phase": 6.283185307179586,
+    "max_phase_b": 6.283185307179586,
+    "phase_center": 0.0,
+    "random_phase": true,
+    "learn_x0": true,
+    "zak_d_margin": 0.5,
+    "zak_x2_margin": 0.5,
+    "zak_x2_init_scale": 0.1
+  },
+  "gain_cfg": {
+    "probe_samples": 2,
+    "probe_batch_size": 1,
+    "probe_radius": 1.0,
+    "worst_case_restarts": 1,
+    "worst_case_steps": 1,
+    "worst_case_batch": 1,
+    "worst_case_lr": 0.08,
+    "local_gain_windows": 1,
+    "local_gain_eps": 0.25,
+    "local_gain_steps": 1,
+    "local_gain_restarts": 1,
+    "local_gain_lr": 0.06,
+    "disturbance_radii": [
+      0.1
+    ],
+    "disturbance_trials": 1
+  },
+  "runtime_cfg": {
+    "batch_size": 8,
+    "seq_lens": [
+      16
+    ],
+    "repeats_forward": 1,
+    "repeats_backward": 1,
+    "warmup": 0
+  },
+  "auto_match_zak_state": true,
+  "train_branch_gamma": true,
+  "regimes": [
+    {
+      "name": "accuracy_trainable_gamma",
+      "pretty_name": "Accuracy regime ($\\gamma$ trainable)",
+      "gamma": 1.0,
+      "train_global_gamma": true,
+      "compute_gain": false,
+      "compute_runtime": false,
+      "compute_robustness": false,
+      "compute_consistency": false
+    },
+    {
+      "name": "robustness_fixed_gamma",
+      "pretty_name": "Robustness regime ($\\gamma=2$ fixed)",
+      "gamma": 2.0,
+      "train_global_gamma": false,
+      "compute_gain": true,
+      "compute_runtime": true,
+      "compute_robustness": true,
+      "compute_consistency": true
+    }
+  ]
+}

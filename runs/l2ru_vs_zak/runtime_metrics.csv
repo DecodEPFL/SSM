@@ -1,0 +1,16 @@
+backward_sec,dataset,forward_sec,gamma,gamma_fixed,mode,param,regime,seed,seq_len
+0.004803266700037057,Cascaded Tanks,0.001024697949833353,2.0,2.0,loop,l2ru,robustness_fixed_gamma,0,64
+0.007751308300066739,Cascaded Tanks,0.0014649062501121079,2.0,2.0,loop,l2ru,robustness_fixed_gamma,0,128
+0.014106412500404985,Cascaded Tanks,0.0022730666500137887,2.0,2.0,loop,l2ru,robustness_fixed_gamma,0,256
+0.05175878340014606,Cascaded Tanks,0.003947783349940437,2.0,2.0,loop,l2ru,robustness_fixed_gamma,0,512
+0.18839753749998636,Cascaded Tanks,0.00765205829993647,2.0,2.0,loop,l2ru,robustness_fixed_gamma,0,1024
+0.0038539583998499437,Cascaded Tanks,0.001246164599797339,2.0,2.0,scan,zak,robustness_fixed_gamma,0,64
+0.0042813833999389315,Cascaded Tanks,0.001445977050025249,2.0,2.0,scan,zak,robustness_fixed_gamma,0,128
+0.004839070900197839,Cascaded Tanks,0.001650193750174367,2.0,2.0,scan,zak,robustness_fixed_gamma,0,256
+0.006345620899810456,Cascaded Tanks,0.002064414599954034,2.0,2.0,scan,zak,robustness_fixed_gamma,0,512
+0.01053195839995169,Cascaded Tanks,0.0033627458000410116,2.0,2.0,scan,zak,robustness_fixed_gamma,0,1024
+0.006515099999523955,Cascaded Tanks,0.00121069164997607,2.0,2.0,loop,zak,robustness_fixed_gamma,0,64
+0.01061292080048588,Cascaded Tanks,0.0017582833501364804,2.0,2.0,loop,zak,robustness_fixed_gamma,0,128
+0.020021545799681916,Cascaded Tanks,0.0028722812501655428,2.0,2.0,loop,zak,robustness_fixed_gamma,0,256
+0.043286816699401244,Cascaded Tanks,0.005027775000053225,2.0,2.0,loop,zak,robustness_fixed_gamma,0,512
+0.21948074590036412,Cascaded Tanks,0.009794306249750662,2.0,2.0,loop,zak,robustness_fixed_gamma,0,1024

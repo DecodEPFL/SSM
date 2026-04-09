@@ -1,0 +1,11 @@
+dataset,gain_mean,gain_mean_std,gain_p95,gain_p95_std,gamma_fixed,label,param,radius,regime,rmse_mean,rmse_mean_std,rmse_std,rmse_std_std
+Cascaded Tanks,1.0489625930786133,0.0,1.066934698820114,0.0,2.0,L2RU | Cascaded Tanks | fixed $\gamma=2$,l2ru,0.05,robustness_fixed_gamma,1.364504098892212,0.0,9.268386186661832e-05,0.0
+Cascaded Tanks,1.0436969697475433,0.0,1.0626438319683076,0.0,2.0,L2RU | Cascaded Tanks | fixed $\gamma=2$,l2ru,0.1,robustness_fixed_gamma,1.3645980656147003,0.0,5.066705967660207e-05,0.0
+Cascaded Tanks,1.0386013984680176,0.0,1.045774507522583,0.0,2.0,L2RU | Cascaded Tanks | fixed $\gamma=2$,l2ru,0.25,robustness_fixed_gamma,1.3645967245101929,0.0,7.842625956264594e-05,0.0
+Cascaded Tanks,1.0371683537960052,0.0,1.0489134967327118,0.0,2.0,L2RU | Cascaded Tanks | fixed $\gamma=2$,l2ru,0.5,robustness_fixed_gamma,1.3651165664196014,0.0,0.0005939186763676222,0.0
+Cascaded Tanks,1.0471730828285217,0.0,1.0629088759422303,0.0,2.0,L2RU | Cascaded Tanks | fixed $\gamma=2$,l2ru,1.0,robustness_fixed_gamma,1.3649352490901947,0.0,0.0006747652813625897,0.0
+Cascaded Tanks,0.21451685950160027,0.0,0.22706051245331763,0.0,2.0,ZAK | Cascaded Tanks | fixed $\gamma=2$,zak,0.05,robustness_fixed_gamma,1.6370533406734467,0.0,7.10998409267554e-05,0.0
+Cascaded Tanks,0.21537788584828377,0.0,0.2216620571911335,0.0,2.0,ZAK | Cascaded Tanks | fixed $\gamma=2$,zak,0.1,robustness_fixed_gamma,1.6371205151081085,0.0,3.2195047618850024e-05,0.0
+Cascaded Tanks,0.2063792124390602,0.0,0.21265553310513496,0.0,2.0,ZAK | Cascaded Tanks | fixed $\gamma=2$,zak,0.25,robustness_fixed_gamma,1.6370837688446045,0.0,6.119704987703927e-05,0.0
+Cascaded Tanks,0.21657292544841766,0.0,0.2261415734887123,0.0,2.0,ZAK | Cascaded Tanks | fixed $\gamma=2$,zak,0.5,robustness_fixed_gamma,1.6373803615570068,0.0,0.0004524504057170405,0.0
+Cascaded Tanks,0.21427244320511818,0.0,0.2302941083908081,0.0,2.0,ZAK | Cascaded Tanks | fixed $\gamma=2$,zak,1.0,robustness_fixed_gamma,1.6369059085845947,0.0,0.0003602381554390612,0.0

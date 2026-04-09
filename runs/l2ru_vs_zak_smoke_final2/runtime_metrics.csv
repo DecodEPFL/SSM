@@ -1,0 +1,5 @@
+backward_sec,dataset,forward_sec,gamma,mode,param,seed,seq_len
+0.012484459000916104,Three-Tanks (local),0.003550834000634495,2.0,scan,l2ru,0,64
+0.006144541999674402,Three-Tanks (local),0.007973457999469247,2.0,loop,l2ru,0,64
+0.0048745409985713195,Three-Tanks (local),0.0016937079999479465,2.0,scan,zak,0,64
+0.006615708000026643,Three-Tanks (local),0.0011908329997822875,2.0,loop,zak,0,64
