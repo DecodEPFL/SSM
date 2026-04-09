@@ -83,21 +83,31 @@ class TLIP(nn.Module):
 
     def __init__(self, config: LayerConfig):
         super().__init__()
+        self.eps = 1e-6
+        lip0 = max(float(config.lip), self.eps)
+        self.register_buffer("lip_const", torch.tensor(lip0))
+
         # Pre-compute hidden dimension for efficiency
         self.hidden_dim = config.d_hidden
         layers = nn.ModuleList()
-        layers.append(torchlip.SpectralLinear(config.d_input, self.hidden_dim))
-        layers.append(torchlip.GroupSort2(2))
+        # Keep the internal backbone 1-Lipschitz and expose the overall Lipschitz
+        # constant through an explicit positive scalar multiplier.
+        layers.append(torchlip.SpectralLinear(config.d_input, self.hidden_dim, k_coef_lip=1.0))
+        layers.append(torchlip.GroupSort2(k_coef_lip=1.0))
 
         for i in range(config.n_layers):
-            layers.append(torchlip.SpectralLinear(self.hidden_dim, self.hidden_dim))
-            layers.append(torchlip.GroupSort2(2))
-        layers.append(torchlip.SpectralLinear(self.hidden_dim, config.d_output))
+            layers.append(torchlip.SpectralLinear(self.hidden_dim, self.hidden_dim, k_coef_lip=1.0))
+            layers.append(torchlip.GroupSort2(k_coef_lip=1.0))
+        layers.append(torchlip.SpectralLinear(self.hidden_dim, config.d_output, k_coef_lip=1.0))
         self.model = nn.Sequential(*layers)
+
+    @property
+    def lip(self) -> torch.Tensor:
+        return self.lip_const
 
     def forward(self, x):
         x = self.model(x)
-        return x
+        return self.lip * x
 
 
 # Manchester lipschitz bounded MLPs

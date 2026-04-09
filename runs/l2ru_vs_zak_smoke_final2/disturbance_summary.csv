@@ -1,0 +1,3 @@
+dataset,gain_mean,gain_mean_std,gain_p95,gain_p95_std,gamma,label,param,radius,rmse_mean,rmse_mean_std,rmse_std,rmse_std_std
+Three-Tanks (local),0.2260507196187973,0.0,0.2260507196187973,0.0,2.0,L2RU | Three-Tanks (local) | $\gamma$=2,l2ru,0.1,4.1196818351745605,0.0,0.0,0.0
+Three-Tanks (local),0.2165532410144806,0.0,0.2165532410144806,0.0,2.0,ZAK | Three-Tanks (local) | $\gamma$=2,zak,0.1,4.327978610992432,0.0,0.0,0.0

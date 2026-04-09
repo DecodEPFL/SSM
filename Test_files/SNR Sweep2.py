@@ -1,6 +1,7 @@
 import torch
 from typing import Tuple, Dict, Optional, Callable, Union
 from src.neural_ssm.ssm import DeepSSM, SSMConfig, PureLRUR
+from src.neural_ssm.ssm.lti_cells import lruz
 import math
 from argparse import Namespace
 import torch.nn as nn
@@ -61,6 +62,20 @@ def estimate_l2_gain(model, input_shape, num_batches=10, batch_size=32, num_iter
     return max(max_gain_per_batch)
 
 
+def exact_l2_gain_from_cell(cell: nn.Module) -> float:
+    if hasattr(cell, "ss_real_matrices"):
+        A, B, C, D = cell.ss_real_matrices(to_numpy=True)
+    else:
+        A, B, C, D = cell.set_param()
+        A = A.detach().cpu().numpy()
+        B = B.detach().cpu().numpy()
+        C = C.detach().cpu().numpy()
+        D = D.detach().cpu().numpy()
+
+    sys = control.ss(A, B, C, D, dt=1.0)
+    return float(control.norm(sys, p='inf'))
+
+
 # Example Usage:
 if __name__ == "__main__":
     # Define a simple PyTorch model for demonstration
@@ -109,18 +124,56 @@ if __name__ == "__main__":
     cfg = {
         "n_u": 3,
         "n_y": 3,
-        "d_model": 5,
+        "d_model": 2,
         "d_state": 6,
         "n_layers": 1,
         "ff": "LMLP",  # GLU | MLP | LMLP
         "max_phase": math.pi / 50,
-        "r_min": 0.7,
-        "r_max": 0.98,
-        "param": 'l2ru',
-        "gamma": 10,
-        "init": 'eye'
+        "r_min": 0.96,
+        "r_max": 0.99,
+        "param": 'zak',
+        "gamma": 5,
+        "init": 'eye',
+        # Main ZAK init-tightness knobs:
+        # d_margin: pushes ||D|| closer to gamma
+        # x2_margin: pushes the B/C block closer to its certificate limit
+        # x2_init_scale: changes the initial direction of the B/C block
+        "zak_d_margin": 0.995,
+        "zak_x2_margin": 0.995,
+        "zak_x2_init_scale": 1.0,
     }
     cfg_robust = Namespace(**cfg)
+
+    if cfg_robust.param == "zak":
+        sweep_setups = [
+            ("conservative", 0.25, 0.90, 0.10),
+            ("tight", 0.98, 0.98, 0.50),
+            ("ultra_tight", cfg_robust.zak_d_margin, cfg_robust.zak_x2_margin, cfg_robust.zak_x2_init_scale),
+        ]
+
+        print(f"Prescribed gamma = {cfg_robust.gamma:.6f}")
+        print("Exact ZAK gain at initialization")
+        for label, d_margin, x2_margin, x2_scale in sweep_setups:
+            zak_cell = lruz(
+                input_features=10,
+                output_features=10,
+                state_features=10,
+                rmin=cfg_robust.r_min,
+                rmax=cfg_robust.r_max,
+                max_phase=cfg_robust.max_phase,
+                gamma=cfg_robust.gamma,
+                d_margin=d_margin,
+                x2_margin=x2_margin,
+                x2_init_scale=x2_scale,
+                init=cfg_robust.init,
+            )
+            gamma_hat = exact_l2_gain_from_cell(zak_cell)
+            ratio = gamma_hat / max(float(cfg_robust.gamma), 1e-12)
+            print(
+                f"{label:>14s} | d_margin={d_margin:.3f} | "
+                f"x2_margin={x2_margin:.3f} | x2_scale={x2_scale:.3f} | "
+                f"exact_gain={gamma_hat:.6f} | gain/gamma={ratio:.6f}"
+            )
 
     LRUR = PureLRUR(10, param=cfg_robust.param, gamma=cfg_robust.gamma, init=cfg_robust.init)
 
@@ -137,16 +190,7 @@ if __name__ == "__main__":
 
     total_params = sum(p.numel() for p in LRUR.parameters())
     print(f"Number of parameters: {total_params}")
-
-    A, B, C, D = LRUR.lru.set_param()
-
-    A = A.cpu().detach().numpy()
-    B = B.cpu().detach().numpy()
-    C = C.data.cpu().detach().numpy()
-    D = D.cpu().detach().numpy()
-    import control
-    sys = control.ss(A, B, C, D, dt=1.0)
-    # Compute the H∞ norm (L2 gain) and the peak frequency ω_peak
-    gamma = control.norm(sys, p='inf')
+    gamma = exact_l2_gain_from_cell(LRUR.lru)
+    print(f"Reference exact gain = {gamma:.6f}")
 
 cfg_robust

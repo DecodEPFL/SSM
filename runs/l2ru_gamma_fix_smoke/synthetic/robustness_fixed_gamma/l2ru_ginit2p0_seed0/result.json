@@ -1,0 +1,386 @@
+{
+  "dataset": "Synthetic",
+  "dataset_key": "synthetic",
+  "param": "l2ru",
+  "regime": "robustness_fixed_gamma",
+  "regime_pretty": "Robustness regime",
+  "gamma": 2.0,
+  "gamma_init": 2.0,
+  "gamma_fixed": 2.0,
+  "train_global_gamma": false,
+  "trained_global_gamma": null,
+  "train_branch_gamma": true,
+  "seed": 0,
+  "shape": {
+    "d_model": 8,
+    "d_state": 8,
+    "n_layers": 1,
+    "ff": "LGLU2",
+    "d_hidden": 8,
+    "nl_layers": 2,
+    "scale": 1.0,
+    "init": "eye",
+    "rho": 0.95,
+    "rmin": 0.7,
+    "rmax": 0.98,
+    "max_phase": 6.283185307179586,
+    "max_phase_b": 6.283185307179586,
+    "phase_center": 0.0,
+    "random_phase": true,
+    "learn_x0": true,
+    "zak_d_margin": 0.5,
+    "zak_x2_margin": 0.5,
+    "zak_x2_init_scale": 0.1
+  },
+  "parameter_match": {
+    "enabled": true,
+    "reference_param": "l2ru",
+    "target_param": "zak",
+    "reference_parameter_count": 455,
+    "target_parameter_count": 462,
+    "absolute_gap": 7,
+    "relative_gap": 0.015384615384615385,
+    "target_shape": {
+      "d_model": 8,
+      "d_state": 7,
+      "n_layers": 1,
+      "ff": "LGLU2",
+      "d_hidden": 8,
+      "nl_layers": 2,
+      "scale": 1.0,
+      "init": "eye",
+      "rho": 0.95,
+      "rmin": 0.7,
+      "rmax": 0.98,
+      "max_phase": 6.283185307179586,
+      "max_phase_b": 6.283185307179586,
+      "phase_center": 0.0,
+      "random_phase": true,
+      "learn_x0": true,
+      "zak_d_margin": 0.5,
+      "zak_x2_margin": 0.5,
+      "zak_x2_init_scale": 0.1
+    }
+  },
+  "init_window": 0,
+  "parameter_count": 455,
+  "train_cfg": {
+    "epochs": 2,
+    "batch_size": 1,
+    "lr": 0.001,
+    "weight_decay": 0.0,
+    "grad_clip": 1.0,
+    "patience": 30,
+    "min_delta": 1e-05,
+    "val_interval": 1,
+    "window_len": 16,
+    "normalize_data": true,
+    "train_mode": "loop",
+    "eval_mode": "loop",
+    "use_early_stopping": false
+  },
+  "effective_modes": {
+    "train_mode_requested": "loop",
+    "eval_mode_requested": "loop",
+    "train_mode_used": "loop",
+    "eval_mode_used": "loop",
+    "supported_modes": [
+      "loop"
+    ]
+  },
+  "training_history": {
+    "train_loss": [
+      1.2764824628829956,
+      1.2567963600158691
+    ],
+    "val_loss": [
+      0.5344330072402954,
+      0.5321686863899231
+    ],
+    "val_rmse": [
+      0.5344330072402954,
+      0.5321686863899231
+    ],
+    "epoch_time_sec": [
+      0.02546483299738611,
+      0.003747583003132604
+    ]
+  },
+  "steps_per_epoch": 1,
+  "train_sequence_count": 1,
+  "train_sequence_length": 32,
+  "best_epoch": 1,
+  "best_val_rmse": 0.5321686863899231,
+  "normalizer": {
+    "u_mean": [
+      0.06770752370357513
+    ],
+    "u_std": [
+      0.953434407711029
+    ],
+    "y_mean": [
+      0.03385376185178757
+    ],
+    "y_std": [
+      0.4767172038555145
+    ]
+  },
+  "clean_metrics": {
+    "rmse": 0.5321686863899231,
+    "nrmse": 1.1163194179534912,
+    "mae": 0.41384580731391907,
+    "r2": -0.2461690902709961,
+    "fit": -11.631941795349121,
+    "rmse_per_channel": [
+      0.5321686863899231
+    ],
+    "nrmse_per_channel": [
+      1.1163194179534912
+    ],
+    "mae_per_channel": [
+      0.41384580731391907
+    ],
+    "r2_per_channel": [
+      -0.2461690902709961
+    ],
+    "fit_per_channel": [
+      -11.631941795349121
+    ]
+  },
+  "scan_loop_consistency": {
+    "available": false,
+    "skipped": true,
+    "reason": "skipped for regime=robustness_fixed_gamma"
+  },
+  "certificate": {
+    "available": true,
+    "blocks": [
+      {
+        "index": 0,
+        "branch_gamma": 2.0015485286712646,
+        "ff_lip": 1.0009807348251343,
+        "res_scale": 0.2692461609840393,
+        "effective_block_gain": 1.5394377844442784
+      }
+    ],
+    "block_gain_product": 1.5394377844442784,
+    "target_gamma": 2.0,
+    "encoder_norm": 1.0002323389053345,
+    "decoder_norm": 0.9994558691978455,
+    "decoder_scale": 1.2995809583866003
+  },
+  "gain_estimates": null,
+  "disturbance_robustness": [],
+  "runtime": {
+    "scan": {
+      "available": false,
+      "skipped": true,
+      "error": "skipped for regime=robustness_fixed_gamma",
+      "points": []
+    },
+    "loop": {
+      "available": false,
+      "skipped": true,
+      "error": "skipped for regime=robustness_fixed_gamma",
+      "points": []
+    }
+  },
+  "prediction_payload": {
+    "y_true": [
+      [
+        -0.1454179584980011
+      ],
+      [
+        -0.6840528845787048
+      ],
+      [
+        0.27105897665023804
+      ],
+      [
+        -0.7899813055992126
+      ],
+      [
+        -0.6561674475669861
+      ],
+      [
+        0.053615864366292953
+      ],
+      [
+        0.2235443890094757
+      ],
+      [
+        0.5469725728034973
+      ],
+      [
+        0.20046427845954895
+      ],
+      [
+        0.056898657232522964
+      ],
+      [
+        0.17406457662582397
+      ],
+      [
+        -0.326996386051178
+      ],
+      [
+        0.1365738958120346
+      ],
+      [
+        0.02920079044997692
+      ],
+      [
+        -1.114613652229309
+      ],
+      [
+        -0.36854901909828186
+      ],
+      [
+        0.3762598931789398
+      ],
+      [
+        0.8988125324249268
+      ],
+      [
+        -0.06750202924013138
+      ],
+      [
+        0.5415188670158386
+      ],
+      [
+        0.1141522228717804
+      ],
+      [
+        -0.6148905754089355
+      ],
+      [
+        -0.16286742687225342
+      ],
+      [
+        0.39899885654449463
+      ],
+      [
+        0.7836374640464783
+      ],
+      [
+        0.09530450403690338
+      ],
+      [
+        -0.46498697996139526
+      ],
+      [
+        0.01932697370648384
+      ],
+      [
+        0.8725594878196716
+      ],
+      [
+        -0.11666587740182877
+      ],
+      [
+        0.41086286306381226
+      ],
+      [
+        0.3921842873096466
+      ]
+    ],
+    "y_pred": [
+      [
+        0.055887967348098755
+      ],
+      [
+        0.13153967261314392
+      ],
+      [
+        0.007846547290682793
+      ],
+      [
+        0.14583049714565277
+      ],
+      [
+        0.12326334416866302
+      ],
+      [
+        0.028945693746209145
+      ],
+      [
+        0.011927921324968338
+      ],
+      [
+        -0.015016887336969376
+      ],
+      [
+        0.014537375420331955
+      ],
+      [
+        0.02993175759911537
+      ],
+      [
+        0.017235996201634407
+      ],
+      [
+        0.0789467990398407
+      ],
+      [
+        0.020793266594409943
+      ],
+      [
+        0.03277675807476044
+      ],
+      [
+        0.1939389705657959
+      ],
+      [
+        0.08084578812122345
+      ],
+      [
+        -0.002526562660932541
+      ],
+      [
+        -0.03854767233133316
+      ],
+      [
+        0.04410623013973236
+      ],
+      [
+        -0.016317464411258698
+      ],
+      [
+        0.02341577410697937
+      ],
+      [
+        0.12162187695503235
+      ],
+      [
+        0.05568641424179077
+      ],
+      [
+        -0.005074910819530487
+      ],
+      [
+        -0.0334337055683136
+      ],
+      [
+        0.026034165173768997
+      ],
+      [
+        0.10081857442855835
+      ],
+      [
+        0.0341130755841732
+      ],
+      [
+        -0.03912718594074249
+      ],
+      [
+        0.05298652499914169
+      ],
+      [
+        -0.005777817219495773
+      ],
+      [
+        -0.0039017312228679657
+      ]
+    ]
+  }
+}

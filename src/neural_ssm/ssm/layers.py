@@ -48,9 +48,10 @@ class SSMConfig:
     nl_layers: int = 2 # number of hidden layers of the non-linear layers (static nonlinearities)
     param: Optional[str] = None  # pick the parametrization you want to use for the LRU. Default = LRU, other options are L2RU
     # and ZAK
-    gamma: Optional[float] = 1.0  # set the overall l2 gain value for the SSM. If set to None, the l2 gain will be trainable and
-    # not specified.
-    train_gamma: bool = True # choose weather the l2 gain of the dynamical systems should be trainable or fixed.
+    gamma: Optional[float] = 1.0  # overall target l2 gain for the DeepSSM. If set, DeepSSM keeps this global gain fixed
+    # through encoder/decoder certificate scaling.
+    train_gamma: bool = True # controls whether the per-block / per-LTI gamma parameters are trainable. This is distinct
+    # from the global target gamma above, which remains fixed whenever `gamma` is not None.
     init: str = 'eye'  # controls the initialization of the parameters when the L2RU param is chosen.
     # parameters needed for the prescribed-gain parametrization
     rho: float = 0.9
@@ -59,6 +60,11 @@ class SSMConfig:
     random_phase: bool = True
     offdiag_scale: float = 0.05  # init std for K12/K21/K22 in l2n (old default was 0.005)
     learn_x0: bool = False  # if True, the initial hidden state is a learnable parameter
+    zak_d_margin: float = 0.5  # ZAK-only: initialize the direct term strictly inside the feasible set
+    zak_x2_margin: float = 0.5  # ZAK-only: initialize the off-diagonal coupling strictly inside the feasible set
+    zak_x2_init_scale: float = 0.1  # ZAK-only: scale of the free real X2 initialization
+    cert_scale_temperature: float = 0.05  # smoothness of the fixed-gamma soft cap; smaller values approach
+    # the hard min without breaking the guarantee.
 
     # Parallel scan must be selected in the forward call of the SSM.
 
@@ -78,6 +84,19 @@ class SSL(nn.Module):
     """
     def __init__(self, config: SSMConfig):
         super().__init__()
+        res_logit_init = -1.0
+        init_block_gamma = None
+        if config.gamma is not None and config.n_layers > 0:
+            # Use the exact per-block initialization requested by the user for
+            # trainable LTI gammas. The global fixed gamma is now enforced as a
+            # cap in DeepSSM.forward, so we do not need to inflate the branch
+            # gamma to compensate for the residual gate at initialization.
+            init_block_gamma = max(float(config.gamma) ** (1.0 / config.n_layers) - 1.0, 0.01)
+
+        fixed_branch_gamma = init_block_gamma if init_block_gamma is not None else config.gamma
+        if config.train_gamma:
+            fixed_branch_gamma = None
+
         # --- SSM selection ---
         if config.param is None or config.param == "lru":
             self.lru = LRU(
@@ -90,7 +109,12 @@ class SSL(nn.Module):
                 learn_x0=config.learn_x0,
             )
         elif config.param == "l2ru":
-            self.lru = L2RU(state_features=config.d_model, init=config.init, learn_x0=config.learn_x0)
+            self.lru = L2RU(
+                state_features=config.d_model,
+                gamma=fixed_branch_gamma,
+                init=config.init,
+                learn_x0=config.learn_x0,
+            )
         elif config.param == "zak":
             self.lru = lruz(
                 input_features=config.d_model,
@@ -99,18 +123,20 @@ class SSL(nn.Module):
                 rmin=config.rmin,
                 rmax=config.rmax,
                 max_phase=config.max_phase,
+                gamma=fixed_branch_gamma,
+                d_margin=config.zak_d_margin,
+                x2_margin=config.zak_x2_margin,
+                x2_init_scale=config.zak_x2_init_scale,
+                init=config.init,
                 learn_x0=config.learn_x0,
             )
         elif config.param == "l2n":
-            if config.gamma is not None and config.n_layers > 0:
-                init_block_gamma = max(float(config.gamma) ** (1.0 / config.n_layers) - 1.0, 0.01)
-            else:
-                init_block_gamma = 1.0
+            block_gamma = init_block_gamma if init_block_gamma is not None else 1.0
             self.lru = Block2x2DenseL2SSM(
                 d_state=config.d_state,
                 d_input=config.d_model,
                 d_output=config.d_model,
-                gamma=init_block_gamma,
+                gamma=block_gamma,
                 train_gamma=config.train_gamma,
                 learn_x0=config.learn_x0,
             )
@@ -122,26 +148,32 @@ class SSL(nn.Module):
                 offdiag_scale=config.offdiag_scale,
             )
         elif config.param == "l2nt":
+            block_gamma = init_block_gamma if init_block_gamma is not None else 1.0
             self.lru = L2BoundedLTICell(
                 d_state=config.d_state,
                 d_input=config.d_model,
                 d_output=config.d_model,
+                gamma=block_gamma,
                 train_gamma=config.train_gamma,
                 learn_x0=config.learn_x0,
             )
         elif config.param == "tv":
+            block_gamma = init_block_gamma if init_block_gamma is not None else 1.0
             self.lru = RobustMambaDiagSSM(
                 d_state=config.d_state,
                 d_model=config.d_model,
                 d_out=config.d_model,
+                gamma=block_gamma,
                 train_gamma=config.train_gamma,
                 learn_x0=config.learn_x0,
             )
         elif config.param == "tvc":
+            block_gamma = init_block_gamma if init_block_gamma is not None else 1.0
             self.lru = RobustMambaDiagLTI(
                 d_state=config.d_state,
                 d_model=config.d_model,
                 d_out=config.d_model,
+                gamma=block_gamma,
                 train_gamma=config.train_gamma,
                 param_net="mlp",
                 hidden=max(64, 2 * config.d_model),
@@ -156,6 +188,22 @@ class SSL(nn.Module):
             )
         else:
             raise ValueError("Invalid parametrization")
+
+        if config.train_gamma and init_block_gamma is not None:
+            with torch.no_grad():
+                target_gamma = float(init_block_gamma)
+                gamma_attr = getattr(self.lru, "gamma", None)
+                if hasattr(self.lru, "gamma_raw") and isinstance(self.lru.gamma_raw, nn.Parameter):
+                    target = torch.as_tensor(
+                        target_gamma,
+                        device=self.lru.gamma_raw.device,
+                        dtype=self.lru.gamma_raw.dtype,
+                    ).clamp_min(1e-6)
+                    self.lru.gamma_raw.copy_(torch.log(torch.expm1(target)))
+                elif hasattr(self.lru, "log_gamma") and isinstance(self.lru.log_gamma, nn.Parameter):
+                    self.lru.log_gamma.fill_(math.log(max(target_gamma, 1e-8)))
+                elif isinstance(gamma_attr, nn.Parameter):
+                    gamma_attr.fill_(target_gamma)
 
         # --- FF selection ---
         l_config = LayerConfig()
@@ -181,8 +229,8 @@ class SSL(nn.Module):
 
         self.dropout = nn.Dropout(config.dropout)
 
-        # Small residual gate at init: sigmoid(-2) ≈ 0.119
-        self.res_logit = nn.Parameter(torch.tensor(-1.0))
+        # Small residual gate at init: sigmoid(-1) ≈ 0.269
+        self.res_logit = nn.Parameter(torch.tensor(res_logit_init))
 
     @property
     def res_scale(self) -> torch.Tensor:
@@ -223,7 +271,7 @@ class DeepSSM(nn.Module):
         rmin: float = .8,
         rmax: float = .95,
         max_phase: float = 2 * math.pi,
-        ff: str = "LGLU",
+        ff: str = "LGLU2",
         scale: float = 1,
         dim_amp: int = 4,
         d_hidden: int = 4,
@@ -424,12 +472,44 @@ class DeepSSM(nn.Module):
             else:
                 gamma_prod = torch.ones((), device=x.device, dtype=x.dtype)
 
-            scale = gamma_t / (gamma_prod + 1e-12)
+            trainable_global_gamma = (
+                gamma is None
+                and isinstance(getattr(self, "gamma_t", None), nn.Parameter)
+                and self.gamma_t.requires_grad
+            )
+            if trainable_global_gamma:
+                scale = gamma_t / (gamma_prod + 1e-12)
+            else:
+                # Treat fixed gamma as a smooth upper bound. The log-sum-exp cap is
+                # always below the hard admissible scale min(1, gamma_t / gamma_prod),
+                # so the guarantee is preserved while gradients stay nonzero near the boundary.
+                scale = self._smooth_capped_scale(
+                    gamma_t=gamma_t,
+                    gamma_prod=gamma_prod,
+                    temperature=self.config.cert_scale_temperature,
+                )
             outputs = F.linear(x, decoder_eff * scale, bias=None)
         else:
             outputs = self.decoder(x)
 
         return outputs, layer_states
+
+    @staticmethod
+    def _smooth_capped_scale(
+        gamma_t: torch.Tensor,
+        gamma_prod: torch.Tensor,
+        temperature: float,
+    ) -> torch.Tensor:
+        """
+        Smooth approximation of min(1, gamma_t / gamma_prod) that preserves the
+        hard guarantee by replacing max(0, log(gamma_prod / gamma_t)) with a
+        log-sum-exp / softplus upper bound.
+        """
+        eps = 1e-12
+        tau = max(float(temperature), 1e-6)
+        log_ratio = torch.log(gamma_prod + eps) - torch.log(gamma_t + eps)
+        smooth_log_cap = tau * F.softplus(log_ratio / tau)
+        return torch.exp(-smooth_log_cap)
 
     def reset(self):
         for block in self.blocks:
@@ -448,6 +528,15 @@ class PureLRUR(nn.Module):
             self.lru = L2RU(state_features=n, gamma=gamma, init=init, learn_x0=learn_x0)
         elif param == "lru":
             self.lru = LRU(in_features=n, out_features=n, state_features=n, learn_x0=learn_x0)
+        elif param == "zak":
+            self.lru = lruz(
+                input_features=n,
+                output_features=n,
+                state_features=n,
+                gamma=gamma,
+                init=init,
+                learn_x0=learn_x0,
+            )
         else:
             raise ValueError("Unsupported param")
 

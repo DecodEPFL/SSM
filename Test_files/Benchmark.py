@@ -690,6 +690,19 @@ class Visualizer:
             'savefig.dpi': 300,
         })
 
+    @staticmethod
+    def _to_numpy_2d(x: torch.Tensor) -> np.ndarray:
+        if isinstance(x, torch.Tensor):
+            x = x.detach().cpu().numpy()
+        x = np.asarray(x)
+        if x.ndim == 1:
+            return x[:, None]
+        if x.ndim == 2:
+            return x
+        if x.ndim == 3 and x.shape[0] == 1:
+            return x[0]
+        raise ValueError(f"Expected a single sequence shaped (T,), (T, C), or (1, T, C); got {x.shape}")
+
     def plot_losses(
             self,
             train_losses: list,
@@ -779,15 +792,77 @@ class Visualizer:
         else:
             plt.close()
 
+    def plot_inputs(
+            self,
+            u_train: torch.Tensor,
+            u_val: torch.Tensor,
+            title: str = "Input Signals",
+            filename: str = 'input_signals',
+            ylabel: str = r'$u$',
+            init_window: int = 0,
+    ):
+        """
+        Plot training and validation inputs side by side.
+
+        Args:
+            u_train: Training input sequence
+            u_val: Validation input sequence
+            title: Plot title
+            filename: Base filename used for saved figures
+            ylabel: Y-axis label
+            init_window: Optional validation initialization window to highlight
+        """
+        train = self._to_numpy_2d(u_train)
+        val = self._to_numpy_2d(u_val)
+        n_channels = max(train.shape[1], val.shape[1])
+
+        fig, axes = plt.subplots(
+            2,
+            1,
+            figsize=(6.25, 3.2),
+            sharex=False,
+            constrained_layout=True,
+        )
+        fig.suptitle(title)
+
+        palette = ['#33658a', '#2f9e44', '#ef476f', '#8d6a9f', '#f4a261', '#2a9d8f']
+        for ax, data, split_name in zip(axes, (train, val), ("Training input", "Validation input")):
+            time = np.arange(data.shape[0])
+            for ch in range(data.shape[1]):
+                label = f'$u_{ch + 1}$' if n_channels > 1 else 'Input'
+                ax.plot(time, data[:, ch], color=palette[ch % len(palette)], label=label)
+            if split_name == "Validation input" and init_window > 0:
+                ax.axvspan(0, init_window, color='#cbd5e1', alpha=0.35, lw=0, label='Init window')
+            ax.set_title(split_name)
+            ax.set_xlabel('Time step')
+            ax.set_ylabel(ylabel)
+            ax.spines['top'].set_visible(False)
+            ax.spines['right'].set_visible(False)
+            ax.legend(loc='upper right', frameon=False, ncol=min(max(data.shape[1], 1), 3))
+
+        pdf_path = self.save_dir / f'{filename}.pdf'
+        png_path = self.save_dir / f'{filename}.png'
+        plt.savefig(pdf_path, format='pdf', bbox_inches='tight')
+        plt.savefig(png_path, format='png', bbox_inches='tight')
+
+        if self.show_plots:
+            plt.show()
+        else:
+            plt.close()
+
     def plot_all_results(
             self,
             train_losses: list,
             val_losses: list,
+            u_train: torch.Tensor,
+            u_val: torch.Tensor,
             y_train: torch.Tensor,
             y_train_pred: torch.Tensor,
             y_val: torch.Tensor,
             y_val_pred: torch.Tensor,
-            ylabel: str = r'$y$'
+            ylabel: str = r'$y$',
+            ulabel: str = r'$u$',
+            init_window: int = 0,
     ):
         """
         Create all plots in one call.
@@ -795,12 +870,23 @@ class Visualizer:
         Args:
             train_losses: Training loss history
             val_losses: Validation loss history
+            u_train, u_val: Training and validation inputs
             y_train, y_train_pred: Training data and predictions
             y_val, y_val_pred: Validation data and predictions
             ylabel: Y-axis label for predictions
         """
         # Plot training loss
         self.plot_losses(train_losses, val_losses, 'training_loss.pdf')
+
+        # Plot inputs
+        self.plot_inputs(
+            u_train=u_train,
+            u_val=u_val,
+            title="Training and Validation Inputs",
+            filename='input_signals',
+            ylabel=ulabel,
+            init_window=init_window,
+        )
 
         # Plot training predictions
         self.plot_predictions(
@@ -1279,7 +1365,7 @@ def main():
     # Load data
     print("Loading data...")
 
-    train_val, test = nonlinear_benchmarks.EMPS()
+    train_val, test = nonlinear_benchmarks.Cascaded_Tanks()
     print(test.state_initialization_window_length)  # = 50
     u_train, y_train = train_val
     u_val, y_val = test
@@ -1301,12 +1387,12 @@ def main():
     )
 
     # Initialize configurations
-    model_config = ModelConfig(n_u=u_train.shape[1], n_y=y_train.shape[1], param='tv', d_model=3, d_state=16,
-                               gamma= None, ff='MBLIP', init='eye',
-                               n_layers=9, d_amp=3, rho=0.99, phase_center=0.0, max_phase_b=2*np.pi, d_hidden=12, nl_layers=3, learn_x0=True)
+    model_config = ModelConfig(n_u=u_train.shape[1], n_y=y_train.shape[1], param='l2ru', d_model=5, d_state=8,
+                               gamma= 40, ff='TLIP', init='eye',
+                               n_layers=3, d_amp=3, rho=0.99, phase_center=0.0, max_phase_b=2*np.pi, d_hidden=12, nl_layers=3, learn_x0=True)
     train_config = TrainingConfig(
         num_epochs=2000,
-        learning_rate=1.6568e-03,
+        learning_rate=1.6568e-02,
         init_window=test.state_initialization_window_length,
         normalize_data=False,  # set True to enable train-split z-score normalization
     )
@@ -1436,11 +1522,15 @@ def main():
     visualizer.plot_all_results(
         history['train_losses'],
         history['val_losses'],
+        u_train,
+        u_val,
         y_train,
         y_train_pred,
         y_val,
         y_val_pred,
-        ylabel=r'$h_1$ [cm]'
+        ylabel=r'$h_1$ [cm]',
+        ulabel=r'$q$',
+        init_window=n,
     )
 
     # Save loss history
