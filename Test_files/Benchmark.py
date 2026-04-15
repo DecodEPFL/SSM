@@ -35,7 +35,7 @@ class TrainingConfig:
     batch_size: int = 32
     num_epochs: int = 2000
     seed: int = 9
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    device: str = "cpu" if torch.cuda.is_available() else "cpu"
     # Validation init window (timesteps skipped in loss computation)
     init_window: int = 50
 
@@ -142,7 +142,10 @@ class ModelConfig:
     param: str = 'l2ru'
     d_hidden: int = 8
     nl_layers: int = 3
+    scale: float = 1.0
     gamma: Optional[float] = 2
+    train_gamma: bool = True
+    train_ff_lip: Optional[bool] = None
     init: str = 'rand'
     rho: float = 0.9
     max_phase_b: float = 0.5  # small spread
@@ -162,9 +165,12 @@ class ModelConfig:
             max_phase=self.max_phase,
             d_hidden = self.d_hidden,
             nl_layers = self.nl_layers,
+            scale=self.scale,
             dim_amp=self.d_amp,
             param=self.param,
             gamma=self.gamma,
+            train_gamma=self.train_gamma,
+            train_ff_lip=self.train_ff_lip,
             init=self.init,
             rho = self.rho,
             max_phase_b = self.max_phase_b,
@@ -204,6 +210,174 @@ class HyperOptConfig:
     d_state_min: int = 4
     d_state_max: int = 32
     d_state_step: int = 2
+
+
+@dataclass
+class GainDiagnosticConfig:
+    """Configuration for reporting certified-gain diagnostics during training."""
+    enabled: bool = False
+    update_interval: int = 0
+    print_per_block: bool = True
+    print_at_start: bool = True
+    print_final: bool = True
+
+
+def _find_deepssm_core(model: nn.Module) -> Optional[DeepSSM]:
+    if isinstance(model, DeepSSM):
+        return model
+    core = getattr(model, "core", None)
+    if isinstance(core, DeepSSM):
+        return core
+    return None
+
+
+@torch.no_grad()
+def collect_gain_diagnostics(model: nn.Module) -> Optional[Dict[str, Any]]:
+    """Collect per-block gain data for DeepSSM certified models."""
+    core = _find_deepssm_core(model)
+    if core is None:
+        return None
+
+    try:
+        ref_param = next(core.parameters())
+    except StopIteration:
+        return None
+
+    device = ref_param.device
+    dtype = ref_param.dtype
+
+    block_rows = []
+    g_eff_terms = []
+    branch_terms = []
+
+    for index, block in enumerate(core.blocks):
+        gamma_attr = getattr(block.lru, "gamma", None)
+        if gamma_attr is None:
+            return None
+
+        core_gamma = torch.as_tensor(
+            gamma_attr,
+            device=device,
+            dtype=dtype,
+        ).abs()
+
+        ff_lip_attr = getattr(block.ff, "lip", None)
+        if ff_lip_attr is None:
+            ff_lip = torch.ones((), device=device, dtype=dtype)
+        else:
+            ff_lip = torch.as_tensor(
+                ff_lip_attr,
+                device=device,
+                dtype=dtype,
+            )
+
+        if core.training:
+            drop_factor = torch.as_tensor(
+                1.0 / max(1.0 - float(block.dropout.p), 1e-12),
+                device=device,
+                dtype=dtype,
+            )
+        else:
+            drop_factor = torch.ones((), device=device, dtype=dtype)
+
+        alpha = block.res_scale.to(device=device, dtype=dtype).clamp(0.0, 1.0)
+        branch_gain = core_gamma * ff_lip * drop_factor
+        g_eff = (1.0 + alpha * branch_gain).clamp_min(1e-12)
+
+        raw_lip = getattr(block.ff, "raw_lip", None)
+        ff_lip_trainable = isinstance(raw_lip, nn.Parameter) and raw_lip.requires_grad
+
+        block_rows.append({
+            "index": index,
+            "lru_type": block.lru.__class__.__name__,
+            "ff_type": block.ff.__class__.__name__,
+            "core_gamma": float(core_gamma.detach().cpu().item()),
+            "ff_lip": float(ff_lip.detach().cpu().item()),
+            "ff_lip_trainable": ff_lip_trainable,
+            "alpha": float(alpha.detach().cpu().item()),
+            "drop_factor": float(drop_factor.detach().cpu().item()),
+            "branch_gain": float(branch_gain.detach().cpu().item()),
+            "g_eff": float(g_eff.detach().cpu().item()),
+        })
+
+        branch_terms.append(branch_gain)
+        g_eff_terms.append(g_eff)
+
+    if g_eff_terms:
+        gamma_prod = torch.exp(torch.log(torch.stack(g_eff_terms)).sum())
+        branch_prod = torch.exp(torch.log1p(torch.stack(branch_terms)).sum())
+    else:
+        gamma_prod = torch.ones((), device=device, dtype=dtype)
+        branch_prod = torch.ones((), device=device, dtype=dtype)
+
+    conservative_gamma_prod = core.conservative_gamma_product(device=device, dtype=dtype)
+
+    global_gamma = None
+    smooth_scale = None
+    hard_scale = None
+    if core.use_cert_scaling:
+        gamma_t = core.gamma_t.abs().to(device=device, dtype=dtype)
+        global_gamma = float(gamma_t.detach().cpu().item())
+        smooth_scale = float(
+            core._smooth_capped_scale(
+                gamma_t=gamma_t,
+                gamma_prod=gamma_prod,
+                temperature=core.config.cert_scale_temperature,
+            ).detach().cpu().item()
+        )
+        hard_scale = float(torch.minimum(
+            torch.ones((), device=device, dtype=dtype),
+            gamma_t / (gamma_prod + 1e-12),
+        ).detach().cpu().item())
+
+    return {
+        "mode": "train" if core.training else "eval",
+        "use_cert_scaling": core.use_cert_scaling,
+        "global_gamma": global_gamma,
+        "gamma_prod": float(gamma_prod.detach().cpu().item()),
+        "branch_prod": float(branch_prod.detach().cpu().item()),
+        "conservative_gamma_prod": float(conservative_gamma_prod.detach().cpu().item()),
+        "smooth_scale": smooth_scale,
+        "hard_scale": hard_scale,
+        "n_blocks": len(block_rows),
+        "blocks": block_rows,
+    }
+
+
+def format_gain_diagnostics(
+        diagnostics: Dict[str, Any],
+        *,
+        epoch: int,
+        print_per_block: bool = True,
+) -> str:
+    """Render collected gain diagnostics into a short multi-line report."""
+    global_gamma = diagnostics["global_gamma"]
+    gamma_label = "None" if global_gamma is None else f"{global_gamma:.4e}"
+    line = (
+        f"[GainDiag][epoch {epoch + 1}] mode={diagnostics['mode']} "
+        f"global_gamma={gamma_label} gamma_prod={diagnostics['gamma_prod']:.4e} "
+        f"conservative={diagnostics['conservative_gamma_prod']:.4e}"
+    )
+
+    if diagnostics["smooth_scale"] is not None and diagnostics["hard_scale"] is not None:
+        line += (
+            f" decoder_scale={diagnostics['smooth_scale']:.4e} "
+            f"hard_cap={diagnostics['hard_scale']:.4e}"
+        )
+
+    if not print_per_block:
+        return line
+
+    lines = [line]
+    for block in diagnostics["blocks"]:
+        lip_tag = "trainable" if block["ff_lip_trainable"] else "fixed"
+        lines.append(
+            f"  block {block['index']}: {block['lru_type']} + {block['ff_type']} "
+            f"core_gamma={block['core_gamma']:.4e} ff_lip={block['ff_lip']:.4e} ({lip_tag}) "
+            f"alpha={block['alpha']:.4f} branch={block['branch_gain']:.4e} "
+            f"g_eff={block['g_eff']:.4e}"
+        )
+    return "\n".join(lines)
 
 
 # ============================================================================
@@ -381,6 +555,7 @@ class SystemIDTrainer:
             optimizer: Optional[torch.optim.Optimizer] = None,
             live_plot_config: Optional[LivePlotConfig] = None,
             normalizer: Optional[ChannelwiseStandardizer] = None,
+            gain_diagnostic_config: Optional[GainDiagnosticConfig] = None,
     ):
         """
         Args:
@@ -396,6 +571,7 @@ class SystemIDTrainer:
         self.device = torch.device(train_config.device)
         self.live_plot_config = live_plot_config
         self.normalizer = normalizer
+        self.gain_diagnostic_config = gain_diagnostic_config
         self.model.to(self.device)
 
         # Set up loss and optimizer
@@ -408,6 +584,7 @@ class SystemIDTrainer:
         self.train_losses = []
         self.val_losses = []
         self.best_val_loss = float('inf')
+        self.gain_diagnostics = []
 
         # Create checkpoint directory
         self.config.save_dir.mkdir(parents=True, exist_ok=True)
@@ -534,6 +711,26 @@ class SystemIDTrainer:
             train_loss, train_pred = self.train_epoch(u_train, y_train)
             self.train_losses.append(train_loss)
 
+            diag_cfg = self.gain_diagnostic_config
+            if diag_cfg is not None and diag_cfg.enabled:
+                interval = max(int(diag_cfg.update_interval), 0)
+                should_print_diag = (
+                    (diag_cfg.print_at_start and epoch == 0)
+                    or (interval > 0 and (epoch + 1) % interval == 0)
+                )
+                if should_print_diag:
+                    diagnostics = collect_gain_diagnostics(self.model)
+                    if diagnostics is not None:
+                        diagnostics["epoch"] = epoch + 1
+                        self.gain_diagnostics.append(diagnostics)
+                        pbar.write(
+                            format_gain_diagnostics(
+                                diagnostics,
+                                epoch=epoch,
+                                print_per_block=diag_cfg.print_per_block,
+                            )
+                        )
+
             # Validate
             val_loss, val_pred = self.validate(u_val, y_val, n=self.config.init_window)
             self.val_losses.append(val_loss)
@@ -587,6 +784,26 @@ class SystemIDTrainer:
         # Save final checkpoint
         self.save_checkpoint(epoch, is_best=False)
 
+        diag_cfg = self.gain_diagnostic_config
+        if diag_cfg is not None and diag_cfg.enabled and diag_cfg.print_final:
+            final_epoch = len(self.train_losses)
+            already_logged_final = (
+                len(self.gain_diagnostics) > 0
+                and self.gain_diagnostics[-1].get("epoch") == final_epoch
+            )
+            if not already_logged_final:
+                diagnostics = collect_gain_diagnostics(self.model)
+                if diagnostics is not None:
+                    diagnostics["epoch"] = final_epoch
+                    self.gain_diagnostics.append(diagnostics)
+                    print(
+                        format_gain_diagnostics(
+                            diagnostics,
+                            epoch=max(final_epoch - 1, 0),
+                            print_per_block=diag_cfg.print_per_block,
+                        )
+                    )
+
         # Print final report
         print("\n" + "=" * 70)
         print("TRAINING COMPLETE")
@@ -602,7 +819,8 @@ class SystemIDTrainer:
         return {
             'train_losses': self.train_losses,
             'val_losses': self.val_losses,
-            'best_val_loss': self.best_val_loss
+            'best_val_loss': self.best_val_loss,
+            'gain_diagnostics': self.gain_diagnostics,
         }
 
     @torch.no_grad()
@@ -1385,11 +1603,18 @@ def main():
         transition_frames=5,
         transition_pause=0.002,
     )
+    gain_diagnostic_config = GainDiagnosticConfig(
+        enabled=True,          # <-- set to False to turn off gain diagnostics
+        update_interval=50,     # set >0 to print every N epochs during training
+        print_per_block=True,
+        print_at_start=True,
+        print_final=True,
+    )
 
     # Initialize configurations
-    model_config = ModelConfig(n_u=u_train.shape[1], n_y=y_train.shape[1], param='l2ru', d_model=5, d_state=8,
-                               gamma= 40, ff='TLIP', init='eye',
-                               n_layers=3, d_amp=3, rho=0.99, phase_center=0.0, max_phase_b=2*np.pi, d_hidden=12, nl_layers=3, learn_x0=True)
+    model_config = ModelConfig(n_u=u_train.shape[1], n_y=y_train.shape[1], param='zak', d_model=5, d_state=8,
+                               gamma= 40, ff='TLIP', init='eye', max_phase=0.4,
+                               n_layers=3, d_amp=3, rho=0.99, phase_center=0.0, max_phase_b=.04, d_hidden=12, nl_layers=3, learn_x0=True)
     train_config = TrainingConfig(
         num_epochs=2000,
         learning_rate=1.6568e-02,
@@ -1489,7 +1714,8 @@ def main():
     # Initialize trainer
     trainer = SystemIDTrainer(model, train_config, criterion=nn.MSELoss(),
                               live_plot_config=live_plot_config,
-                              normalizer=normalizer)
+                              normalizer=normalizer,
+                              gain_diagnostic_config=gain_diagnostic_config)
 
     # Train model
     history = trainer.fit(u_train, y_train, u_val, y_val, use_early_stopping=False)
