@@ -10,6 +10,7 @@ class LayerConfig:
     n_layers: int = 2  # number of static_layers
     dropout: float = 0.0  # set it different from 0 if you want to introduce dropout regularization
     lip: float = 1.0  # Lipschitz bound for lip. bounded MLPs
+    train_lip: bool = True  # if False, keep the FF Lipschitz scale fixed at `lip`
 
 
 class GLU(nn.Module):

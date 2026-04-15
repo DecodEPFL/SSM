@@ -19,7 +19,7 @@ from .selective_cells import RobustMambaDiagSSM, RobustMambaDiagLTI
 from .experimental import ExpertSelectiveTimeVaryingSSM, Block2x2SelectiveBCDExpertsL2SSM
 from ..static_layers.generic_layers import LayerConfig, GLU, MLP
 from ..static_layers.lipschitz_mlps import (
-    LMLP, L2BoundedGLU, L2BoundedGLUv2, MultiBranchLipMixer,
+    LMLP, L2BoundedGLU, L2BoundedGLUv2, BudgetedL2BoundedGLUv2, MultiBranchLipMixer,
 )
 
 try:
@@ -52,6 +52,8 @@ class SSMConfig:
     # through encoder/decoder certificate scaling.
     train_gamma: bool = True # controls whether the per-block / per-LTI gamma parameters are trainable. This is distinct
     # from the global target gamma above, which remains fixed whenever `gamma` is not None.
+    train_ff_lip: Optional[bool] = True  # if None, freeze FF Lipschitz scaling when using a fixed, non-trainable gamma
+    # and leave it trainable otherwise.
     init: str = 'eye'  # controls the initialization of the parameters when the L2RU param is chosen.
     # parameters needed for the prescribed-gain parametrization
     rho: float = 0.9
@@ -212,12 +214,18 @@ class SSL(nn.Module):
         l_config.d_hidden = config.d_hidden
         l_config.n_layers = config.nl_layers
         l_config.lip = config.scale
+        if config.train_ff_lip is None:
+            l_config.train_lip = not (config.gamma is not None and not config.train_gamma)
+        else:
+            l_config.train_lip = bool(config.train_ff_lip)
 
         ff_layers = {
             "GLU": GLU,
             "MLP": MLP,
             "LGLU": L2BoundedGLU,
             "LGLU2": L2BoundedGLUv2,
+            "BLGLU2": BudgetedL2BoundedGLUv2,
+            "BudgetedLGLU2": BudgetedL2BoundedGLUv2,
             "LMLP": LMLP,
             "MBLIP": MultiBranchLipMixer,
         }
@@ -279,6 +287,7 @@ class DeepSSM(nn.Module):
         param: Optional[str] = "lru",
         gamma: Optional[float] = None,
         train_gamma: Optional[bool] = True,
+        train_ff_lip: Optional[bool] = None,
         init: str = "eye",
         rho: float = 0.9,
         max_phase_b: float = 0.5,
@@ -308,6 +317,7 @@ class DeepSSM(nn.Module):
             param=param,
             gamma=gamma,
             train_gamma=train_gamma,
+            train_ff_lip=train_ff_lip,
             init=init,
             rho=rho,
             max_phase_b=max_phase_b,

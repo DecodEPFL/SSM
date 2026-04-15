@@ -238,11 +238,15 @@ class L2BoundedGLU(nn.Module):
         d_input = int(config.d_input)
         lip_init = float(config.lip)
         lip0 = max(lip_init, self.eps)
+        train_lip = bool(getattr(config, "train_lip", True))
 
         # Per-channel positive trainable Lipschitz levels
         # We parametrize lip_vec = softplus(raw_lip) + eps
         raw_init = torch.log(torch.expm1(torch.full((d_input,), lip0)))
-        self.raw_lip = nn.Parameter(raw_init.clone().detach())
+        if train_lip:
+            self.raw_lip = nn.Parameter(raw_init.clone().detach())
+        else:
+            self.register_buffer("raw_lip", raw_init.clone().detach())
 
         # Linear map to 2d, intended to satisfy ||W||_2 <= 1
         self.lin = param.spectral_norm(nn.Linear(d_input, 2 * d_input, bias=False))
@@ -296,12 +300,16 @@ class L2BoundedGLUv2(nn.Module):
         d_input = int(config.d_input)
         lip_init = float(config.lip)
         lip0 = max(lip_init, self.eps)
+        train_lip = bool(getattr(config, "train_lip", True))
 
         if a_bound + 0.25 * b_bound > 1.0 + 1e-8:
             raise ValueError("Need a_bound + 0.25 * b_bound <= 1 for a 1-Lipschitz pre-block.")
 
         raw_init = torch.log(torch.expm1(torch.full((d_input,), lip0)))
-        self.raw_lip = nn.Parameter(raw_init.clone().detach())
+        if train_lip:
+            self.raw_lip = nn.Parameter(raw_init.clone().detach())
+        else:
+            self.register_buffer("raw_lip", raw_init.clone().detach())
 
         self.A = L2BoundedLinearExact(d_input, d_input, bound=a_bound, exact_norm=True)
         self.B = L2BoundedLinearExact(d_input, d_input, bound=b_bound, exact_norm=True)
@@ -319,6 +327,87 @@ class L2BoundedGLUv2(nn.Module):
         b = torch.sigmoid(self.B(x))
         y = a * b
         return y * self.lip_vec
+
+
+class BudgetedL2BoundedGLUv2(nn.Module):
+    """
+    GLU-like FF whose Lipschitz budget is spent inside the nonlinearity instead
+    of being applied as a post-hoc output rescaling.
+
+    Let
+        h(x) = tanh(alpha * A0 x) * sigmoid(beta * B0 x)
+        y(x) = W0 h(x)
+    where ||A0||_2, ||B0||_2, ||W0||_2 <= 1.
+
+    Since tanh is 1-Lipschitz and sigmoid is 1/4-Lipschitz, we get
+        Lip(h) <= alpha + beta / 4.
+
+    We parameterize a trainable split rho in (0, 1) and enforce
+        alpha = (1 - margin) * lip * rho
+        beta  = 4 * (1 - margin) * lip * (1 - rho),
+    so the whole block satisfies
+        Lip(y) <= Lip(h) <= (1 - margin) * lip < lip.
+
+    This makes `lip` control the admissible internal shape family rather than
+    simply scaling the final output.
+    """
+
+    def __init__(
+        self,
+        config: LayerConfig,
+        *,
+        split_init: float = 0.75,
+        margin: float = 1e-3,
+    ):
+        super().__init__()
+        self.eps = 1e-6
+        self.margin = float(min(max(margin, 0.0), 1.0 - 1e-6))
+
+        d_input = int(config.d_input)
+        d_output = int(config.d_output)
+        width = max(d_input, d_output, int(config.d_hidden))
+
+        lip_init = float(config.lip)
+        lip0 = max(lip_init, self.eps)
+        train_lip = bool(getattr(config, "train_lip", True))
+
+        raw_lip_init = torch.log(torch.expm1(torch.tensor(lip0, dtype=torch.float32)))
+        if train_lip:
+            self.raw_lip = nn.Parameter(raw_lip_init.clone().detach())
+        else:
+            self.register_buffer("raw_lip", raw_lip_init.clone().detach())
+
+        split0 = min(max(float(split_init), self.eps), 1.0 - self.eps)
+        split_logit_init = torch.logit(torch.tensor(split0, dtype=torch.float32))
+        self.split_logit = nn.Parameter(split_logit_init.clone().detach())
+
+        self.A0 = L2BoundedLinearExact(d_input, width, bound=1.0, exact_norm=True)
+        self.B0 = L2BoundedLinearExact(d_input, width, bound=1.0, exact_norm=True)
+        self.W0 = L2BoundedLinearExact(width, d_output, bound=1.0, exact_norm=True)
+
+    @property
+    def lip(self) -> torch.Tensor:
+        return F.softplus(self.raw_lip) + self.eps
+
+    @property
+    def rho(self) -> torch.Tensor:
+        return torch.sigmoid(self.split_logit).clamp(self.eps, 1.0 - self.eps)
+
+    @property
+    def alpha_bound(self) -> torch.Tensor:
+        budget = (1.0 - self.margin) * self.lip
+        return budget * self.rho
+
+    @property
+    def beta_bound(self) -> torch.Tensor:
+        budget = (1.0 - self.margin) * self.lip
+        return 4.0 * budget * (1.0 - self.rho)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        a = torch.tanh(self.alpha_bound * self.A0(x))
+        b = torch.sigmoid(self.beta_bound * self.B0(x))
+        y = a * b
+        return self.W0(y)
 
 
 
@@ -434,7 +523,11 @@ class MultiBranchLipMixer(nn.Module):
         lip_init = float(config.lip)
         lip0 = max(lip_init, self.eps)
         raw_lip_init = math.log(math.expm1(lip0))
-        self.raw_lip = nn.Parameter(torch.tensor(raw_lip_init))
+        train_lip = bool(getattr(config, "train_lip", True))
+        if train_lip:
+            self.raw_lip = nn.Parameter(torch.tensor(raw_lip_init))
+        else:
+            self.register_buffer("raw_lip", torch.tensor(raw_lip_init))
 
         # Learn branch allocation under an l2 budget:
         # w_i = sqrt(softmax(logits)_i), so sum_i w_i^2 = 1
