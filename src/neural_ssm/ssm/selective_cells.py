@@ -103,6 +103,26 @@ def _diag_scan(
     return states
 
 
+def _spectral_cap(weight: torch.Tensor, bound: torch.Tensor, *, eps: float = 1e-12) -> torch.Tensor:
+    """Return ``weight`` rescaled so its spectral norm is ``<= bound``.
+
+    Like :meth:`DeepSSM._spectrally_capped_weight`, this only ever shrinks the
+    weight (``divisor >= 1``); it never amplifies an under-sized matrix. ``bound``
+    may be a (possibly grad-carrying) scalar tensor so the cap adapts to learnable
+    gain budgets, in which case gradients flow into ``bound`` while the cap binds.
+    """
+    weight_for_norm = (
+        weight.float() if weight.dtype in (torch.float16, torch.bfloat16) else weight
+    )
+    sigma = torch.linalg.matrix_norm(weight_for_norm, ord=2).to(
+        device=weight.device, dtype=weight.dtype
+    )
+    if not torch.is_tensor(bound):
+        bound = torch.as_tensor(bound, device=weight.device, dtype=weight.dtype)
+    divisor = torch.clamp(sigma / bound.clamp_min(eps), min=1.0)
+    return weight / divisor
+
+
 # ----------------------------
 # Robust Mamba-style selective diagonal SSM with prescribed ℓ2 gain
 # ----------------------------
@@ -674,3 +694,298 @@ class RobustMambaDiagLTI(nn.Module):
 
     def reset(self):
         self.state = _reset_runtime_state(self.state, x0=self.x0_param)
+
+
+# ----------------------------
+# Raven-like selective slot-memory cell with a prescribed ℓ2 gain
+# ----------------------------
+class L2SelectiveRavenCell(nn.Module):
+    r"""Scan-compatible Raven-style selective SSM cell with a certified ℓ2 gain.
+
+    Interface-wise this is an "LTI cell": it has the same
+    ``forward(z, state=None, *, mode=...)`` contract, the same ``loop``/``scan``
+    modes, the same streaming-state semantics, and exposes ``.gamma`` so the
+    certified :class:`DeepSSM` stack can compose it. Mathematically it is **not**
+    LTI: its diagonal coefficients depend on the current input token ``z_t``
+    through a top-K router, i.e. it is an input-dependent (selective) diagonal SSM
+
+        S_{t+1} = A(z_t) ⊙ S_t + B(z_t).
+
+    State is key/value slot memory ``S_k: (B,H,M,d_k)``, ``S_v: (B,H,M,d_v)``.
+    For each token (all projections are bias-free, which is required for the
+    zero-state gain certificate: ``z_t = 0`` must give ``y_t = 0``)::
+
+        q_t = W_q z_t,  k_t = W_k z_t,  v_t = W_v z_t          # per head
+        m_t = sigmoid(W_r z_t)                                 # (B,H,M)
+        g_t = top_k(m_t, K)                                    # zero outside top-K
+        r_t = g_t / (alpha * g_t.sum(-1, keepdim).clamp_min(eps))   # sum_M r_t <= 1/alpha
+
+        lambda_t = rho * exp(a ⊙ r_t),   a = -softplus(a_raw) <= 0  =>  lambda_t <= rho < 1
+        omega_t  = r_t ⊙ (1 - lambda_t)                        # r_t = 0  =>  omega_t = 0
+
+        S^{k}_{t+1} = lambda_t ⊙ S^k_t + omega_t ⊙ k_t         # inactive slots decay as rho
+        S^{v}_{t+1} = lambda_t ⊙ S^v_t + omega_t ⊙ v_t
+
+    The readout is attention over slots, using the pre-write memory (strictly
+    causal, ``S_0 = 0`` so a zero prefix reads out zero)::
+
+        p_t = softmax( (S^k_t · q_t) / sqrt(d_k) )             # over slots
+        o_t = sum_m p_{t,m} S^v_t[m]                           # convex combination
+        y_t = W_o o_t  (+ D z_t  if use_skip)
+
+    Conservative ℓ2-gain certificate (zero initial state)::
+
+        gamma_layer <= ||W_o||_2 ||W_v||_2 / (alpha (1 - rho)) + ||D||_2.
+
+    It is enforced by spectrally capping ``W_v``, ``W_o`` to ``c_v = c_o =
+    sqrt(gamma_mem * alpha * (1 - rho))`` (so ``||W_o|| ||W_v|| <= gamma_mem *
+    alpha * (1 - rho)``) and ``D`` to ``gamma_skip``, with ``gamma_mem = gamma -
+    gamma_skip``. Keys, queries and the router are unconstrained because the
+    softmax weights live in the simplex and never enter the magnitude bound.
+    The certificate is rigorous but conservative; the realized gain is typically
+    well below ``gamma``.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        num_slots: int,
+        key_dim: int,
+        value_dim: int,
+        top_k: int,
+        *,
+        gamma: float = 1.0,
+        train_gamma: bool = True,
+        gamma_skip: float = 0.0,
+        alpha: float = 1.0,
+        rho_max: float = 0.999,
+        eps: float = 1e-6,
+        use_skip: bool = False,
+        learn_x0: bool = False,
+    ):
+        super().__init__()
+        self.d_model = int(d_model)
+        self.H = int(num_heads)
+        self.M = int(num_slots)
+        self.d_k = int(key_dim)
+        self.d_v = int(value_dim)
+        self.K = int(top_k)
+        if min(self.d_model, self.H, self.M, self.d_k, self.d_v) <= 0:
+            raise ValueError("d_model, num_heads, num_slots, key_dim, value_dim must be positive.")
+        if not (1 <= self.K <= self.M):
+            raise ValueError(f"top_k must be in [1, num_slots={self.M}], got {self.K}.")
+        self.alpha = float(alpha)
+        if self.alpha <= 0.0 or not math.isfinite(self.alpha):
+            raise ValueError(f"alpha must be finite and positive, got {alpha}.")
+        self.rho_max = float(rho_max)
+        if not (0.0 < self.rho_max < 1.0):
+            raise ValueError(f"rho_max must be in (0, 1), got {rho_max}.")
+        self.eps = float(eps)
+        self.use_skip = bool(use_skip)
+        self.gamma_skip = float(gamma_skip)
+        if self.gamma_skip < 0.0:
+            raise ValueError(f"gamma_skip must be non-negative, got {gamma_skip}.")
+
+        # Total prescribed ℓ2-gain budget (matches the `.gamma`/`log_gamma`
+        # convention used by the other certified cells so `_set_cell_gamma` works).
+        g0 = torch.tensor(float(gamma)).clamp_min(1e-8)
+        if train_gamma:
+            self.log_gamma = nn.Parameter(g0.log())
+        else:
+            self.register_buffer("log_gamma", g0.log())
+
+        # rho in (0, rho_max) via rho = rho_max * sigmoid(rho_logit).
+        self.rho_logit = nn.Parameter(torch.tensor(0.0))
+        # Per-(head, slot) decay shaping, a = -softplus(a_raw) <= 0.
+        self.a_raw = nn.Parameter(torch.zeros(self.H, self.M))
+
+        # Bias-free projections (bias would break the zero-input -> zero-output
+        # property the gain certificate relies on).
+        self.W_q = nn.Linear(self.d_model, self.H * self.d_k, bias=False)
+        self.W_k = nn.Linear(self.d_model, self.H * self.d_k, bias=False)
+        self.W_v = nn.Linear(self.d_model, self.H * self.d_v, bias=False)
+        self.W_r = nn.Linear(self.d_model, self.H * self.M, bias=False)
+        self.W_o = nn.Linear(self.H * self.d_v, self.d_model, bias=False)
+        self.D = nn.Linear(self.d_model, self.d_model, bias=False) if self.use_skip else None
+
+        self.learn_x0 = bool(learn_x0)
+        if self.learn_x0:
+            self.S_k0 = nn.Parameter(torch.zeros(1, self.H, self.M, self.d_k))
+            self.S_v0 = nn.Parameter(torch.zeros(1, self.H, self.M, self.d_v))
+        else:
+            self.register_buffer("S_k0", None)
+            self.register_buffer("S_v0", None)
+
+        self.state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+
+    # ---- gain-control parameters -------------------------------------------------
+    @property
+    def rho(self) -> torch.Tensor:
+        return self.rho_max * torch.sigmoid(self.rho_logit)
+
+    @property
+    def gamma(self) -> torch.Tensor:
+        """Prescribed (enforced) ℓ2-gain upper bound used by the DeepSSM certificate."""
+        return self.log_gamma.exp()
+
+    @property
+    def decay_shape(self) -> torch.Tensor:
+        """``a = -softplus(a_raw) <= 0``; controls per-(head, slot) extra decay."""
+        return -F.softplus(self.a_raw)
+
+    def _gain_budget(self, device, dtype):
+        """Return ``(c, gamma_skip_eff, rho)`` with ``c_v = c_o = c``.
+
+        Enforces ``gamma_mem + gamma_skip_eff <= gamma`` and ``c^2 = gamma_mem *
+        alpha * (1 - rho)`` so the capped weights satisfy the certificate.
+        """
+        gamma_total = self.gamma.to(device=device, dtype=dtype)
+        rho = self.rho.to(device=device, dtype=dtype)
+        gamma_skip = torch.as_tensor(self.gamma_skip, device=device, dtype=dtype)
+        gamma_skip_eff = torch.minimum(gamma_skip, gamma_total)
+        gamma_mem = (gamma_total - gamma_skip_eff).clamp_min(0.0)
+        budget = gamma_mem * self.alpha * (1.0 - rho)
+        c = torch.sqrt(budget.clamp_min(0.0) + self.eps)
+        return c, gamma_skip_eff, rho
+
+    # ---- state plumbing ----------------------------------------------------------
+    def _resolve_state(self, state, reset_state, B, device, dtype):
+        internal = self.state
+        if reset_state:
+            internal = (self.S_k0, self.S_v0) if self.learn_x0 else None
+        # Explicit state always wins (matches resolve_runtime_state semantics).
+        src = state if state is not None else internal
+        if src is None:
+            Sk0 = torch.zeros(B, self.H, self.M, self.d_k, device=device, dtype=dtype)
+            Sv0 = torch.zeros(B, self.H, self.M, self.d_v, device=device, dtype=dtype)
+            return Sk0, Sv0
+        Sk0, Sv0 = src
+        return (
+            self._cast_state(Sk0, B, self.d_k, device, dtype),
+            self._cast_state(Sv0, B, self.d_v, device, dtype),
+        )
+
+    def _cast_state(self, S, B, d, device, dtype):
+        if S.dim() == 3:           # (H,M,d) -> add batch
+            S = S.unsqueeze(0)
+        if S.dim() != 4:
+            raise ValueError(f"slot state must have 3 or 4 dims, got shape {tuple(S.shape)}.")
+        if S.size(0) == 1 and B > 1:
+            S = S.expand(B, -1, -1, -1)
+        if S.shape != (B, self.H, self.M, d):
+            raise ValueError(
+                f"slot state has shape {tuple(S.shape)}, expected {(B, self.H, self.M, d)}."
+            )
+        return S.to(device=device, dtype=dtype)
+
+    def _router(self, m: torch.Tensor) -> torch.Tensor:
+        """Top-K, then normalize so ``sum_M r_t <= 1/alpha`` (the gain-budget input)."""
+        if self.K >= self.M:
+            g = m
+        else:
+            top_val, top_idx = torch.topk(m, self.K, dim=-1)
+            g = torch.zeros_like(m).scatter(-1, top_idx, top_val)
+        denom = self.alpha * g.sum(dim=-1, keepdim=True).clamp_min(self.eps)
+        return g / denom
+
+    def _scan_memory(self, A, Bx, S0, mode):
+        """Run ``S_{t+1} = A_t ⊙ S_t + B_t``; return ``(post, pre)`` states.
+
+        post[t] = S_{t+1} (after writing token t); pre[t] = S_t (before).
+        A: (B,T,H,M,1), Bx: (B,T,H,M,d), S0: (B,H,M,d).
+        """
+        T = A.shape[1]
+        if T == 0:
+            empty = Bx[:, :0]
+            return empty, empty
+        if mode == "loop":
+            posts = []
+            S = S0
+            for t in range(T):
+                S = A[:, t] * S + Bx[:, t]
+                posts.append(S)
+            post = torch.stack(posts, dim=1)
+        elif mode == "scan":
+            Bx = Bx.clone()
+            Bx[:, 0] = Bx[:, 0] + A[:, 0] * S0
+            # Inclusive affine prefix scan along time (axis=1); same JIT operator as LRU.
+            _, post = associative_scan(binary_operator_diag, (A, Bx), axis=1)
+        else:
+            raise ValueError(f"Unknown mode {mode!r}, expected 'loop' or 'scan'.")
+        pre = torch.cat([S0.unsqueeze(1), post[:, :-1]], dim=1)
+        return post, pre
+
+    def forward(
+        self,
+        z: torch.Tensor,
+        state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        *,
+        mode: Literal["scan", "loop"] = "scan",
+        return_state: bool = True,
+        return_last: bool = False,
+        reset_state: bool = True,
+        detach_state: bool = True,
+    ):
+        """``z: (B,L,d_model) -> y: (B,L,d_model)``; state is ``(S_k, S_v)``.
+
+        Returns ``(y, (S_k_seq, S_v_seq))`` by default, where each slot-memory
+        trajectory has shape ``(B, L, H, M, d)`` and its last time index is the
+        streaming state ``(B, H, M, d)`` recovered by ``DeepSSM._last_runtime_state``.
+        """
+        z = _normalize_to_3d(z)
+        B, T, Dm = z.shape
+        if Dm != self.d_model:
+            raise ValueError(f"Expected d_model={self.d_model}, got {Dm}.")
+        device, dtype = z.device, z.dtype
+
+        S_k0, S_v0 = self._resolve_state(state, reset_state, B, device, dtype)
+
+        c, gamma_skip_eff, rho = self._gain_budget(device, dtype)
+        W_v_eff = _spectral_cap(self.W_v.weight, c)
+        W_o_eff = _spectral_cap(self.W_o.weight, c)
+
+        q = self.W_q(z).view(B, T, self.H, self.d_k)
+        k = self.W_k(z).view(B, T, self.H, self.d_k)
+        v = F.linear(z, W_v_eff).view(B, T, self.H, self.d_v)
+        m = torch.sigmoid(self.W_r(z)).view(B, T, self.H, self.M)
+
+        r = self._router(m)                                       # (B,T,H,M), sum_M r <= 1/alpha
+        a = self.decay_shape.to(device=device, dtype=dtype)       # (H,M) <= 0
+        lam = rho * torch.exp(a[None, None] * r)                  # (B,T,H,M) <= rho
+        omega = r * (1.0 - lam)                                   # (B,T,H,M), 0 where r == 0
+
+        A = lam.unsqueeze(-1)                                     # (B,T,H,M,1)
+        Bk = omega.unsqueeze(-1) * k.unsqueeze(3)                 # (B,T,H,M,d_k)
+        Bv = omega.unsqueeze(-1) * v.unsqueeze(3)                 # (B,T,H,M,d_v)
+
+        Sk_post, Sk_pre = self._scan_memory(A, Bk, S_k0, mode)
+        Sv_post, Sv_pre = self._scan_memory(A, Bv, S_v0, mode)
+
+        # Attention readout over slots from the pre-write memory.
+        scores = (Sk_pre * q.unsqueeze(3)).sum(-1) / math.sqrt(self.d_k)   # (B,T,H,M)
+        p = torch.softmax(scores, dim=-1)                                  # (B,T,H,M)
+        o = (p.unsqueeze(-1) * Sv_pre).sum(dim=3)                          # (B,T,H,d_v)
+        o = o.reshape(B, T, self.H * self.d_v)
+        y = F.linear(o, W_o_eff)                                           # (B,T,d_model)
+        if self.use_skip:
+            y = y + F.linear(z, _spectral_cap(self.D.weight, gamma_skip_eff))
+
+        Sk_last = Sk_post[:, -1] if T > 0 else S_k0
+        Sv_last = Sv_post[:, -1] if T > 0 else S_v0
+        self.state = (
+            (Sk_last.detach(), Sv_last.detach()) if detach_state else (Sk_last, Sv_last)
+        )
+
+        state_seq = (Sk_post, Sv_post)
+        last_state = (Sk_last, Sv_last)
+        if return_state and return_last:
+            return y, state_seq, last_state
+        if return_state:
+            return y, state_seq
+        if return_last:
+            return y, last_state
+        return y, last_state
+
+    def reset(self):
+        self.state = None

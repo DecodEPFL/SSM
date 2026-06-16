@@ -34,7 +34,7 @@ from .lti_cells import (
     _normalize_to_3d,
     lruz,
 )
-from .selective_cells import RobustMambaDiagSSM, RobustMambaDiagLTI
+from .selective_cells import L2SelectiveRavenCell, RobustMambaDiagSSM, RobustMambaDiagLTI
 from ..static_layers.generic_layers import GLU, MLP, LayerConfig
 from ..static_layers.lipschitz_mlps import (
     BudgetedL2BoundedGLUv2,
@@ -92,6 +92,18 @@ class SSMConfig:
     # the hard min without breaking the guarantee.
     ssm_residual_init: float = -1.0  # logit of the SSM residual gate
     ff_residual_init: float = -1.0  # logit of the FF residual gate
+
+    # Raven selective slot-memory cell (param="raven"). Tune these by passing an
+    # SSMConfig directly; DeepSSM(...) keyword construction uses these defaults.
+    raven_heads: int = 4  # number of attention heads (H)
+    raven_slots: int = 16  # number of key/value memory slots (M)
+    raven_key_dim: int = 16  # per-head key/query dimension (d_k)
+    raven_value_dim: int = 16  # per-head value dimension (d_v)
+    raven_top_k: int = 4  # router keeps the top-K slots per token (1 <= K <= M)
+    raven_alpha: float = 1.0  # router normalization; larger => smaller writes / gain budget
+    raven_rho_max: float = 0.999  # hard cap on the slot decay rho in (0, rho_max)
+    raven_gamma_skip: float = 0.0  # gain budget reserved for the optional direct skip D
+    raven_use_skip: bool = False  # include the spectrally-capped direct term D z_t
 
     # Parallel scan must be selected in the forward call of the SSM.
 
@@ -277,6 +289,24 @@ def _build_tvc_cell(config: SSMConfig, block_gamma: Optional[float]) -> nn.Modul
     )
 
 
+def _build_raven_cell(config: SSMConfig, block_gamma: Optional[float]) -> nn.Module:
+    return L2SelectiveRavenCell(
+        d_model=config.d_model,
+        num_heads=config.raven_heads,
+        num_slots=config.raven_slots,
+        key_dim=config.raven_key_dim,
+        value_dim=config.raven_value_dim,
+        top_k=config.raven_top_k,
+        gamma=_gamma_init(block_gamma),
+        train_gamma=config.train_gamma,
+        gamma_skip=config.raven_gamma_skip,
+        alpha=config.raven_alpha,
+        rho_max=config.raven_rho_max,
+        use_skip=config.raven_use_skip,
+        learn_x0=config.learn_x0,
+    )
+
+
 _SSM_PARAMETRIZATIONS: dict[str, SSMParametrization] = {
     "lru": SSMParametrization("lru", _build_lru_cell, certified=False),
     "l2ru": SSMParametrization("l2ru", _build_l2ru_cell, certified=True),
@@ -285,6 +315,7 @@ _SSM_PARAMETRIZATIONS: dict[str, SSMParametrization] = {
     "l2nt": SSMParametrization("l2nt", _build_l2nt_cell, certified=True),
     "tv": SSMParametrization("tv", _build_tv_cell, certified=True),
     "tvc": SSMParametrization("tvc", _build_tvc_cell, certified=True),
+    "raven": SSMParametrization("raven", _build_raven_cell, certified=True),
 }
 _CERTIFIED_PARAMETRIZATIONS = frozenset(
     name for name, spec in _SSM_PARAMETRIZATIONS.items() if spec.certified
@@ -836,21 +867,26 @@ class DeepSSM(nn.Module):
             device=device,
             dtype=dtype,
         )
-        scale = self._smooth_capped_scale_from_logs(
+        log_scale = self._smooth_capped_log_scale_from_logs(
             gamma_t=gamma_cap,
             log_gamma_prod=log_block_product,
             temperature=self.config.cert_scale_temperature,
         )
 
         tiny = torch.finfo(dtype).tiny
+        # Compose entirely in log space. Materializing ``scale`` first and
+        # reading it back via ``log(scale.clamp_min(tiny))`` re-inflates the
+        # decoder attenuation once it underflows to a subnormal float (deep
+        # stacks / large learned branch gains in float32), which would report a
+        # bound far above ``gamma``.
         log_bound = (
             torch.log(encoder_norm.clamp_min(tiny))
             + log_block_product
             + torch.log(decoder_norm.clamp_min(tiny))
-            + torch.log(scale.clamp_min(tiny))
+            + log_scale
         )
         bound = torch.exp(log_bound)
-        return torch.where(scale > 0, bound, torch.zeros_like(bound))
+        return torch.where(torch.isfinite(log_scale), bound, torch.zeros_like(bound))
 
     @torch.no_grad()
     def gain_diagnostics(self) -> dict[str, Any]:
@@ -1054,6 +1090,33 @@ class DeepSSM(nn.Module):
         )
 
     @staticmethod
+    def _smooth_capped_log_scale_from_logs(
+        gamma_t: torch.Tensor,
+        log_gamma_prod: torch.Tensor,
+        temperature: float,
+    ) -> torch.Tensor:
+        """
+        Log of the smooth decoder scale.
+
+        Returns ``log(scale)`` where ``scale`` is no larger than
+        ``min(1, gamma_t / gamma_prod)``. Keeping the result in log space lets
+        callers compose the certificate without ever materializing ``scale``:
+        for deep stacks ``scale`` underflows to a subnormal float, and reading
+        it back through ``log(clamp_min(scale, tiny))`` would re-inflate it and
+        break ``bound <= gamma``. Returns ``-inf`` for non-positive ``gamma_t``.
+        """
+        tau = max(float(temperature), 1e-6)
+        gamma_t = gamma_t.abs()
+        tiny = torch.finfo(gamma_t.dtype).tiny
+        log_gamma_t = torch.log(gamma_t.clamp_min(tiny))
+        log_ratio = log_gamma_prod - log_gamma_t
+        smooth_log_cap = tau * F.softplus(log_ratio / tau)
+        log_scale = -smooth_log_cap
+        return torch.where(
+            gamma_t > 0, log_scale, torch.full_like(log_scale, float("-inf"))
+        )
+
+    @staticmethod
     def _smooth_capped_scale_from_logs(
         gamma_t: torch.Tensor,
         log_gamma_prod: torch.Tensor,
@@ -1064,16 +1127,14 @@ class DeepSSM(nn.Module):
 
         The result is no larger than ``min(1, gamma_t / gamma_prod)``. Working
         with ``log_gamma_prod`` avoids overflow for deep stacks or large learned
-        branch bounds.
+        branch bounds. ``exp(-inf) == 0`` recovers the non-positive-gamma case.
         """
-        tau = max(float(temperature), 1e-6)
-        gamma_t = gamma_t.abs()
-        tiny = torch.finfo(gamma_t.dtype).tiny
-        log_gamma_t = torch.log(gamma_t.clamp_min(tiny))
-        log_ratio = log_gamma_prod - log_gamma_t
-        smooth_log_cap = tau * F.softplus(log_ratio / tau)
-        scale = torch.exp(-smooth_log_cap)
-        return torch.where(gamma_t > 0, scale, torch.zeros_like(scale))
+        log_scale = DeepSSM._smooth_capped_log_scale_from_logs(
+            gamma_t=gamma_t,
+            log_gamma_prod=log_gamma_prod,
+            temperature=temperature,
+        )
+        return torch.exp(log_scale)
 
     def reset(self):
         for block in self.blocks:

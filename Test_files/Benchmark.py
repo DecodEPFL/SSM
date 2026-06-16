@@ -220,8 +220,12 @@ class ModelConfig:
     raven_d_k: Optional[int] = None
     raven_d_v: Optional[int] = None
     raven_routing_alpha: float = 1.0
-    raven_residual: bool = True
-    raven_norm: bool = True
+    raven_residual: bool = True  # only used by the experimental model_type="raven" wrapper
+    raven_norm: bool = True      # only used by the experimental model_type="raven" wrapper
+    # Extra knobs for the certified L2SelectiveRavenCell core (param="raven").
+    raven_rho_max: float = 0.999  # hard cap on slot decay rho in (0, rho_max)
+    raven_gamma_skip: float = 0.0  # gain budget reserved for the optional direct skip D
+    raven_use_skip: bool = False  # include the spectrally-capped direct term D z_t
 
     def to_ssm_config(self) -> SSMConfig:
         """Convert to SSMConfig object."""
@@ -249,6 +253,22 @@ class ModelConfig:
             learn_x0=self.learn_x0,
             ssm_residual_init=self.ssm_residual_init,
             ff_residual_init=self.ff_residual_init,
+            # Forwarded for param="raven" (ignored by the other parametrizations).
+            raven_heads=self.raven_heads,
+            raven_slots=self.raven_slots,
+            raven_top_k=self.raven_top_k,
+            raven_key_dim=(
+                self.raven_d_k if self.raven_d_k is not None
+                else max(1, self.d_model // self.raven_heads)
+            ),
+            raven_value_dim=(
+                self.raven_d_v if self.raven_d_v is not None
+                else max(1, self.d_model // self.raven_heads)
+            ),
+            raven_alpha=self.raven_routing_alpha,
+            raven_rho_max=self.raven_rho_max,
+            raven_gamma_skip=self.raven_gamma_skip,
+            raven_use_skip=self.raven_use_skip,
         )
 
 
@@ -1623,9 +1643,16 @@ def main():
     )
 
     # Initialize configurations
-    model_config = ModelConfig(n_u=u_train.shape[1], n_y=y_train.shape[1], param='tv', d_model=8, d_state=8,
-                               gamma= 5, ff='MBLIP', init='eye', max_phase=0.4,
-                               n_layers=3, d_amp=3, rho=0.99, phase_center=0.0, max_phase_b=.04, d_hidden=12, nl_layers=3, learn_x0=False)
+    model_config = ModelConfig(n_u=u_train.shape[1], n_y=y_train.shape[1], param='raven', d_model=18, d_state=18,
+                               gamma= None, ff='GLU', init='eye', max_phase=0.4,
+                               n_layers=5, d_amp=3, rho=0.99, phase_center=0.0, max_phase_b=.04, d_hidden=12, nl_layers=3, learn_x0=False,
+                               # ---- Raven knobs (optional; these now feed the cell) ----
+                               raven_heads=4, raven_slots=8, raven_top_k=2,
+                               raven_d_k=None, raven_d_v=None,  # None -> d_model // heads
+                               raven_routing_alpha=1.0,
+                               raven_rho_max=0.999,
+                               raven_use_skip=False, raven_gamma_skip=0.0,
+                               )
     train_config = TrainingConfig(
         num_epochs=2000,
         learning_rate=1.6568e-02,
