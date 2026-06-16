@@ -65,19 +65,21 @@ The SSM model is implemented by the class DeepSSM, which takes a number of input
 - `d_state`: internal recurrent state dimension.
 - `n_layers`: number of stacked SSL blocks.
 - `param`: parametrization of the recurrent unit (`lru`, `l2n`, `tv`, ...).
-- `ff`: static nonlinearity type, same for each SSL block (`GLU`, `MLP`, `LMLP`, `LGLU`, `TLIP`).
-- `gamma`: desired L_2 bound of the overall SSM. If `gamma=None`, it is trainable.
+- `ff`: static nonlinearity type, same for each SSL block. Certified models require a block with an explicit global Lipschitz bound, such as `LGLU2`, `BLGLU2`, `MBLIP`, or `TLIP`.
+- `gamma`: prescribed upper bound on the zero-state L_2 gain. If `gamma=None`, the global certificate is disabled.
+
+Certified models require `learn_x0=False`. A nonzero learned initial state can produce output at zero input, so it needs a separate initial-storage term rather than a pure induced-gain bound.
 
 ## Where each component is in the code
 
 - End-to-end wrapper (encoder, stack, decoder):  
-  `DeepSSM` in `src/neural_ssm/ssm/lru.py`
+  `DeepSSM` in `src/neural_ssm/ssm/layers.py`
 - Repeated SSM block (dynamic core + nonlinearity + residual):  
-  `SSL` in `src/neural_ssm/ssm/lru.py`
+  `SSL` in `src/neural_ssm/ssm/layers.py`
 - Dynamic cores:
-  - `lru` -> `LRU` in `src/neural_ssm/ssm/lru.py`
-  - `l2n` -> `Block2x2DenseL2SSM` in `src/neural_ssm/ssm/lru.py`
-  - `tv` -> `RobustMambaDiagSSM` in `src/neural_ssm/ssm/mamba.py`
+  - `lru` -> `LRU` in `src/neural_ssm/ssm/lti_cells.py`
+  - `l2n` -> `Block2x2DenseL2SSM` in `src/neural_ssm/ssm/lti_cells.py`
+  - `tv` -> `RobustMambaDiagSSM` in `src/neural_ssm/ssm/selective_cells.py`
 - Static nonlinearities:
   - `GLU`, `MLP` in `src/neural_ssm/static_layers/generic_layers.py`
   - `LGLU`, `LMLP`, `TLIP` in `src/neural_ssm/static_layers/lipschitz_mlps.py`
@@ -130,7 +132,7 @@ model = DeepSSM(
     d_state=16,
     n_layers=4,
     param="tv",
-    ff="LGLU",
+    ff="LGLU2",
     gamma=2.0,
 )
 

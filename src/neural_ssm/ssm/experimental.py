@@ -6,6 +6,220 @@ import torch.nn as nn
 import torch.nn.functional as F
 from .scan_utils import compute_linear_recurrence_parallel_block2x2
 
+
+class MultiHeadRavenRSM(nn.Module):
+    """Multi-head Raven/Routing Slot Memory.
+
+    The layer keeps per-head key/value slot memories and updates only the
+    top-K routed slots at each time step. Its recurrent state is the tuple
+    ``(S_k, S_v)`` with shapes ``(B, H, M, d_k)`` and ``(B, H, M, d_v)``.
+
+    ``r_t == 0`` gives ``lambda_t == 1`` and ``eta_t == 0``, so inactive slots
+    are preserved exactly.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        *,
+        num_heads: int = 4,
+        num_slots: int = 8,
+        d_k: Optional[int] = None,
+        d_v: Optional[int] = None,
+        top_k: int = 2,
+        routing_alpha: float = 1.0,
+        eps: float = 1e-6,
+        residual: bool = True,
+        norm: bool = True,
+        bias: bool = True,
+        a_init: float = -1.0,
+    ):
+        super().__init__()
+        if d_model <= 0:
+            raise ValueError(f"d_model must be positive, got {d_model}.")
+        if num_heads <= 0 or num_slots <= 0:
+            raise ValueError("num_heads and num_slots must be positive.")
+        if not 1 <= int(top_k) <= int(num_slots):
+            raise ValueError(f"top_k must be in [1, num_slots], got {top_k}.")
+        if routing_alpha <= 0.0:
+            raise ValueError("routing_alpha must be positive.")
+
+        self.d_model = int(d_model)
+        self.num_heads = int(num_heads)
+        self.num_slots = int(num_slots)
+        self.d_k = int(d_k if d_k is not None else max(1, d_model // num_heads))
+        self.d_v = int(d_v if d_v is not None else self.d_k)
+        self.top_k = int(top_k)
+        self.routing_alpha = float(routing_alpha)
+        self.eps = float(eps)
+        self.residual = bool(residual)
+
+        self.q_proj = nn.Linear(self.d_model, self.num_heads * self.d_k, bias=bias)
+        self.k_proj = nn.Linear(self.d_model, self.num_heads * self.d_k, bias=bias)
+        self.v_proj = nn.Linear(self.d_model, self.num_heads * self.d_v, bias=bias)
+        self.router = nn.Linear(self.d_model, self.num_heads * self.num_slots, bias=bias)
+        self.out_proj = nn.Linear(self.num_heads * self.d_v, self.d_model, bias=bias)
+        self.norm = nn.LayerNorm(self.d_model) if norm else nn.Identity()
+
+        # a = -softplus(a_raw) <= 0. Store one retention rate per head/slot.
+        a0 = max(abs(float(a_init)), self.eps)
+        a_raw0 = math.log(math.expm1(a0))
+        self.a_raw = nn.Parameter(torch.full((self.num_heads, self.num_slots), a_raw0))
+        self.state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+
+    @property
+    def a(self) -> torch.Tensor:
+        return -F.softplus(self.a_raw)
+
+    def reset_state(
+        self,
+        batch_size: int,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Create and store an all-zero slot-memory state."""
+        if batch_size <= 0:
+            raise ValueError(f"batch_size must be positive, got {batch_size}.")
+        ref = next(self.parameters())
+        device = ref.device if device is None else device
+        dtype = ref.dtype if dtype is None else dtype
+        self.state = (
+            torch.zeros(
+                batch_size,
+                self.num_heads,
+                self.num_slots,
+                self.d_k,
+                device=device,
+                dtype=dtype,
+            ),
+            torch.zeros(
+                batch_size,
+                self.num_heads,
+                self.num_slots,
+                self.d_v,
+                device=device,
+                dtype=dtype,
+            ),
+        )
+        return self.state
+
+    def _coerce_state(
+        self,
+        state: Optional[Tuple[torch.Tensor, torch.Tensor]],
+        *,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        reset_state: bool,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if state is None and not reset_state and self.state is not None:
+            S_k, S_v = self.state
+            if S_k.shape[0] == batch_size and S_v.shape[0] == batch_size:
+                state = self.state
+
+        if state is None:
+            return self.reset_state(batch_size, device=device, dtype=dtype)
+
+        if not isinstance(state, tuple) or len(state) != 2:
+            raise ValueError("state must be a tuple (S_k, S_v).")
+
+        S_k, S_v = state
+        expected_k = (batch_size, self.num_heads, self.num_slots, self.d_k)
+        expected_v = (batch_size, self.num_heads, self.num_slots, self.d_v)
+        if tuple(S_k.shape) != expected_k:
+            raise ValueError(f"S_k has shape {tuple(S_k.shape)}, expected {expected_k}.")
+        if tuple(S_v.shape) != expected_v:
+            raise ValueError(f"S_v has shape {tuple(S_v.shape)}, expected {expected_v}.")
+        return S_k.to(device=device, dtype=dtype), S_v.to(device=device, dtype=dtype)
+
+    def _project_inputs(
+        self,
+        z: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        B, L, _ = z.shape
+        q = self.q_proj(z).view(B, L, self.num_heads, self.d_k)
+        k = self.k_proj(z).view(B, L, self.num_heads, self.d_k)
+        v = self.v_proj(z).view(B, L, self.num_heads, self.d_v)
+        route = self.router(z).view(B, L, self.num_heads, self.num_slots)
+        return q, k, v, route
+
+    def _topk_gates(self, route_logits: torch.Tensor) -> torch.Tensor:
+        """Sparse sigmoid gates with gradients only through selected entries."""
+        m = torch.sigmoid(route_logits)
+        if self.top_k == self.num_slots:
+            return m
+        _, top_idx = torch.topk(m, k=self.top_k, dim=-1)
+        mask = torch.zeros_like(m).scatter(-1, top_idx, 1.0)
+        return m * mask
+
+    def forward(
+        self,
+        z: torch.Tensor,
+        state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        *,
+        return_state: bool = True,
+        reset_state: bool = True,
+        detach_state: bool = True,
+    ):
+        """
+        Args:
+            z: input sequence, shape ``(B, L, d_model)``.
+            state: optional ``(S_k, S_v)`` recurrent state.
+
+        Returns:
+            ``(y, state)`` by default. Pass ``return_state=False`` to return
+            only ``y``.
+        """
+        if z.dim() != 3:
+            raise ValueError(f"z must have shape (B, L, d_model), got {tuple(z.shape)}.")
+        B, L, D = z.shape
+        if D != self.d_model:
+            raise ValueError(f"Expected last dim {self.d_model}, got {D}.")
+
+        S_k, S_v = self._coerce_state(
+            state,
+            batch_size=B,
+            device=z.device,
+            dtype=z.dtype,
+            reset_state=reset_state,
+        )
+        q_all, k_all, v_all, route_all = self._project_inputs(z)
+        a = self.a.to(device=z.device, dtype=z.dtype).unsqueeze(0)
+
+        outputs = []
+        scale = math.sqrt(self.d_k)
+        for t in range(L):
+            q_t = q_all[:, t]       # (B, H, d_k)
+            k_t = k_all[:, t]       # (B, H, d_k)
+            v_t = v_all[:, t]       # (B, H, d_v)
+            gates = self._topk_gates(route_all[:, t])  # (B, H, M)
+            denom = self.routing_alpha * gates.sum(dim=-1, keepdim=True).clamp_min(self.eps)
+            r_t = gates / denom
+
+            lambda_t = torch.exp(a * r_t)
+            eta_t = 1.0 - lambda_t
+
+            S_k = lambda_t[..., None] * S_k + eta_t[..., None] * k_t[:, :, None, :]
+            S_v = lambda_t[..., None] * S_v + eta_t[..., None] * v_t[:, :, None, :]
+
+            scores = (S_k * q_t[:, :, None, :]).sum(dim=-1) / scale
+            read_weights = F.softmax(scores, dim=-1)
+            read = (read_weights[..., None] * S_v).sum(dim=2)
+            read = read.reshape(B, self.num_heads * self.d_v)
+
+            y_t = self.out_proj(read)
+            if self.residual:
+                y_t = z[:, t, :] + y_t
+            outputs.append(self.norm(y_t))
+
+        y = torch.stack(outputs, dim=1) if outputs else z.new_empty(B, 0, self.d_model)
+        new_state = (S_k.detach(), S_v.detach()) if detach_state else (S_k, S_v)
+        self.state = new_state
+        if return_state:
+            return y, new_state
+        return y
+
+
 class ExpertSelectiveTimeVaryingSSM(nn.Module):
     r"""
     Time-varying / selective model in (potentially trainable) storage coordinates.

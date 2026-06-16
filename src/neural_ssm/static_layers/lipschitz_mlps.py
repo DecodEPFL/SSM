@@ -89,16 +89,41 @@ class TLIP(nn.Module):
 
         # Pre-compute hidden dimension for efficiency
         self.hidden_dim = config.d_hidden
+        if self.hidden_dim % 2 != 0:
+            raise ValueError(
+                f"TLIP requires an even d_hidden for GroupSort2, got {self.hidden_dim}."
+            )
         layers = nn.ModuleList()
         # Keep the internal backbone 1-Lipschitz and expose the overall Lipschitz
         # constant through an explicit positive scalar multiplier.
-        layers.append(torchlip.SpectralLinear(config.d_input, self.hidden_dim, k_coef_lip=1.0))
+        layers.append(
+            torchlip.SpectralLinear(
+                config.d_input,
+                self.hidden_dim,
+                bias=False,
+                k_coef_lip=1.0,
+            )
+        )
         layers.append(torchlip.GroupSort2(k_coef_lip=1.0))
 
         for i in range(config.n_layers):
-            layers.append(torchlip.SpectralLinear(self.hidden_dim, self.hidden_dim, k_coef_lip=1.0))
+            layers.append(
+                torchlip.SpectralLinear(
+                    self.hidden_dim,
+                    self.hidden_dim,
+                    bias=False,
+                    k_coef_lip=1.0,
+                )
+            )
             layers.append(torchlip.GroupSort2(k_coef_lip=1.0))
-        layers.append(torchlip.SpectralLinear(self.hidden_dim, config.d_output, k_coef_lip=1.0))
+        layers.append(
+            torchlip.SpectralLinear(
+                self.hidden_dim,
+                config.d_output,
+                bias=False,
+                k_coef_lip=1.0,
+            )
+        )
         self.model = nn.Sequential(*layers)
 
     @property
@@ -106,8 +131,9 @@ class TLIP(nn.Module):
         return self.lip_const
 
     def forward(self, x):
-        x = self.model(x)
-        return self.lip * x
+        leading_shape = x.shape[:-1]
+        x = self.model(x.reshape(-1, x.shape[-1]))
+        return (self.lip * x).reshape(*leading_shape, x.shape[-1])
 
 
 # Manchester lipschitz bounded MLPs

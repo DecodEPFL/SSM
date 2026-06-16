@@ -1,25 +1,47 @@
 # python
 # file: src/neural_ssm/ssm/layers.py
-"""
-High-level SSM layer wrappers:
-  SSMConfig, SSL, DeepSSM, PureLRUR, SimpleRNN
+"""High-level deep state-space models and lightweight recurrent baselines.
+
+The main :class:`DeepSSM` stack uses two residual updates per block:
+
+    x <- x + alpha_ssm * SSM(x)
+    x <- x + alpha_ff  * FF(x)
+
+Keeping the temporal and channel-mixing branches separate improves gradient
+flow and lets each branch learn its own contribution. When ``gamma`` is set,
+the implementation certifies the zero-state induced L2 gain using the block
+bound
+
+    (1 + alpha_ssm * gamma_ssm) * (1 + alpha_ff * lip_ff),
+
+with the appropriate dropout factors during training.
 """
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass, fields
-from typing import TypedDict, Optional, List, Union, Tuple, Sequence
+from typing import Any, Callable, List, Optional, Sequence, Tuple, TypedDict, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .lti_cells import LRU, L2RU, lruz, L2BoundedLTICell, Block2x2DenseL2SSM, _normalize_to_3d
+from .lti_cells import (
+    Block2x2DenseL2SSM,
+    L2BoundedLTICell,
+    L2RU,
+    LRU,
+    _normalize_to_3d,
+    lruz,
+)
 from .selective_cells import RobustMambaDiagSSM, RobustMambaDiagLTI
-from .experimental import ExpertSelectiveTimeVaryingSSM, Block2x2SelectiveBCDExpertsL2SSM
-from ..static_layers.generic_layers import LayerConfig, GLU, MLP
+from ..static_layers.generic_layers import GLU, MLP, LayerConfig
 from ..static_layers.lipschitz_mlps import (
-    LMLP, L2BoundedGLU, L2BoundedGLUv2, BudgetedL2BoundedGLUv2, MultiBranchLipMixer,
+    BudgetedL2BoundedGLUv2,
+    L2BoundedGLU,
+    L2BoundedGLUv2,
+    LMLP,
+    MultiBranchLipMixer,
 )
 
 try:
@@ -28,7 +50,9 @@ except ImportError:
     TLIP = None
 
 
-""" Optional data class to set up the SSM model (values here are used just to initialize all fields) """
+_CERTIFIED_FEEDFORWARDS = frozenset(
+    {"LGLU2", "BLGLU2", "BudgetedLGLU2", "MBLIP", "TLIP"}
+)
 
 
 @dataclass
@@ -48,8 +72,7 @@ class SSMConfig:
     nl_layers: int = 2 # number of hidden layers of the non-linear layers (static nonlinearities)
     param: Optional[str] = None  # pick the parametrization you want to use for the LRU. Default = LRU, other options are L2RU
     # and ZAK
-    gamma: Optional[float] = 1.0  # overall target l2 gain for the DeepSSM. If set, DeepSSM keeps this global gain fixed
-    # through encoder/decoder certificate scaling.
+    gamma: Optional[float] = None  # prescribed upper bound on the zero-state l2 gain. None disables the global cap.
     train_gamma: bool = True # controls whether the per-block / per-LTI gamma parameters are trainable. This is distinct
     # from the global target gamma above, which remains fixed whenever `gamma` is not None.
     train_ff_lip: Optional[bool] = True  # if None, freeze FF Lipschitz scaling when using a fixed, non-trainable gamma
@@ -67,6 +90,8 @@ class SSMConfig:
     zak_x2_init_scale: float = 0.1  # ZAK-only: scale of the free real X2 initialization
     cert_scale_temperature: float = 0.05  # smoothness of the fixed-gamma soft cap; smaller values approach
     # the hard min without breaking the guarantee.
+    ssm_residual_init: float = -1.0  # logit of the SSM residual gate
+    ff_residual_init: float = -1.0  # logit of the FF residual gate
 
     # Parallel scan must be selected in the forward call of the SSM.
 
@@ -77,172 +102,377 @@ SSMConfigDict = TypedDict('SSMConfigDict',
                           {f.name: f.type for f in fields(SSMConfig)},
                           total=False)
 
-""" SSMs blocks ----------------------------------------- """
+"""SSM block construction and gain helpers."""
+
+
+def _sigmoid_scalar(value: float) -> float:
+    """Numerically stable scalar sigmoid used during module construction."""
+    value = float(value)
+    if value >= 0.0:
+        return 1.0 / (1.0 + math.exp(-value))
+    exp_value = math.exp(value)
+    return exp_value / (1.0 + exp_value)
+
+
+def _initial_block_gamma(config: SSMConfig) -> Optional[float]:
+    """Choose a useful recurrent-branch gain at initialization.
+
+    The global decoder cap is responsible for the hard end-to-end guarantee.
+    This initializer only tries to avoid starting with an unnecessarily large
+    decoder attenuation. It accounts for the initial FF residual factor.
+    """
+    if config.gamma is None or config.n_layers <= 0:
+        return None
+
+    alpha_ssm = _sigmoid_scalar(config.ssm_residual_init)
+    alpha_ff = _sigmoid_scalar(config.ff_residual_init)
+    per_block_target = math.exp(math.log(float(config.gamma)) / config.n_layers)
+    ff_factor = 1.0 + alpha_ff * float(config.scale)
+    recurrent_factor = per_block_target / ff_factor
+    gamma = (recurrent_factor - 1.0) / max(alpha_ssm, 1e-8)
+    return max(gamma, 1e-2)
+
+
+@torch.no_grad()
+def _set_cell_gamma(cell: nn.Module, target_gamma: float) -> None:
+    """Initialize the different positive-gamma parametrizations consistently."""
+    target = max(float(target_gamma), 1e-8)
+    gamma_raw = getattr(cell, "gamma_raw", None)
+    log_gamma = getattr(cell, "log_gamma", None)
+    gamma = getattr(cell, "gamma", None)
+
+    if isinstance(gamma_raw, nn.Parameter):
+        value = torch.as_tensor(target, device=gamma_raw.device, dtype=gamma_raw.dtype)
+        value = value.clamp_min(1e-6)
+        # Stable inverse softplus: x + log(1 - exp(-x)).
+        gamma_raw.copy_(value + torch.log(-torch.expm1(-value)))
+    elif isinstance(log_gamma, nn.Parameter):
+        log_gamma.fill_(math.log(target))
+    elif isinstance(gamma, nn.Parameter):
+        gamma.fill_(target)
+
+
+CellFactory = Callable[[SSMConfig, Optional[float]], nn.Module]
+
+
+@dataclass(frozen=True)
+class SSMParametrization:
+    """Construction metadata for one recurrent-cell parametrization.
+
+    ``certified`` means the produced cell exposes a finite zero-state L2-gain
+    bound through either ``gain_bound()`` or the legacy ``.gamma`` attribute.
+    """
+
+    name: str
+    factory: CellFactory
+    certified: bool
+
+
+def _fixed_gamma(config: SSMConfig, block_gamma: Optional[float]) -> Optional[float]:
+    """Return the fixed per-cell gamma used by legacy fixed-gamma cells."""
+    return None if config.train_gamma else block_gamma
+
+
+def _gamma_init(block_gamma: Optional[float]) -> float:
+    """Default positive gamma for cells that own their trainability flag."""
+    return 1.0 if block_gamma is None else float(block_gamma)
+
+
+def _build_lru_cell(config: SSMConfig, block_gamma: Optional[float]) -> nn.Module:
+    return LRU(
+        in_features=config.d_model,
+        out_features=config.d_model,
+        state_features=config.d_state,
+        rmin=config.rmin,
+        rmax=config.rmax,
+        max_phase=config.max_phase,
+        learn_x0=config.learn_x0,
+    )
+
+
+def _build_l2ru_cell(config: SSMConfig, block_gamma: Optional[float]) -> nn.Module:
+    return L2RU(
+        state_features=config.d_model,
+        gamma=_fixed_gamma(config, block_gamma),
+        init=config.init,
+        learn_x0=config.learn_x0,
+    )
+
+
+def _build_zak_cell(config: SSMConfig, block_gamma: Optional[float]) -> nn.Module:
+    return lruz(
+        input_features=config.d_model,
+        output_features=config.d_model,
+        state_features=config.d_state,
+        rmin=config.rmin,
+        rmax=config.rmax,
+        max_phase=config.max_phase,
+        gamma=_fixed_gamma(config, block_gamma),
+        d_margin=config.zak_d_margin,
+        x2_margin=config.zak_x2_margin,
+        x2_init_scale=config.zak_x2_init_scale,
+        init=config.init,
+        learn_x0=config.learn_x0,
+    )
+
+
+def _build_l2n_cell(config: SSMConfig, block_gamma: Optional[float]) -> nn.Module:
+    cell = Block2x2DenseL2SSM(
+        d_state=config.d_state,
+        d_input=config.d_model,
+        d_output=config.d_model,
+        gamma=_gamma_init(block_gamma),
+        train_gamma=config.train_gamma,
+        learn_x0=config.learn_x0,
+    )
+    cell.init_on_circle(
+        rho=config.rho,
+        max_phase=config.max_phase_b,
+        phase_center=config.phase_center,
+        random_phase=config.random_phase,
+        offdiag_scale=config.offdiag_scale,
+    )
+    return cell
+
+
+def _build_l2nt_cell(config: SSMConfig, block_gamma: Optional[float]) -> nn.Module:
+    return L2BoundedLTICell(
+        d_state=config.d_state,
+        d_input=config.d_model,
+        d_output=config.d_model,
+        gamma=_gamma_init(block_gamma),
+        train_gamma=config.train_gamma,
+        learn_x0=config.learn_x0,
+    )
+
+
+def _build_tv_cell(config: SSMConfig, block_gamma: Optional[float]) -> nn.Module:
+    return RobustMambaDiagSSM(
+        d_state=config.d_state,
+        d_model=config.d_model,
+        d_out=config.d_model,
+        gamma=_gamma_init(block_gamma),
+        train_gamma=config.train_gamma,
+        learn_x0=config.learn_x0,
+    )
+
+
+def _build_tvc_cell(config: SSMConfig, block_gamma: Optional[float]) -> nn.Module:
+    return RobustMambaDiagLTI(
+        d_state=config.d_state,
+        d_model=config.d_model,
+        d_out=config.d_model,
+        gamma=_gamma_init(block_gamma),
+        train_gamma=config.train_gamma,
+        param_net="mlp",
+        hidden=max(64, 2 * config.d_model),
+        init_rho=config.rho,
+        init_sign=0.995,
+        init_b=0.10,
+        init_c=0.10,
+        init_d=0.10,
+        bcd_nonlinearity="tanh",
+        output_uses_post_state=False,
+        learn_x0=config.learn_x0,
+    )
+
+
+_SSM_PARAMETRIZATIONS: dict[str, SSMParametrization] = {
+    "lru": SSMParametrization("lru", _build_lru_cell, certified=False),
+    "l2ru": SSMParametrization("l2ru", _build_l2ru_cell, certified=True),
+    "zak": SSMParametrization("zak", _build_zak_cell, certified=True),
+    "l2n": SSMParametrization("l2n", _build_l2n_cell, certified=True),
+    "l2nt": SSMParametrization("l2nt", _build_l2nt_cell, certified=True),
+    "tv": SSMParametrization("tv", _build_tv_cell, certified=True),
+    "tvc": SSMParametrization("tvc", _build_tvc_cell, certified=True),
+}
+_CERTIFIED_PARAMETRIZATIONS = frozenset(
+    name for name, spec in _SSM_PARAMETRIZATIONS.items() if spec.certified
+)
+
+
+def _param_name(param: Optional[str]) -> str:
+    return "lru" if param is None else str(param)
+
+
+def _get_ssm_parametrization(param: Optional[str]) -> SSMParametrization:
+    name = _param_name(param)
+    try:
+        return _SSM_PARAMETRIZATIONS[name]
+    except KeyError as exc:
+        available = ", ".join(sorted(_SSM_PARAMETRIZATIONS))
+        raise ValueError(
+            f"Unknown SSM parametrization: {param!r}. Available: {{{available}}}."
+        ) from exc
+
+
+def _has_gain_contract(module: nn.Module) -> bool:
+    return callable(getattr(module, "gain_bound", None)) or hasattr(module, "gamma")
+
+
+def _module_gain_bound(
+    module: nn.Module,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Read a module's scalar gain contract.
+
+    New cells can implement ``gain_bound()``. Existing cells continue to work
+    through their ``.gamma`` property/parameter.
+    """
+    if callable(getattr(module, "gain_bound", None)):
+        bound = module.gain_bound()
+    else:
+        bound = getattr(module, "gamma", None)
+    if bound is None:
+        return torch.full((), float("inf"), device=device, dtype=dtype)
+    return torch.as_tensor(bound, device=device, dtype=dtype).abs()
+
+
+def _module_lip_bound(
+    module: nn.Module,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Read a static branch's Lipschitz contract.
+
+    ``lip_bound()`` is the preferred future hook; ``.lip`` keeps existing
+    feedforward modules compatible.
+    """
+    if callable(getattr(module, "lip_bound", None)):
+        bound = module.lip_bound()
+    else:
+        bound = getattr(module, "lip", None)
+    if bound is None:
+        return torch.full((), float("inf"), device=device, dtype=dtype)
+    return torch.as_tensor(bound, device=device, dtype=dtype).abs()
+
+
+def _build_ssm_cell(config: SSMConfig, block_gamma: Optional[float]) -> nn.Module:
+    """Build one recurrent cell from the registry and initialize its gain."""
+    cell = _get_ssm_parametrization(config.param).factory(config, block_gamma)
+    if config.train_gamma and block_gamma is not None:
+        _set_cell_gamma(cell, block_gamma)
+    return cell
+
+
+def _build_feedforward(config: SSMConfig) -> nn.Module:
+    """Build the instantaneous channel-mixing branch."""
+    layer_config = LayerConfig(
+        d_input=config.d_model,
+        d_output=config.d_model,
+        d_hidden=config.d_hidden,
+        n_layers=config.nl_layers,
+        lip=config.scale,
+        train_lip=(
+            not (config.gamma is not None and not config.train_gamma)
+            if config.train_ff_lip is None
+            else bool(config.train_ff_lip)
+        ),
+    )
+    builders = {
+        "GLU": GLU,
+        "MLP": MLP,
+        "LGLU": L2BoundedGLU,
+        "LGLU2": L2BoundedGLUv2,
+        "BLGLU2": BudgetedL2BoundedGLUv2,
+        "BudgetedLGLU2": BudgetedL2BoundedGLUv2,
+        "LMLP": LMLP,
+        "MBLIP": MultiBranchLipMixer,
+    }
+    if TLIP is not None:
+        builders["TLIP"] = TLIP
+    try:
+        return builders[config.ff](layer_config)
+    except KeyError as exc:
+        raise ValueError(f"Unknown feedforward type: {config.ff!r}.") from exc
 
 
 class SSL(nn.Module):
-    """State Space Layer: gated residual
-    y = x + alpha * dropout(FF(LRU(x)))
+    """State-space block with separate temporal and feedforward residuals.
+
+    The SSM branch first updates the representation using temporal context. The
+    FF branch then mixes channels at every time step:
+
+        x1 = x  + alpha_ssm * dropout_ssm(SSM(x))
+        y  = x1 + alpha_ff  * dropout_ff(FF(x1))
+
+    In certified mode the scalar gates are in ``(0, 1)`` and the block gain is
+    bounded by ``(1 + alpha_ssm*gamma_ssm)*(1 + alpha_ff*lip_ff)``.
     """
+
     def __init__(self, config: SSMConfig):
         super().__init__()
-        res_logit_init = -1.0
-        init_block_gamma = None
-        if config.gamma is not None and config.n_layers > 0:
-            # Use the exact per-block initialization requested by the user for
-            # trainable LTI gammas. The global fixed gamma is now enforced as a
-            # cap in DeepSSM.forward, so we do not need to inflate the branch
-            # gamma to compensate for the residual gate at initialization.
-            init_block_gamma = max(float(config.gamma) ** (1.0 / config.n_layers) - 1.0, 0.01)
+        block_gamma = _initial_block_gamma(config)
+        self.lru = _build_ssm_cell(config, block_gamma)
+        self.ff = _build_feedforward(config)
 
-        fixed_branch_gamma = init_block_gamma if init_block_gamma is not None else config.gamma
-        if config.train_gamma:
-            fixed_branch_gamma = None
+        self.ssm_dropout = nn.Dropout(config.dropout)
+        self.ff_dropout = nn.Dropout(config.dropout)
+        self.ssm_res_logit = nn.Parameter(torch.tensor(float(config.ssm_residual_init)))
+        self.ff_res_logit = nn.Parameter(torch.tensor(float(config.ff_residual_init)))
 
-        # --- SSM selection ---
-        if config.param is None or config.param == "lru":
-            self.lru = LRU(
-                in_features=config.d_model,
-                out_features=config.d_model,
-                state_features=config.d_state,
-                rmin=config.rmin,
-                rmax=config.rmax,
-                max_phase=config.max_phase,
-                learn_x0=config.learn_x0,
-            )
-        elif config.param == "l2ru":
-            self.lru = L2RU(
-                state_features=config.d_model,
-                gamma=fixed_branch_gamma,
-                init=config.init,
-                learn_x0=config.learn_x0,
-            )
-        elif config.param == "zak":
-            self.lru = lruz(
-                input_features=config.d_model,
-                output_features=config.d_model,
-                state_features=config.d_state,
-                rmin=config.rmin,
-                rmax=config.rmax,
-                max_phase=config.max_phase,
-                gamma=fixed_branch_gamma,
-                d_margin=config.zak_d_margin,
-                x2_margin=config.zak_x2_margin,
-                x2_init_scale=config.zak_x2_init_scale,
-                init=config.init,
-                learn_x0=config.learn_x0,
-            )
-        elif config.param == "l2n":
-            block_gamma = init_block_gamma if init_block_gamma is not None else 1.0
-            self.lru = Block2x2DenseL2SSM(
-                d_state=config.d_state,
-                d_input=config.d_model,
-                d_output=config.d_model,
-                gamma=block_gamma,
-                train_gamma=config.train_gamma,
-                learn_x0=config.learn_x0,
-            )
-            self.lru.init_on_circle(
-                rho=config.rho,
-                max_phase=config.max_phase_b,
-                phase_center=config.phase_center,
-                random_phase=config.random_phase,
-                offdiag_scale=config.offdiag_scale,
-            )
-        elif config.param == "l2nt":
-            block_gamma = init_block_gamma if init_block_gamma is not None else 1.0
-            self.lru = L2BoundedLTICell(
-                d_state=config.d_state,
-                d_input=config.d_model,
-                d_output=config.d_model,
-                gamma=block_gamma,
-                train_gamma=config.train_gamma,
-                learn_x0=config.learn_x0,
-            )
-        elif config.param == "tv":
-            block_gamma = init_block_gamma if init_block_gamma is not None else 1.0
-            self.lru = RobustMambaDiagSSM(
-                d_state=config.d_state,
-                d_model=config.d_model,
-                d_out=config.d_model,
-                gamma=block_gamma,
-                train_gamma=config.train_gamma,
-                learn_x0=config.learn_x0,
-            )
-        elif config.param == "tvc":
-            block_gamma = init_block_gamma if init_block_gamma is not None else 1.0
-            self.lru = RobustMambaDiagLTI(
-                d_state=config.d_state,
-                d_model=config.d_model,
-                d_out=config.d_model,
-                gamma=block_gamma,
-                train_gamma=config.train_gamma,
-                param_net="mlp",
-                hidden=max(64, 2 * config.d_model),
-                init_rho=config.rho,
-                init_sign=0.995,
-                init_b=0.10,
-                init_c=0.10,
-                init_d=0.10,
-                bcd_nonlinearity="tanh",
-                output_uses_post_state=False,  # keeps the exact simple certificate
-                learn_x0=config.learn_x0,
-            )
-        else:
-            raise ValueError("Invalid parametrization")
+    @property
+    def ssm_scale(self) -> torch.Tensor:
+        return torch.sigmoid(self.ssm_res_logit)
 
-        if config.train_gamma and init_block_gamma is not None:
-            with torch.no_grad():
-                target_gamma = float(init_block_gamma)
-                gamma_attr = getattr(self.lru, "gamma", None)
-                if hasattr(self.lru, "gamma_raw") and isinstance(self.lru.gamma_raw, nn.Parameter):
-                    target = torch.as_tensor(
-                        target_gamma,
-                        device=self.lru.gamma_raw.device,
-                        dtype=self.lru.gamma_raw.dtype,
-                    ).clamp_min(1e-6)
-                    self.lru.gamma_raw.copy_(torch.log(torch.expm1(target)))
-                elif hasattr(self.lru, "log_gamma") and isinstance(self.lru.log_gamma, nn.Parameter):
-                    self.lru.log_gamma.fill_(math.log(max(target_gamma, 1e-8)))
-                elif isinstance(gamma_attr, nn.Parameter):
-                    gamma_attr.fill_(target_gamma)
-
-        # --- FF selection ---
-        l_config = LayerConfig()
-        l_config.d_input = config.d_model
-        l_config.d_output = config.d_model
-        l_config.d_hidden = config.d_hidden
-        l_config.n_layers = config.nl_layers
-        l_config.lip = config.scale
-        if config.train_ff_lip is None:
-            l_config.train_lip = not (config.gamma is not None and not config.train_gamma)
-        else:
-            l_config.train_lip = bool(config.train_ff_lip)
-
-        ff_layers = {
-            "GLU": GLU,
-            "MLP": MLP,
-            "LGLU": L2BoundedGLU,
-            "LGLU2": L2BoundedGLUv2,
-            "BLGLU2": BudgetedL2BoundedGLUv2,
-            "BudgetedLGLU2": BudgetedL2BoundedGLUv2,
-            "LMLP": LMLP,
-            "MBLIP": MultiBranchLipMixer,
-        }
-        if TLIP is not None:
-            ff_layers["TLIP"] = TLIP
-        if config.ff not in ff_layers:
-            raise ValueError(f"Unknown feedforward type: {config.ff}")
-        self.ff = ff_layers[config.ff](l_config)
-
-        self.dropout = nn.Dropout(config.dropout)
-
-        # Small residual gate at init: sigmoid(-1) ≈ 0.269
-        self.res_logit = nn.Parameter(torch.tensor(res_logit_init))
+    @property
+    def ff_scale(self) -> torch.Tensor:
+        return torch.sigmoid(self.ff_res_logit)
 
     @property
     def res_scale(self) -> torch.Tensor:
-        return torch.sigmoid(self.res_logit)
+        """Compatibility alias for the former single residual gate."""
+        return self.ssm_scale
+
+    @property
+    def dropout(self) -> nn.Dropout:
+        """Compatibility alias used by older diagnostics."""
+        return self.ff_dropout
+
+    def gain_terms(
+        self,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+        training: Optional[bool] = None,
+    ) -> dict[str, torch.Tensor]:
+        """Return the exact factors used by the block certificate."""
+        training = self.training if training is None else bool(training)
+        gamma = _module_gain_bound(self.lru, device=device, dtype=dtype)
+        ff_lip = _module_lip_bound(self.ff, device=device, dtype=dtype)
+
+        ssm_drop_factor = torch.as_tensor(
+            1.0 / max(1.0 - float(self.ssm_dropout.p), 1e-12) if training else 1.0,
+            device=device,
+            dtype=dtype,
+        )
+        ff_drop_factor = torch.as_tensor(
+            1.0 / max(1.0 - float(self.ff_dropout.p), 1e-12) if training else 1.0,
+            device=device,
+            dtype=dtype,
+        )
+        alpha_ssm = self.ssm_scale.to(device=device, dtype=dtype)
+        alpha_ff = self.ff_scale.to(device=device, dtype=dtype)
+        ssm_branch_gain = gamma * ssm_drop_factor
+        ff_branch_gain = ff_lip * ff_drop_factor
+        ssm_factor = 1.0 + alpha_ssm * ssm_branch_gain
+        ff_factor = 1.0 + alpha_ff * ff_branch_gain
+        return {
+            "gamma": gamma,
+            "ff_lip": ff_lip,
+            "ssm_drop_factor": ssm_drop_factor,
+            "ff_drop_factor": ff_drop_factor,
+            "alpha_ssm": alpha_ssm,
+            "alpha_ff": alpha_ff,
+            "ssm_branch_gain": ssm_branch_gain,
+            "ff_branch_gain": ff_branch_gain,
+            "ssm_factor": ssm_factor,
+            "ff_factor": ff_factor,
+            "block_factor": ssm_factor * ff_factor,
+        }
 
     def forward(
         self,
@@ -252,20 +482,61 @@ class SSL(nn.Module):
         reset_state: bool = True,
         detach_state: bool = False,
     ):
-        z, st = self.lru(
+        ssm_out, state_trajectory = self.lru(
             x3d,
             state=state,
             mode=mode,
             reset_state=reset_state,
             detach_state=detach_state,
         )
-        z = self.ff(z)
-        z = self.dropout(z)
-        return x3d + self.res_scale * z, st
+        x = x3d + self.ssm_scale * self.ssm_dropout(ssm_out)
+        x = x + self.ff_scale * self.ff_dropout(self.ff(x))
+        return x, state_trajectory
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        # Old checkpoints used one residual logit. Initialize both new branches
+        # from it so existing experiments remain loadable.
+        legacy_key = prefix + "res_logit"
+        if legacy_key in state_dict:
+            legacy = state_dict.pop(legacy_key)
+            state_dict.setdefault(prefix + "ssm_res_logit", legacy.clone())
+            state_dict.setdefault(prefix + "ff_res_logit", legacy.clone())
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
 
 class DeepSSM(nn.Module):
-    """Deep SSM: normalized encoder -> n gated residual blocks -> normalized decoder."""
+    """
+    Deep SSM with an optional certified zero-state l2-gain upper bound.
+
+    For certified configurations, the encoder and decoder have spectral norm at
+    most one, and each block is bounded by
+
+        (1 + alpha_ssm,k * gamma_k * lip(dropout_ssm,k))
+        * (1 + alpha_ff,k * lip(ff_k) * lip(dropout_ff,k)).
+
+    and the decoder is smoothly attenuated so the composed bound does not
+    exceed the prescribed ``config.gamma``. The certificate applies to a
+    full trajectory initialized at zero state. Stateful continuation remains
+    valid as part of that same trajectory, but a standalone nonzero initial
+    state requires an additional storage-energy term.
+    """
     def __init__(
         self,
         d_input: int,
@@ -294,9 +565,13 @@ class DeepSSM(nn.Module):
         phase_center: float = 0,
         random_phase: bool = True,
         learn_x0: bool = False,
+        ssm_residual_init: float = -1.0,
+        ff_residual_init: float = -1.0,
         config: Optional[SSMConfig] = None,
     ):
         super().__init__()
+        if d_input <= 0 or d_output <= 0:
+            raise ValueError("d_input and d_output must be positive.")
         self.d_input = d_input
         self.d_output = d_output
 
@@ -324,9 +599,16 @@ class DeepSSM(nn.Module):
             phase_center=phase_center,
             random_phase=random_phase,
             learn_x0=learn_x0,
+            ssm_residual_init=ssm_residual_init,
+            ff_residual_init=ff_residual_init,
         )
 
-        self.use_cert_scaling = (self.config.param != "lru") and (self.config.gamma is not None)
+        self._validate_config(self.config)
+        self.use_cert_scaling = self.config.gamma is not None
+        self._prescribed_gamma = (
+            float(self.config.gamma) if self.config.gamma is not None else None
+        )
+        self.ff_has_lip = False
 
         if self.use_cert_scaling:
             self.register_buffer("gamma_t", torch.tensor(float(self.config.gamma)))
@@ -337,16 +619,167 @@ class DeepSSM(nn.Module):
             with torch.no_grad():
                 nn.init.orthogonal_(self.encoder_w)
                 nn.init.orthogonal_(self.decoder_w)
-
-            self.ff_has_lip = False
         else:
             self.encoder = nn.Linear(d_input, self.config.d_model, bias=False)
             self.decoder = nn.Linear(self.config.d_model, d_output, bias=False)
 
         self.blocks = nn.ModuleList([SSL(self.config) for _ in range(self.config.n_layers)])
 
-        if self.use_cert_scaling and len(self.blocks) > 0:
-            self.ff_has_lip = hasattr(self.blocks[0].ff, "lip")
+        if len(self.blocks) > 0:
+            self.ff_has_lip = all(hasattr(block.ff, "lip") for block in self.blocks)
+
+        if self.use_cert_scaling:
+            missing_gamma = [
+                block.lru.__class__.__name__
+                for block in self.blocks
+                if not _has_gain_contract(block.lru)
+            ]
+            if missing_gamma:
+                raise RuntimeError(
+                    "Certified DeepSSM blocks must expose an l2-gain bound through "
+                    f"`.gamma`; missing on: {missing_gamma}."
+                )
+            if self.blocks and not self.ff_has_lip:
+                raise RuntimeError(
+                    "Certified DeepSSM feedforwards must expose a global Lipschitz "
+                    "bound through `.lip`."
+                )
+
+    @staticmethod
+    def _validate_config(config: SSMConfig) -> None:
+        if config.d_model <= 0 or config.d_state <= 0:
+            raise ValueError("d_model and d_state must be positive.")
+        if config.n_layers < 0:
+            raise ValueError("n_layers must be non-negative.")
+        if not 0.0 <= float(config.dropout) < 1.0:
+            raise ValueError(f"dropout must be in [0, 1), got {config.dropout}.")
+        if float(config.scale) <= 0.0 or not math.isfinite(float(config.scale)):
+            raise ValueError(f"scale must be finite and positive, got {config.scale}.")
+        if (
+            float(config.cert_scale_temperature) <= 0.0
+            or not math.isfinite(float(config.cert_scale_temperature))
+        ):
+            raise ValueError(
+                "cert_scale_temperature must be finite and positive, got "
+                f"{config.cert_scale_temperature}."
+            )
+        if not math.isfinite(float(config.ssm_residual_init)):
+            raise ValueError(
+                "ssm_residual_init must be finite, got "
+                f"{config.ssm_residual_init}."
+            )
+        if not math.isfinite(float(config.ff_residual_init)):
+            raise ValueError(
+                "ff_residual_init must be finite, got "
+                f"{config.ff_residual_init}."
+            )
+
+        cell_spec = _get_ssm_parametrization(config.param)
+
+        if config.gamma is None:
+            return
+
+        gamma = float(config.gamma)
+        if gamma <= 0.0 or not math.isfinite(gamma):
+            raise ValueError(f"gamma must be finite and positive, got {config.gamma}.")
+        if config.n_layers > 0 and not cell_spec.certified:
+            supported = ", ".join(sorted(_CERTIFIED_PARAMETRIZATIONS))
+            raise ValueError(
+                f"param={config.param!r} does not provide a certified l2-gain bound. "
+                f"Use one of {{{supported}}} or set gamma=None."
+            )
+        if config.n_layers > 0 and config.ff not in _CERTIFIED_FEEDFORWARDS:
+            supported = ", ".join(sorted(_CERTIFIED_FEEDFORWARDS))
+            hint = (
+                " `LGLU` is not globally Lipschitz; use `LGLU2` instead."
+                if config.ff == "LGLU"
+                else ""
+            )
+            raise ValueError(
+                f"ff={config.ff!r} cannot be used for a certified global gain bound."
+                f"{hint} Use one of {{{supported}}} or set gamma=None."
+            )
+        if config.n_layers > 0 and config.learn_x0:
+            raise ValueError(
+                "learn_x0=True is incompatible with a zero-state induced l2-gain "
+                "certificate because a learned initial condition can produce output "
+                "with zero input. Set learn_x0=False or gamma=None."
+            )
+
+    @staticmethod
+    def _spectrally_capped_weight(
+        weight: torch.Tensor,
+        *,
+        bound: float = 1.0,
+    ) -> torch.Tensor:
+        """Return a weight with spectral norm <= bound without scaling small weights up."""
+        if bound <= 0.0:
+            raise ValueError(f"bound must be positive, got {bound}.")
+
+        weight_for_norm = (
+            weight.float() if weight.dtype in (torch.float16, torch.bfloat16) else weight
+        )
+        sigma = torch.linalg.matrix_norm(weight_for_norm, ord=2).to(
+            device=weight.device,
+            dtype=weight.dtype,
+        )
+        divisor = torch.clamp(sigma / float(bound), min=1.0)
+        return weight / divisor
+
+    def _block_gain_terms(
+        self,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+        training: Optional[bool] = None,
+    ) -> List[dict[str, torch.Tensor]]:
+        return [
+            block.gain_terms(device=device, dtype=dtype, training=training)
+            for block in self.blocks
+        ]
+
+    def _log_block_gain_product(
+        self,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        terms = self._block_gain_terms(device=device, dtype=dtype)
+        if not terms:
+            return torch.zeros((), device=device, dtype=dtype)
+        factors = torch.stack([term["block_factor"] for term in terms])
+        # Configuration validation guarantees finite component bounds. Avoid a
+        # tensor-to-Python finiteness check here because it synchronizes CUDA on
+        # every certified forward pass.
+        return torch.log(factors.clamp_min(torch.finfo(dtype).tiny)).sum()
+
+    def _effective_gamma_cap(
+        self,
+        *,
+        gamma,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if not self.use_cert_scaling or self._prescribed_gamma is None:
+            raise RuntimeError("No prescribed global gain is configured.")
+
+        current = self.gamma_t.to(device=device, dtype=dtype).abs()
+        candidate = current
+        if gamma is not None:
+            requested = torch.as_tensor(gamma, device=device, dtype=dtype)
+            if requested.numel() != 1:
+                raise ValueError("gamma override must be a scalar.")
+            requested = requested.reshape(())
+            if not bool(torch.isfinite(requested)) or not bool(requested > 0):
+                raise ValueError("gamma override must be finite and positive.")
+            candidate = torch.minimum(candidate, requested)
+
+        prescribed = torch.as_tensor(
+            self._prescribed_gamma,
+            device=device,
+            dtype=dtype,
+        )
+        return torch.minimum(candidate, prescribed)
 
     @torch.no_grad()
     def conservative_gamma_product(
@@ -357,8 +790,11 @@ class DeepSSM(nn.Module):
     ) -> torch.Tensor:
         """
         Conservative reporting-only bound:
-            prod_k (1 + g_k)
-        ignoring the residual gate alpha_k.
+            prod_k (1 + gamma_k * lip(dropout_ssm,k))
+                   * (1 + lip(ff_k) * lip(dropout_ff,k))
+
+        This sets both residual gates to one, so it is no smaller than the block
+        product used by the actual certificate.
         """
         if device is None:
             device = next(self.parameters()).device
@@ -368,19 +804,163 @@ class DeepSSM(nn.Module):
         if len(self.blocks) == 0:
             return torch.ones((), device=device, dtype=dtype)
 
-        g = torch.stack([
-            block.lru.gamma.abs().to(device=device, dtype=dtype)
-            for block in self.blocks
+        terms = self._block_gain_terms(device=device, dtype=dtype)
+        if any(
+            not bool(torch.isfinite(term["gamma"]))
+            or not bool(torch.isfinite(term["ff_lip"]))
+            for term in terms
+        ):
+            return torch.full((), float("inf"), device=device, dtype=dtype)
+        factors = torch.stack([
+            (1.0 + term["ssm_branch_gain"]) * (1.0 + term["ff_branch_gain"])
+            for term in terms
         ])
+        return torch.exp(torch.log(factors).sum())
 
-        if self.ff_has_lip:
-            ff_lips = torch.stack([
-                block.ff.lip.to(device=device, dtype=dtype)
-                for block in self.blocks
-            ])
-            g = g * ff_lips
+    @torch.no_grad()
+    def certified_gain_bound(self, gamma=None) -> torch.Tensor:
+        """Return the composed upper bound used for the current train/eval mode."""
+        if not self.use_cert_scaling:
+            raise RuntimeError("certified_gain_bound requires a prescribed gamma.")
 
-        return torch.exp(torch.log1p(g).sum())
+        device = self.encoder_w.device
+        dtype = self.encoder_w.dtype
+        encoder_eff = self._spectrally_capped_weight(self.encoder_w)
+        decoder_eff = self._spectrally_capped_weight(self.decoder_w)
+        encoder_norm = torch.linalg.matrix_norm(encoder_eff.float(), ord=2).to(dtype=dtype)
+        decoder_norm = torch.linalg.matrix_norm(decoder_eff.float(), ord=2).to(dtype=dtype)
+
+        log_block_product = self._log_block_gain_product(device=device, dtype=dtype)
+        gamma_cap = self._effective_gamma_cap(
+            gamma=gamma,
+            device=device,
+            dtype=dtype,
+        )
+        scale = self._smooth_capped_scale_from_logs(
+            gamma_t=gamma_cap,
+            log_gamma_prod=log_block_product,
+            temperature=self.config.cert_scale_temperature,
+        )
+
+        tiny = torch.finfo(dtype).tiny
+        log_bound = (
+            torch.log(encoder_norm.clamp_min(tiny))
+            + log_block_product
+            + torch.log(decoder_norm.clamp_min(tiny))
+            + torch.log(scale.clamp_min(tiny))
+        )
+        bound = torch.exp(log_bound)
+        return torch.where(scale > 0, bound, torch.zeros_like(bound))
+
+    @torch.no_grad()
+    def gain_diagnostics(self) -> dict[str, Any]:
+        """Return certificate data using the same factors as :meth:`forward`.
+
+        Keeping diagnostics here prevents training scripts from duplicating the
+        gain formula and silently drifting away from the implementation.
+        """
+        try:
+            reference = next(self.parameters())
+        except StopIteration as exc:
+            raise RuntimeError("DeepSSM has no parameters to diagnose.") from exc
+
+        device, dtype = reference.device, reference.dtype
+        terms = self._block_gain_terms(device=device, dtype=dtype)
+        block_rows = []
+        for index, (block, term) in enumerate(zip(self.blocks, terms)):
+            raw_lip = getattr(block.ff, "raw_lip", None)
+            ff_lip_trainable = isinstance(raw_lip, nn.Parameter) and raw_lip.requires_grad
+            block_rows.append({
+                "index": index,
+                "lru_type": block.lru.__class__.__name__,
+                "ff_type": block.ff.__class__.__name__,
+                "core_gamma": float(term["gamma"].detach().cpu()),
+                "ff_lip": float(term["ff_lip"].detach().cpu()),
+                "ff_lip_trainable": ff_lip_trainable,
+                "alpha_ssm": float(term["alpha_ssm"].detach().cpu()),
+                "alpha_ff": float(term["alpha_ff"].detach().cpu()),
+                "ssm_drop_factor": float(term["ssm_drop_factor"].detach().cpu()),
+                "ff_drop_factor": float(term["ff_drop_factor"].detach().cpu()),
+                "ssm_branch_gain": float(term["ssm_branch_gain"].detach().cpu()),
+                "ff_branch_gain": float(term["ff_branch_gain"].detach().cpu()),
+                "ssm_factor": float(term["ssm_factor"].detach().cpu()),
+                "ff_factor": float(term["ff_factor"].detach().cpu()),
+                "block_factor": float(term["block_factor"].detach().cpu()),
+            })
+
+        if terms:
+            block_factors = torch.stack([term["block_factor"] for term in terms])
+            log_gamma_prod = torch.log(block_factors).sum()
+            gamma_prod = torch.exp(log_gamma_prod)
+        else:
+            log_gamma_prod = torch.zeros((), device=device, dtype=dtype)
+            gamma_prod = torch.ones((), device=device, dtype=dtype)
+
+        conservative = self.conservative_gamma_product(device=device, dtype=dtype)
+        global_gamma = smooth_scale = hard_scale = certified_bound = None
+        encoder_norm = decoder_norm = None
+
+        if self.use_cert_scaling:
+            gamma_cap = self._effective_gamma_cap(
+                gamma=None,
+                device=device,
+                dtype=dtype,
+            )
+            smooth = self._smooth_capped_scale_from_logs(
+                gamma_t=gamma_cap,
+                log_gamma_prod=log_gamma_prod,
+                temperature=self.config.cert_scale_temperature,
+            )
+            tiny = torch.finfo(dtype).tiny
+            hard = torch.exp(
+                -torch.clamp(
+                    log_gamma_prod - torch.log(gamma_cap.clamp_min(tiny)),
+                    min=0.0,
+                )
+            )
+            encoder_eff = self._spectrally_capped_weight(self.encoder_w)
+            decoder_eff = self._spectrally_capped_weight(self.decoder_w)
+            encoder_norm_t = torch.linalg.matrix_norm(
+                encoder_eff.float(), ord=2
+            ).to(dtype=dtype)
+            decoder_norm_t = torch.linalg.matrix_norm(
+                decoder_eff.float(), ord=2
+            ).to(dtype=dtype)
+
+            global_gamma = float(gamma_cap.detach().cpu())
+            smooth_scale = float(smooth.detach().cpu())
+            hard_scale = float(hard.detach().cpu())
+            certified_bound = float(self.certified_gain_bound().detach().cpu())
+            encoder_norm = float(encoder_norm_t.detach().cpu())
+            decoder_norm = float(decoder_norm_t.detach().cpu())
+
+        return {
+            "mode": "train" if self.training else "eval",
+            "use_cert_scaling": self.use_cert_scaling,
+            "global_gamma": global_gamma,
+            "gamma_prod": float(gamma_prod.detach().cpu()),
+            "conservative_gamma_prod": float(conservative.detach().cpu()),
+            "smooth_scale": smooth_scale,
+            "hard_scale": hard_scale,
+            "certified_gain_bound": certified_bound,
+            "encoder_norm": encoder_norm,
+            "decoder_norm": decoder_norm,
+            "n_blocks": len(block_rows),
+            "blocks": block_rows,
+        }
+
+    @staticmethod
+    def _last_runtime_state(state: Any) -> Any:
+        """Extract a reusable final state from a returned state trajectory."""
+        if state is None:
+            return None
+        if torch.is_tensor(state):
+            return state[:, -1, :] if state.ndim >= 3 else state
+        if isinstance(state, tuple):
+            return tuple(DeepSSM._last_runtime_state(item) for item in state)
+        if isinstance(state, list):
+            return [DeepSSM._last_runtime_state(item) for item in state]
+        raise TypeError(f"Unsupported state trajectory type: {type(state).__name__}.")
 
     def forward(
         self,
@@ -392,6 +972,8 @@ class DeepSSM(nn.Module):
         detach_state: bool = False,
     ):
         u3d = _normalize_to_3d(u)
+        if gamma is not None and not self.use_cert_scaling:
+            raise ValueError("gamma override requires a model constructed with gamma set.")
         if reset_state:
             self.reset()
 
@@ -411,11 +993,8 @@ class DeepSSM(nn.Module):
 
         # Encode
         if self.use_cert_scaling:
-            enc_norm = torch.linalg.matrix_norm(self.encoder_w, ord=2).clamp_min(1e-12)
-            dec_norm = torch.linalg.matrix_norm(self.decoder_w, ord=2).clamp_min(1e-12)
-
-            encoder_eff = self.encoder_w / enc_norm
-            decoder_eff = self.decoder_w / dec_norm
+            encoder_eff = self._spectrally_capped_weight(self.encoder_w)
+            decoder_eff = self._spectrally_capped_weight(self.decoder_w)
 
             x = F.linear(u3d, encoder_eff, bias=None)
         else:
@@ -430,74 +1009,24 @@ class DeepSSM(nn.Module):
                 reset_state=reset_state,
                 detach_state=detach_state,
             )
-            layer_states[i] = st[:, -1, :]
+            layer_states[i] = self._last_runtime_state(st)
 
         # Decode
         if self.use_cert_scaling:
-            gamma_t = (
-                self.gamma_t.abs()
-                if gamma is None
-                else torch.as_tensor(gamma, device=x.device, dtype=x.dtype).abs()
+            gamma_t = self._effective_gamma_cap(
+                gamma=gamma,
+                device=x.device,
+                dtype=x.dtype,
             )
-
-            if len(self.blocks) > 0:
-                # Residual branch gain g_k
-                g = torch.stack([
-                    block.lru.gamma.abs().to(device=x.device, dtype=x.dtype)
-                    for block in self.blocks
-                ])
-
-                if self.ff_has_lip:
-                    ff_lips = torch.stack([
-                        block.ff.lip.to(device=x.device, dtype=x.dtype)
-                        for block in self.blocks
-                    ])
-                    g = g * ff_lips
-
-                # Dropout factor during training: Lip(dropout) <= 1/(1-p)
-                if self.training:
-                    drop_factors = torch.stack([
-                        torch.as_tensor(
-                            1.0 / max(1.0 - float(block.dropout.p), 1e-12),
-                            device=x.device,
-                            dtype=x.dtype,
-                        )
-                        for block in self.blocks
-                    ])
-                else:
-                    drop_factors = torch.ones(len(self.blocks), device=x.device, dtype=x.dtype)
-
-                g = g * drop_factors
-
-                # Tighter valid per-layer factor for y = x + alpha * z:
-                #   ||block|| <= 1 + alpha_k * g_k
-                alphas = torch.stack([
-                    block.res_scale.to(device=x.device, dtype=x.dtype).clamp(0.0, 1.0)
-                    for block in self.blocks
-                ])
-
-                g_eff = (1.0 + alphas * g).clamp_min(1e-12)
-                log_gamma_prod = torch.log(g_eff).sum()
-                gamma_prod = torch.exp(log_gamma_prod)
-            else:
-                gamma_prod = torch.ones((), device=x.device, dtype=x.dtype)
-
-            trainable_global_gamma = (
-                gamma is None
-                and isinstance(getattr(self, "gamma_t", None), nn.Parameter)
-                and self.gamma_t.requires_grad
+            log_gamma_prod = self._log_block_gain_product(
+                device=x.device,
+                dtype=x.dtype,
             )
-            if trainable_global_gamma:
-                scale = gamma_t / (gamma_prod + 1e-12)
-            else:
-                # Treat fixed gamma as a smooth upper bound. The log-sum-exp cap is
-                # always below the hard admissible scale min(1, gamma_t / gamma_prod),
-                # so the guarantee is preserved while gradients stay nonzero near the boundary.
-                scale = self._smooth_capped_scale(
-                    gamma_t=gamma_t,
-                    gamma_prod=gamma_prod,
-                    temperature=self.config.cert_scale_temperature,
-                )
+            scale = self._smooth_capped_scale_from_logs(
+                gamma_t=gamma_t,
+                log_gamma_prod=log_gamma_prod,
+                temperature=self.config.cert_scale_temperature,
+            )
             outputs = F.linear(x, decoder_eff * scale, bias=None)
         else:
             outputs = self.decoder(x)
@@ -515,11 +1044,36 @@ class DeepSSM(nn.Module):
         hard guarantee by replacing max(0, log(gamma_prod / gamma_t)) with a
         log-sum-exp / softplus upper bound.
         """
-        eps = 1e-12
+        dtype = gamma_prod.dtype
+        tiny = torch.finfo(dtype).tiny
+        log_gamma_prod = torch.log(gamma_prod.abs().clamp_min(tiny))
+        return DeepSSM._smooth_capped_scale_from_logs(
+            gamma_t=gamma_t,
+            log_gamma_prod=log_gamma_prod,
+            temperature=temperature,
+        )
+
+    @staticmethod
+    def _smooth_capped_scale_from_logs(
+        gamma_t: torch.Tensor,
+        log_gamma_prod: torch.Tensor,
+        temperature: float,
+    ) -> torch.Tensor:
+        """
+        Smoothly cap decoder gain without ever amplifying it.
+
+        The result is no larger than ``min(1, gamma_t / gamma_prod)``. Working
+        with ``log_gamma_prod`` avoids overflow for deep stacks or large learned
+        branch bounds.
+        """
         tau = max(float(temperature), 1e-6)
-        log_ratio = torch.log(gamma_prod + eps) - torch.log(gamma_t + eps)
+        gamma_t = gamma_t.abs()
+        tiny = torch.finfo(gamma_t.dtype).tiny
+        log_gamma_t = torch.log(gamma_t.clamp_min(tiny))
+        log_ratio = log_gamma_prod - log_gamma_t
         smooth_log_cap = tau * F.softplus(log_ratio / tau)
-        return torch.exp(-smooth_log_cap)
+        scale = torch.exp(-smooth_log_cap)
+        return torch.where(gamma_t > 0, scale, torch.zeros_like(scale))
 
     def reset(self):
         for block in self.blocks:
