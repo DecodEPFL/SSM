@@ -14,7 +14,7 @@ import math
 import nonlinear_benchmarks
 from nonlinear_benchmarks.error_metrics import RMSE, NRMSE, R_squared, MAE, fit_index
 import json
-from src.neural_ssm.ssm import DeepSSM, SSMConfig, SimpleRNN
+from src.neural_ssm.ssm import DeepSSM, MultiHeadRavenRSM, SSMConfig, SimpleRNN
 from src.neural_ssm.rens.ren import REN
 
 try:
@@ -126,15 +126,75 @@ class LSTMWrapper(nn.Module):
         return y, None
 
 
+class RavenRSMWrapper(nn.Module):
+    """System-ID wrapper around the experimental MultiHeadRavenRSM layer."""
+
+    def __init__(
+            self,
+            dim_in: int,
+            dim_out: int,
+            *,
+            d_model: int,
+            num_heads: int,
+            num_slots: int,
+            d_k: Optional[int] = None,
+            d_v: Optional[int] = None,
+            top_k: int = 2,
+            routing_alpha: float = 1.0,
+            residual: bool = True,
+            norm: bool = True,
+    ):
+        super().__init__()
+        self.encoder = nn.Linear(dim_in, d_model, bias=False)
+        self.memory = MultiHeadRavenRSM(
+            d_model=d_model,
+            num_heads=num_heads,
+            num_slots=num_slots,
+            d_k=d_k,
+            d_v=d_v,
+            top_k=top_k,
+            routing_alpha=routing_alpha,
+            residual=residual,
+            norm=norm,
+        )
+        self.decoder = nn.Linear(d_model, dim_out, bias=False)
+
+    def forward(
+            self,
+            u: torch.Tensor,
+            state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+            *,
+            reset_state: bool = True,
+            detach_state: bool = True,
+    ):
+        if u.dim() == 2:
+            u = u.unsqueeze(0)
+        if u.dim() != 3:
+            raise ValueError(f"Expected input shape (T,D) or (B,T,D), got {tuple(u.shape)}.")
+        z = self.encoder(u)
+        h, state = self.memory(
+            z,
+            state=state,
+            return_state=True,
+            reset_state=reset_state,
+            detach_state=detach_state,
+        )
+        return self.decoder(h), state
+
+    def reset(self):
+        self.memory.state = None
+
+
 @dataclass
 class ModelConfig:
     """Configuration for model architecture."""
+    model_type: str = "deepssm"  # deepssm | raven
     n_u: int = 1
     n_y: int = 1
     d_model: int = 16
     d_state: int = 11
     n_layers: int = 1
-    ff: str = "LMLP"  # GLU | MLP | LMLP
+    ff: str = "LGLU2"  # Use GLU/MLP only when gamma=None.
     max_phase: float = math.pi / 60
     r_min: float = 0.7
     r_max: float = 0.98
@@ -151,7 +211,17 @@ class ModelConfig:
     max_phase_b: float = 0.5  # small spread
     phase_center: float = 0  # center angle ≈ 17°
     random_phase: bool = True
-    learn_x0: bool = True
+    learn_x0: bool = False
+    ssm_residual_init: float = -1.0
+    ff_residual_init: float = -1.0
+    raven_heads: int = 4
+    raven_slots: int = 8
+    raven_top_k: int = 2
+    raven_d_k: Optional[int] = None
+    raven_d_v: Optional[int] = None
+    raven_routing_alpha: float = 1.0
+    raven_residual: bool = True
+    raven_norm: bool = True
 
     def to_ssm_config(self) -> SSMConfig:
         """Convert to SSMConfig object."""
@@ -163,8 +233,8 @@ class ModelConfig:
             rmin=self.r_min,
             rmax=self.r_max,
             max_phase=self.max_phase,
-            d_hidden = self.d_hidden,
-            nl_layers = self.nl_layers,
+            d_hidden=self.d_hidden,
+            nl_layers=self.nl_layers,
             scale=self.scale,
             dim_amp=self.d_amp,
             param=self.param,
@@ -172,12 +242,40 @@ class ModelConfig:
             train_gamma=self.train_gamma,
             train_ff_lip=self.train_ff_lip,
             init=self.init,
-            rho = self.rho,
-            max_phase_b = self.max_phase_b,
-            phase_center = self.phase_center,
+            rho=self.rho,
+            max_phase_b=self.max_phase_b,
+            phase_center=self.phase_center,
             random_phase=self.random_phase,
-            learn_x0= self.learn_x0
+            learn_x0=self.learn_x0,
+            ssm_residual_init=self.ssm_residual_init,
+            ff_residual_init=self.ff_residual_init,
         )
+
+
+def build_model_from_config(model_config: ModelConfig) -> nn.Module:
+    """Build the benchmark model selected by ModelConfig.model_type."""
+    model_type = model_config.model_type.lower()
+    if model_type == "deepssm":
+        return DeepSSM(
+            d_input=model_config.n_u,
+            d_output=model_config.n_y,
+            config=model_config.to_ssm_config(),
+        )
+    if model_type == "raven":
+        return RavenRSMWrapper(
+            dim_in=model_config.n_u,
+            dim_out=model_config.n_y,
+            d_model=model_config.d_model,
+            num_heads=model_config.raven_heads,
+            num_slots=model_config.raven_slots,
+            d_k=model_config.raven_d_k,
+            d_v=model_config.raven_d_v,
+            top_k=model_config.raven_top_k,
+            routing_alpha=model_config.raven_routing_alpha,
+            residual=model_config.raven_residual,
+            norm=model_config.raven_norm,
+        )
+    raise ValueError(f"Unknown model_type={model_config.model_type!r}.")
 
 
 @dataclass
@@ -233,115 +331,11 @@ def _find_deepssm_core(model: nn.Module) -> Optional[DeepSSM]:
 
 @torch.no_grad()
 def collect_gain_diagnostics(model: nn.Module) -> Optional[Dict[str, Any]]:
-    """Collect per-block gain data for DeepSSM certified models."""
+    """Collect gain data from the model's canonical certificate implementation."""
     core = _find_deepssm_core(model)
     if core is None:
         return None
-
-    try:
-        ref_param = next(core.parameters())
-    except StopIteration:
-        return None
-
-    device = ref_param.device
-    dtype = ref_param.dtype
-
-    block_rows = []
-    g_eff_terms = []
-    branch_terms = []
-
-    for index, block in enumerate(core.blocks):
-        gamma_attr = getattr(block.lru, "gamma", None)
-        if gamma_attr is None:
-            return None
-
-        core_gamma = torch.as_tensor(
-            gamma_attr,
-            device=device,
-            dtype=dtype,
-        ).abs()
-
-        ff_lip_attr = getattr(block.ff, "lip", None)
-        if ff_lip_attr is None:
-            ff_lip = torch.ones((), device=device, dtype=dtype)
-        else:
-            ff_lip = torch.as_tensor(
-                ff_lip_attr,
-                device=device,
-                dtype=dtype,
-            )
-
-        if core.training:
-            drop_factor = torch.as_tensor(
-                1.0 / max(1.0 - float(block.dropout.p), 1e-12),
-                device=device,
-                dtype=dtype,
-            )
-        else:
-            drop_factor = torch.ones((), device=device, dtype=dtype)
-
-        alpha = block.res_scale.to(device=device, dtype=dtype).clamp(0.0, 1.0)
-        branch_gain = core_gamma * ff_lip * drop_factor
-        g_eff = (1.0 + alpha * branch_gain).clamp_min(1e-12)
-
-        raw_lip = getattr(block.ff, "raw_lip", None)
-        ff_lip_trainable = isinstance(raw_lip, nn.Parameter) and raw_lip.requires_grad
-
-        block_rows.append({
-            "index": index,
-            "lru_type": block.lru.__class__.__name__,
-            "ff_type": block.ff.__class__.__name__,
-            "core_gamma": float(core_gamma.detach().cpu().item()),
-            "ff_lip": float(ff_lip.detach().cpu().item()),
-            "ff_lip_trainable": ff_lip_trainable,
-            "alpha": float(alpha.detach().cpu().item()),
-            "drop_factor": float(drop_factor.detach().cpu().item()),
-            "branch_gain": float(branch_gain.detach().cpu().item()),
-            "g_eff": float(g_eff.detach().cpu().item()),
-        })
-
-        branch_terms.append(branch_gain)
-        g_eff_terms.append(g_eff)
-
-    if g_eff_terms:
-        gamma_prod = torch.exp(torch.log(torch.stack(g_eff_terms)).sum())
-        branch_prod = torch.exp(torch.log1p(torch.stack(branch_terms)).sum())
-    else:
-        gamma_prod = torch.ones((), device=device, dtype=dtype)
-        branch_prod = torch.ones((), device=device, dtype=dtype)
-
-    conservative_gamma_prod = core.conservative_gamma_product(device=device, dtype=dtype)
-
-    global_gamma = None
-    smooth_scale = None
-    hard_scale = None
-    if core.use_cert_scaling:
-        gamma_t = core.gamma_t.abs().to(device=device, dtype=dtype)
-        global_gamma = float(gamma_t.detach().cpu().item())
-        smooth_scale = float(
-            core._smooth_capped_scale(
-                gamma_t=gamma_t,
-                gamma_prod=gamma_prod,
-                temperature=core.config.cert_scale_temperature,
-            ).detach().cpu().item()
-        )
-        hard_scale = float(torch.minimum(
-            torch.ones((), device=device, dtype=dtype),
-            gamma_t / (gamma_prod + 1e-12),
-        ).detach().cpu().item())
-
-    return {
-        "mode": "train" if core.training else "eval",
-        "use_cert_scaling": core.use_cert_scaling,
-        "global_gamma": global_gamma,
-        "gamma_prod": float(gamma_prod.detach().cpu().item()),
-        "branch_prod": float(branch_prod.detach().cpu().item()),
-        "conservative_gamma_prod": float(conservative_gamma_prod.detach().cpu().item()),
-        "smooth_scale": smooth_scale,
-        "hard_scale": hard_scale,
-        "n_blocks": len(block_rows),
-        "blocks": block_rows,
-    }
+    return core.gain_diagnostics()
 
 
 def format_gain_diagnostics(
@@ -364,18 +358,25 @@ def format_gain_diagnostics(
             f" decoder_scale={diagnostics['smooth_scale']:.4e} "
             f"hard_cap={diagnostics['hard_scale']:.4e}"
         )
+    if diagnostics["certified_gain_bound"] is not None:
+        line += f" certified={diagnostics['certified_gain_bound']:.4e}"
 
     if not print_per_block:
         return line
 
     lines = [line]
     for block in diagnostics["blocks"]:
-        lip_tag = "trainable" if block["ff_lip_trainable"] else "fixed"
+        if not math.isfinite(block["ff_lip"]):
+            lip_tag = "unbounded"
+        else:
+            lip_tag = "trainable" if block["ff_lip_trainable"] else "fixed"
         lines.append(
             f"  block {block['index']}: {block['lru_type']} + {block['ff_type']} "
             f"core_gamma={block['core_gamma']:.4e} ff_lip={block['ff_lip']:.4e} ({lip_tag}) "
-            f"alpha={block['alpha']:.4f} branch={block['branch_gain']:.4e} "
-            f"g_eff={block['g_eff']:.4e}"
+            f"alpha_ssm={block['alpha_ssm']:.4f} alpha_ff={block['alpha_ff']:.4f} "
+            f"ssm_factor={block['ssm_factor']:.4e} "
+            f"ff_factor={block['ff_factor']:.4e} "
+            f"block={block['block_factor']:.4e}"
         )
     return "\n".join(lines)
 
@@ -871,8 +872,22 @@ class SystemIDTrainer:
             filepath: Path to checkpoint file
         """
         checkpoint = torch.load(filepath, map_location=self.device, weights_only=True)
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        try:
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+        except RuntimeError as exc:
+            reason = str(exc).splitlines()[0]
+            print(
+                "Checkpoint model state is incompatible with the current "
+                f"architecture; skipping checkpoint load ({reason})."
+            )
+            return
+        try:
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        except ValueError as exc:
+            print(
+                "Checkpoint optimizer state is incompatible with the current "
+                f"architecture; keeping the fresh optimizer state ({exc})."
+            )
         self.train_losses = checkpoint['train_losses']
         self.val_losses = checkpoint['val_losses']
         self.best_val_loss = checkpoint['best_val_loss']
@@ -1534,11 +1549,7 @@ def optimize_hyperparameters(
 
         set_random_seed(base_train_config.seed + trial.number)
 
-        model = DeepSSM(
-            d_input=model_config.n_u,
-            d_output=model_config.n_y,
-            config=model_config.to_ssm_config(),
-        )
+        model = build_model_from_config(model_config)
         trainer = SystemIDTrainer(
             model,
             train_config,
@@ -1612,9 +1623,9 @@ def main():
     )
 
     # Initialize configurations
-    model_config = ModelConfig(n_u=u_train.shape[1], n_y=y_train.shape[1], param='zak', d_model=5, d_state=8,
-                               gamma= 40, ff='TLIP', init='eye', max_phase=0.4,
-                               n_layers=3, d_amp=3, rho=0.99, phase_center=0.0, max_phase_b=.04, d_hidden=12, nl_layers=3, learn_x0=True)
+    model_config = ModelConfig(n_u=u_train.shape[1], n_y=y_train.shape[1], param='tv', d_model=8, d_state=8,
+                               gamma= 5, ff='MBLIP', init='eye', max_phase=0.4,
+                               n_layers=3, d_amp=3, rho=0.99, phase_center=0.0, max_phase_b=.04, d_hidden=12, nl_layers=3, learn_x0=False)
     train_config = TrainingConfig(
         num_epochs=2000,
         learning_rate=1.6568e-02,
@@ -1685,10 +1696,7 @@ def main():
 
     # Build model
     print("Building model...")
-    ssm_config = model_config.to_ssm_config()
-
-    # --- DeepSSM (comment out to use REN instead) ---
-    model = DeepSSM(d_input=model_config.n_u, d_output=model_config.n_y, config=ssm_config)
+    model = build_model_from_config(model_config)
 
     # --- LSTM reference baseline (comment out to use DeepSSM instead) ---
     # model = LSTMWrapper(
