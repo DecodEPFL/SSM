@@ -640,6 +640,8 @@ class DeepSSM(nn.Module):
             float(self.config.gamma) if self.config.gamma is not None else None
         )
         self.ff_has_lip = False
+        # Eval-only cache of the spectrally-capped (encoder, decoder) weights.
+        self._enc_dec_cache = None
 
         if self.use_cert_scaling:
             self.register_buffer("gamma_t", torch.tensor(float(self.config.gamma)))
@@ -1029,9 +1031,7 @@ class DeepSSM(nn.Module):
 
         # Encode
         if self.use_cert_scaling:
-            encoder_eff = self._spectrally_capped_weight(self.encoder_w)
-            decoder_eff = self._spectrally_capped_weight(self.decoder_w)
-
+            encoder_eff, decoder_eff = self._capped_encoder_decoder()
             x = F.linear(u3d, encoder_eff, bias=None)
         else:
             x = self.encoder(u3d)
@@ -1135,6 +1135,29 @@ class DeepSSM(nn.Module):
             temperature=temperature,
         )
         return torch.exp(log_scale)
+
+    def _capped_encoder_decoder(self):
+        """Spectrally-capped (encoder, decoder) weights, cached in eval.
+
+        The cap is an SVD-based spectral-norm clip; with fixed weights (eval) the
+        result is constant, so it is computed once and reused. Training always
+        recomputes (weights change), and ``train()``/``eval()`` clears the cache.
+        The cached tensors are exactly the recomputed ones — no math change.
+        """
+        if self.training:
+            self._enc_dec_cache = None
+            return (self._spectrally_capped_weight(self.encoder_w),
+                    self._spectrally_capped_weight(self.decoder_w))
+        if self._enc_dec_cache is None:
+            self._enc_dec_cache = (
+                self._spectrally_capped_weight(self.encoder_w).detach(),
+                self._spectrally_capped_weight(self.decoder_w).detach(),
+            )
+        return self._enc_dec_cache
+
+    def train(self, mode: bool = True):
+        self._enc_dec_cache = None
+        return super().train(mode)
 
     def reset(self):
         for block in self.blocks:

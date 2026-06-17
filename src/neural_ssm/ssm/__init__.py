@@ -8,6 +8,12 @@ from .experimental import (
     MultiHeadRavenRSM,
 )
 from .layers import SSMConfig, SSL, DeepSSM, PureLRUR, SimpleRNN
+from .stable_recurrent_transformer import (
+    StableRecurrentTransformer,
+    StableRecurrentTransformerBlock,
+    LipschitzStaticAttention,
+    split_gain_budget,
+)
 
 __all__ = [
     "LRU", "L2RU", "lruz", "L2BoundedLTICell", "Block2x2DenseL2SSM",
@@ -15,4 +21,6 @@ __all__ = [
     "ExpertSelectiveTimeVaryingSSM", "Block2x2SelectiveBCDExpertsL2SSM",
     "MultiHeadRavenRSM",
     "SSMConfig", "SSL", "DeepSSM", "PureLRUR", "SimpleRNN",
+    "StableRecurrentTransformer", "StableRecurrentTransformerBlock",
+    "LipschitzStaticAttention", "split_gain_budget",
 ]
