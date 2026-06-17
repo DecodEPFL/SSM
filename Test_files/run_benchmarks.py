@@ -34,11 +34,13 @@ Examples
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import math
+import os
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -49,6 +51,9 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+# Let MPS fall back unsupported ops (e.g. the SVD behind the certified spectral
+# norms) to CPU rather than crashing. Must be set before torch is imported.
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 import torch
 import torch.nn as nn
 
@@ -314,47 +319,103 @@ MODEL_ZOO: Dict[str, dict] = {
     "l2ru":  dict(kind="deepssm", param="l2ru",  gamma=5.0,  ff="LGLU2"),   # certified LTI
     "l2n":   dict(kind="deepssm", param="l2n",   gamma=5.0,  ff="LGLU2"),   # certified 2x2 dense LTI (needs even d_state)
     "tv":    dict(kind="deepssm", param="tv",    gamma=5.0,  ff="MBLIP"),   # certified selective
+    "tvc":   dict(kind="deepssm", param="tvc",   gamma=5.0,  ff="MBLIP"),   # certified selective LTI
     "raven": dict(kind="deepssm", param="raven", gamma=5.0,  ff="MBLIP"),   # certified Raven cell
     "lstm":  dict(kind="lstm",    hidden=64, layers=2),
     "gru":   dict(kind="gru",     hidden=64, layers=2),
 }
 
 
-def build_model(name: str, n_u: int, n_y: int, gconf: "GlobalModelConfig") -> nn.Module:
+def _count_params(model: nn.Module) -> int:
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def _make_ssm_config(spec: dict, gconf: "GlobalModelConfig") -> SSMConfig:
+    gamma = spec.get("gamma")
+    if str(gconf.gamma_override).lower() != "auto":
+        ov = str(gconf.gamma_override).lower()
+        gamma = None if ov in ("none", "") else float(gconf.gamma_override)
+    ffo = gconf.ff_override
+    ff = spec.get("ff", "LGLU2") if (not ffo or str(ffo).lower() == "auto") else ffo
+    return SSMConfig(
+        d_model=gconf.d_model, d_state=gconf.d_state, n_layers=gconf.n_layers,
+        d_hidden=gconf.d_hidden, nl_layers=gconf.nl_layers, scale=gconf.scale,
+        param=spec["param"], gamma=gamma, ff=ff, init=gconf.init,
+        train_gamma=True, learn_x0=False,
+        raven_heads=gconf.raven_heads, raven_slots=gconf.raven_slots, raven_top_k=gconf.raven_top_k,
+    )
+
+
+def _closest_width(count_fn, target: int, lo: int = 2, cap: int = 4096) -> int:
+    """Width whose model param count is closest to ``target``.
+
+    ``count_fn(w)`` builds a model of width ``w`` and returns its trainable param
+    count (or None if infeasible). Param count is ~monotonic in width, so bracket
+    the target then check neighbours.
+    """
+    def c(w):
+        try:
+            return count_fn(int(w))
+        except Exception:
+            return None
+
+    hi, chi = max(lo, 4), None
+    chi = c(max(lo, 4))
+    while (chi is None or chi < target) and hi < cap:
+        hi *= 2
+        chi = c(hi)
+    a, b = lo, hi
+    while a < b:
+        mid = (a + b) // 2
+        cm = c(mid)
+        if cm is None or cm < target:
+            a = mid + 1
+        else:
+            b = mid
+    best, best_err = None, None
+    for w in (a - 1, a, a + 1):
+        if w < lo:
+            continue
+        cw = c(w)
+        if cw is None:
+            continue
+        err = abs(cw - target)
+        if best is None or err < best_err:
+            best, best_err = w, err
+    return best if best is not None else lo
+
+
+def build_model(name: str, n_u: int, n_y: int, gconf: "GlobalModelConfig",
+                param_budget: int = 0) -> nn.Module:
+    """Build a model. With ``param_budget > 0`` the width knob is tuned so the
+    trainable parameter count lands near the budget (d_model for DeepSSM cores,
+    hidden size for the RNN baselines); other hyperparameters are left as set."""
     spec = dict(MODEL_ZOO[name])
     kind = spec.pop("kind")
+
     if kind == "deepssm":
+        if param_budget and param_budget > 0:
+            best = _closest_width(
+                lambda w: _count_params(
+                    DeepSSMSim(n_u, n_y, _make_ssm_config(spec, replace(gconf, d_model=w)))),
+                param_budget, lo=max(2, gconf.raven_heads),
+            )
+            gconf = replace(gconf, d_model=best)
         if spec.get("param") == "l2n" and gconf.d_state % 2 != 0:
             raise ValueError(
                 f"param='l2n' (Block2x2DenseL2SSM) needs an even d_state (2x2 blocks); "
                 f"got {gconf.d_state}. Pass an even --d-state (e.g. {gconf.d_state + 1})."
             )
-        gamma = spec.get("gamma")
-        if str(gconf.gamma_override).lower() != "auto":
-            ov = str(gconf.gamma_override).lower()
-            gamma = None if ov in ("none", "") else float(gconf.gamma_override)
-        ffo = gconf.ff_override
-        ff = spec.get("ff", "LGLU2") if (not ffo or str(ffo).lower() == "auto") else ffo
-        cfg = SSMConfig(
-            d_model=gconf.d_model,
-            d_state=gconf.d_state,
-            n_layers=gconf.n_layers,
-            d_hidden=gconf.d_hidden,
-            nl_layers=gconf.nl_layers,
-            scale=gconf.scale,
-            param=spec["param"],
-            gamma=gamma,
-            ff=ff,
-            init=gconf.init,
-            train_gamma=True,
-            learn_x0=False,
-            raven_heads=gconf.raven_heads,
-            raven_slots=gconf.raven_slots,
-            raven_top_k=gconf.raven_top_k,
-        )
-        return DeepSSMSim(n_u, n_y, cfg)
+        return DeepSSMSim(n_u, n_y, _make_ssm_config(spec, gconf))
+
     if kind in ("lstm", "gru"):
+        if param_budget and param_budget > 0:
+            spec["hidden"] = _closest_width(
+                lambda w: _count_params(RNNSim(n_u, n_y, kind=kind, hidden=w, layers=spec["layers"])),
+                param_budget,
+            )
         return RNNSim(n_u, n_y, kind=kind, hidden=spec["hidden"], layers=spec["layers"])
+
     raise ValueError(f"Unknown model kind {kind!r}.")
 
 
@@ -495,13 +556,15 @@ def train_model(
     @torch.no_grad()
     def eval_windows(U, Y, M):
         model.eval()
-        tot, denom = 0.0, 0.0
+        if U.shape[0] == 0:
+            return 0.0
+        tot = torch.zeros((), device=device)  # accumulate on-device; one host sync at the end
         for i in range(0, U.shape[0], tcfg.batch_size):
             pred = model(U[i:i + tcfg.batch_size])
             m = M[i:i + tcfg.batch_size]
-            tot += (((pred - Y[i:i + tcfg.batch_size]) ** 2) * m.unsqueeze(-1)).sum().item()
-            denom += m.sum().item() * n_y
-        return tot / max(denom, 1.0)
+            tot = tot + (((pred - Y[i:i + tcfg.batch_size]) ** 2) * m.unsqueeze(-1)).sum()
+        denom = (M.sum() * n_y).clamp_min(1.0)
+        return (tot / denom).item()
 
     n_win = Ut.shape[0]
     train_losses, val_losses = [], []
@@ -511,11 +574,14 @@ def train_model(
     for epoch in range(tcfg.epochs):
         model.train()
         perm = torch.from_numpy(rng.permutation(n_win)).to(device)
-        running, seen = 0.0, 0
+        running, seen = torch.zeros((), device=device), 0
         for i in range(0, n_win, tcfg.batch_size):
             idx = perm[i:i + tcfg.batch_size]
             opt.zero_grad(set_to_none=True)
-            with torch.autocast(device_type=device.type, enabled=use_amp):
+            # autocast only when AMP is active (CUDA). Avoid passing 'mps'/'cpu' to
+            # torch.autocast, which can raise on some torch builds even when disabled.
+            amp_ctx = torch.autocast(device_type="cuda") if use_amp else contextlib.nullcontext()
+            with amp_ctx:
                 pred = model(Ut[idx])
                 loss = masked_mse(pred, Yt[idx], Mt[idx])
             scaler.scale(loss).backward()
@@ -524,10 +590,10 @@ def train_model(
                 nn.utils.clip_grad_norm_(model.parameters(), tcfg.grad_clip)
             scaler.step(opt)
             scaler.update()
-            running += loss.item() * idx.numel()
+            running = running + loss.detach() * idx.numel()
             seen += idx.numel()
         sched.step()
-        train_loss = running / max(seen, 1)
+        train_loss = (running / max(seen, 1)).item()  # single host sync per epoch
         train_losses.append(train_loss)
 
         val_loss = eval_windows(Uv, Yv, Mv) if has_val else train_loss
@@ -1131,6 +1197,10 @@ def run(args) -> None:
         torch.backends.cudnn.benchmark = True
         torch.set_float32_matmul_precision("high")
     print(f"Device: {device}")
+    if device.type == "mps":
+        print("Note: MPS lacks the SVD op behind the certified spectral norms, so those "
+              "ops fall back to CPU (often SLOWER than '--device cpu' for these small "
+              "models). Prefer cpu unless you've confirmed MPS is faster for your setup.")
 
     gconf = GlobalModelConfig(
         d_model=args.d_model, d_state=args.d_state, n_layers=args.n_layers,
@@ -1185,8 +1255,15 @@ def run(args) -> None:
             rec = {"benchmark": bname, "model": mname, "n_u": bench.n_u, "n_y": bench.n_y}
             try:
                 set_seed(args.seed)
-                model = build_model(mname, bench.n_u, bench.n_y, gconf)
+                model = build_model(mname, bench.n_u, bench.n_y, gconf,
+                                    param_budget=args.param_budget)
                 rec["n_params"] = sum(p.numel() for p in model.parameters())
+                if args.param_budget:
+                    core = getattr(model, "core", None)
+                    rec["width_eff"] = (core.config.d_model if core is not None
+                                        else getattr(getattr(model, "rnn", None), "hidden_size", None))
+                    print(f"     [param-match] width={rec['width_eff']} -> "
+                          f"{rec['n_params']} params (target {args.param_budget})")
 
                 monitor = None
                 if not args.no_plot:
@@ -1311,6 +1388,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--plot-every", type=int, default=10)
     p.add_argument("--report-metric", default="rmse", choices=["rmse", "nrmse", "fit", "r2", "mae"],
                    help="metric for the per-benchmark summary bar charts")
+    p.add_argument("--param-budget", type=int, default=0,
+                   help="if >0, tune each model's width (d_model / RNN hidden) so its "
+                        "trainable param count is ~this, for a capacity-matched comparison")
     # misc
     p.add_argument("--list", action="store_true", help="list benchmarks/models and exit")
     p.add_argument("--verbose", action="store_true")

@@ -41,6 +41,10 @@ class L2BoundedLinearExact(nn.Module):
         if not self.exact_norm:
             self.register_buffer("_u", F.normalize(torch.randn(self.d_out), dim=0))
 
+        # Eval-only cache of the spectrally-rescaled weight (the SVD is expensive,
+        # especially on GPU). Cleared whenever train()/eval() is toggled.
+        self._w_eff_cache = None
+
     def _sigma_exact(self, W: torch.Tensor) -> torch.Tensor:
         # SVD is more version-compatible than matrix_norm(ord=2)
         try:
@@ -59,21 +63,34 @@ class L2BoundedLinearExact(nn.Module):
             self._u.copy_(u)
         return sigma
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def _effective_weight(self) -> torch.Tensor:
         W = self.W_raw
-
         # Safer for some GPU/dtype combinations
         W_for_norm = W.float() if W.dtype in (torch.float16, torch.bfloat16) else W
-
         if self.exact_norm:
             sigma = self._sigma_exact(W_for_norm).to(dtype=W.dtype, device=W.device)
         else:
             sigma = self._sigma_power_iter(W_for_norm).to(dtype=W.dtype, device=W.device)
-
         scale = torch.clamp(sigma / self.bound, min=1.0)
-        W_eff = W / scale
+        return W / scale
 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # In eval the weights are fixed, so the (expensive) spectral-norm rescaling
+        # is computed once and reused; training always recomputes. The cached value
+        # is exactly the recomputed one — no change to the math — and any
+        # train()/eval() toggle clears it.
+        if self.training:
+            self._w_eff_cache = None
+            W_eff = self._effective_weight()
+        else:
+            if self._w_eff_cache is None:
+                self._w_eff_cache = self._effective_weight().detach()
+            W_eff = self._w_eff_cache
         return F.linear(x, W_eff, bias=None)
+
+    def train(self, mode: bool = True):
+        self._w_eff_cache = None
+        return super().train(mode)
 
 
 
