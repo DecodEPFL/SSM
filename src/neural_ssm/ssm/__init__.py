@@ -14,6 +14,15 @@ from .stable_recurrent_transformer import (
     LipschitzStaticAttention,
     split_gain_budget,
 )
+from .certified_transformer import (
+    CertifiedTransformer,
+    CertifiedTransformerBlock,
+    CertifiedMHA,
+    CertifiedFFN,
+    ColumnBudgetedSoftmaxAttention,
+    BoundedQKVProjection,
+    SpectralLinear,
+)
 
 __all__ = [
     "LRU", "L2RU", "lruz", "L2BoundedLTICell", "Block2x2DenseL2SSM",
@@ -23,4 +32,7 @@ __all__ = [
     "SSMConfig", "SSL", "DeepSSM", "PureLRUR", "SimpleRNN",
     "StableRecurrentTransformer", "StableRecurrentTransformerBlock",
     "LipschitzStaticAttention", "split_gain_budget",
+    "CertifiedTransformer", "CertifiedTransformerBlock", "CertifiedMHA",
+    "CertifiedFFN", "ColumnBudgetedSoftmaxAttention", "BoundedQKVProjection",
+    "SpectralLinear",
 ]

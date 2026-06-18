@@ -78,12 +78,26 @@ class SSMConfig:
     train_ff_lip: Optional[bool] = True  # if None, freeze FF Lipschitz scaling when using a fixed, non-trainable gamma
     # and leave it trainable otherwise.
     init: str = 'eye'  # controls the initialization of the parameters when the L2RU param is chosen.
-    # parameters needed for the prescribed-gain parametrization
+    l2ru_eye_scale: float = 0.01
+    l2ru_rand_scale: float = 1.0
+    # L2N initialization
     rho: float = 0.9
     max_phase_b: float = 0.04          # small spread
     phase_center: float = 0        # center angle
     random_phase: bool = True
     offdiag_scale: float = 0.05  # init std for K12/K21/K22 in l2n (old default was 0.005)
+    # Selective TV initialization
+    tv_init_rho: float = 0.99
+    tv_init_delta0: float = 1.0
+    tv_init_param_scale: float = 0.02
+    # Selective LTI TVC initialization
+    tvc_init_rho: float = 0.9
+    tvc_init_delta0: float = 1.0
+    tvc_init_param_scale: float = 0.02
+    tvc_init_sign: float = 0.995
+    tvc_init_b: float = 0.10
+    tvc_init_c: float = 0.10
+    tvc_init_d: float = 0.10
     learn_x0: bool = False  # if True, the initial hidden state is a learnable parameter
     zak_d_margin: float = 0.5  # ZAK-only: initialize the direct term strictly inside the feasible set
     zak_x2_margin: float = 0.5  # ZAK-only: initialize the off-diagonal coupling strictly inside the feasible set
@@ -92,6 +106,8 @@ class SSMConfig:
     # the hard min without breaking the guarantee.
     ssm_residual_init: float = -1.0  # logit of the SSM residual gate
     ff_residual_init: float = -1.0  # logit of the FF residual gate
+    per_channel_gates: bool = False  # if True, the residual gates are per-channel (d_model)
+    # vectors instead of scalars; the certificate uses the worst-channel gate (max).
 
     # Raven selective slot-memory cell (param="raven"). Tune these by passing an
     # SSMConfig directly; DeepSSM(...) keyword construction uses these defaults.
@@ -207,6 +223,8 @@ def _build_l2ru_cell(config: SSMConfig, block_gamma: Optional[float]) -> nn.Modu
         state_features=config.d_model,
         gamma=_fixed_gamma(config, block_gamma),
         init=config.init,
+        eye_scale=config.l2ru_eye_scale,
+        rand_scale=config.l2ru_rand_scale,
         learn_x0=config.learn_x0,
     )
 
@@ -265,6 +283,9 @@ def _build_tv_cell(config: SSMConfig, block_gamma: Optional[float]) -> nn.Module
         d_out=config.d_model,
         gamma=_gamma_init(block_gamma),
         train_gamma=config.train_gamma,
+        init_rho=config.tv_init_rho,
+        init_delta0=config.tv_init_delta0,
+        init_param_scale=config.tv_init_param_scale,
         learn_x0=config.learn_x0,
     )
 
@@ -278,11 +299,13 @@ def _build_tvc_cell(config: SSMConfig, block_gamma: Optional[float]) -> nn.Modul
         train_gamma=config.train_gamma,
         param_net="mlp",
         hidden=max(64, 2 * config.d_model),
-        init_rho=config.rho,
-        init_sign=0.995,
-        init_b=0.10,
-        init_c=0.10,
-        init_d=0.10,
+        init_rho=config.tvc_init_rho,
+        init_delta0=config.tvc_init_delta0,
+        init_param_scale=config.tvc_init_param_scale,
+        init_sign=config.tvc_init_sign,
+        init_b=config.tvc_init_b,
+        init_c=config.tvc_init_c,
+        init_d=config.tvc_init_d,
         bcd_nonlinearity="tanh",
         output_uses_post_state=False,
         learn_x0=config.learn_x0,
@@ -430,8 +453,9 @@ class SSL(nn.Module):
         x1 = x  + alpha_ssm * dropout_ssm(SSM(x))
         y  = x1 + alpha_ff  * dropout_ff(FF(x1))
 
-    In certified mode the scalar gates are in ``(0, 1)`` and the block gain is
-    bounded by ``(1 + alpha_ssm*gamma_ssm)*(1 + alpha_ff*lip_ff)``.
+    The scalar or per-channel gates are in ``(0, 1)``. In certified mode the
+    block bound uses the largest gate in each branch:
+    ``(1 + max(alpha_ssm)*gamma_ssm)*(1 + max(alpha_ff)*lip_ff)``.
     """
 
     def __init__(self, config: SSMConfig):
@@ -442,8 +466,18 @@ class SSL(nn.Module):
 
         self.ssm_dropout = nn.Dropout(config.dropout)
         self.ff_dropout = nn.Dropout(config.dropout)
-        self.ssm_res_logit = nn.Parameter(torch.tensor(float(config.ssm_residual_init)))
-        self.ff_res_logit = nn.Parameter(torch.tensor(float(config.ff_residual_init)))
+        # Per-channel residual gates (vectors of size d_model) let some channels
+        # emphasize memory and others feedforward; scalars recover the old behavior.
+        # The certificate uses the worst-channel gate, so it stays valid either way.
+        self.per_channel_gates = bool(getattr(config, "per_channel_gates", False))
+        if self.per_channel_gates:
+            self.ssm_res_logit = nn.Parameter(
+                torch.full((config.d_model,), float(config.ssm_residual_init)))
+            self.ff_res_logit = nn.Parameter(
+                torch.full((config.d_model,), float(config.ff_residual_init)))
+        else:
+            self.ssm_res_logit = nn.Parameter(torch.tensor(float(config.ssm_residual_init)))
+            self.ff_res_logit = nn.Parameter(torch.tensor(float(config.ff_residual_init)))
 
     @property
     def ssm_scale(self) -> torch.Tensor:
@@ -485,8 +519,11 @@ class SSL(nn.Module):
             device=device,
             dtype=dtype,
         )
-        alpha_ssm = self.ssm_scale.to(device=device, dtype=dtype)
-        alpha_ff = self.ff_scale.to(device=device, dtype=dtype)
+        # The certificate uses the worst-channel gate: for a per-channel residual
+        # ||I + diag(alpha)*M|| <= 1 + max_c(alpha_c)*||M||. ``.max()`` is a no-op
+        # for the scalar-gate case, so this stays exact there too.
+        alpha_ssm = self.ssm_scale.to(device=device, dtype=dtype).max()
+        alpha_ff = self.ff_scale.to(device=device, dtype=dtype).max()
         ssm_branch_gain = gamma * ssm_drop_factor
         ff_branch_gain = ff_lip * ff_drop_factor
         ssm_factor = 1.0 + alpha_ssm * ssm_branch_gain
@@ -541,6 +578,19 @@ class SSL(nn.Module):
             legacy = state_dict.pop(legacy_key)
             state_dict.setdefault(prefix + "ssm_res_logit", legacy.clone())
             state_dict.setdefault(prefix + "ff_res_logit", legacy.clone())
+
+        # A scalar-gate checkpoint has an exact behavior-preserving migration to
+        # per-channel gates: repeat the scalar logit in every channel. The reverse
+        # direction remains a size mismatch because reducing learned channel gates
+        # to one scalar would be lossy and has no uniquely correct rule.
+        for name, target in (
+            ("ssm_res_logit", self.ssm_res_logit),
+            ("ff_res_logit", self.ff_res_logit),
+        ):
+            key = prefix + name
+            source = state_dict.get(key)
+            if source is not None and source.numel() == 1 and target.numel() > 1:
+                state_dict[key] = source.reshape(1).expand_as(target).clone()
         super()._load_from_state_dict(
             state_dict,
             prefix,
@@ -598,6 +648,7 @@ class DeepSSM(nn.Module):
         learn_x0: bool = False,
         ssm_residual_init: float = -1.0,
         ff_residual_init: float = -1.0,
+        per_channel_gates: bool = False,
         config: Optional[SSMConfig] = None,
     ):
         super().__init__()
@@ -632,6 +683,7 @@ class DeepSSM(nn.Module):
             learn_x0=learn_x0,
             ssm_residual_init=ssm_residual_init,
             ff_residual_init=ff_residual_init,
+            per_channel_gates=per_channel_gates,
         )
 
         self._validate_config(self.config)
