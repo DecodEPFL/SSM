@@ -202,6 +202,109 @@ class DeepSSMGainCertificateTests(unittest.TestCase):
         self.assertAlmostEqual(train_terms["ssm_drop_factor"].item(), 1.25)
         self.assertAlmostEqual(train_terms["ff_drop_factor"].item(), 2.0)
 
+    def test_scalar_gates_are_the_default_and_per_channel_gates_are_vectors(self):
+        scalar = _certified_model(gamma=1.5)
+        for block in scalar.blocks:
+            self.assertEqual(block.ssm_res_logit.shape, torch.Size([]))
+            self.assertEqual(block.ff_res_logit.shape, torch.Size([]))
+
+        torch.manual_seed(7)
+        model = DeepSSM(
+            d_input=2,
+            d_output=2,
+            d_model=4,
+            d_state=4,
+            n_layers=2,
+            param="tv",
+            ff="LGLU2",
+            gamma=1.5,
+            scale=0.8,
+            per_channel_gates=True,
+        ).eval()
+        for block in model.blocks:
+            self.assertEqual(block.ssm_res_logit.shape, torch.Size([4]))
+            self.assertEqual(block.ff_res_logit.shape, torch.Size([4]))
+            self.assertEqual(block.ssm_scale.shape, torch.Size([4]))
+
+    def test_per_channel_gates_stay_certified_via_worst_channel(self):
+        torch.manual_seed(0)
+        model = DeepSSM(
+            d_input=2,
+            d_output=2,
+            d_model=4,
+            d_state=4,
+            n_layers=3,
+            param="tv",
+            ff="LGLU2",
+            gamma=1.3,
+            scale=0.8,
+            per_channel_gates=True,
+        ).eval()
+        # Spread the gates widely across channels so the worst-channel reduction in
+        # the certificate (max over channels) is actually exercised.
+        with torch.no_grad():
+            for block in model.blocks:
+                block.ssm_res_logit.copy_(torch.tensor([-5.0, 0.0, 3.0, 6.0]))
+                block.ff_res_logit.copy_(torch.tensor([6.0, -2.0, 1.0, -4.0]))
+
+        terms = model.blocks[0].gain_terms(
+            device=next(model.parameters()).device,
+            dtype=next(model.parameters()).dtype,
+        )
+        # The certificate factor uses the largest gate, not the mean.
+        self.assertAlmostEqual(
+            terms["alpha_ssm"].item(), torch.sigmoid(torch.tensor(6.0)).item(), places=6
+        )
+        self.assertAlmostEqual(
+            terms["alpha_ff"].item(), torch.sigmoid(torch.tensor(6.0)).item(), places=6
+        )
+
+        bound = model.certified_gain_bound().item()
+        self.assertTrue(math.isfinite(bound))
+        self.assertLessEqual(bound, 1.3 + 1e-5)
+
+        # The realized zero-state gain stays below the certificate.
+        u = torch.randn(3, 64, 2)
+        with torch.no_grad():
+            y, _ = model(u, mode="loop", reset_state=True)
+        self.assertLessEqual(y.norm().item(), 1.3 * u.norm().item() + 1e-5)
+
+    def test_scalar_gate_checkpoint_expands_into_per_channel_model(self):
+        kwargs = dict(
+            d_input=2,
+            d_output=2,
+            d_model=4,
+            d_state=4,
+            n_layers=2,
+            param="tv",
+            ff="LGLU2",
+            gamma=1.5,
+        )
+        scalar = DeepSSM(**kwargs, per_channel_gates=False).eval()
+        with torch.no_grad():
+            for i, block in enumerate(scalar.blocks):
+                block.ssm_res_logit.fill_(-0.7 + i)
+                block.ff_res_logit.fill_(0.2 + i)
+
+        vector = DeepSSM(**kwargs, per_channel_gates=True).eval()
+        vector.load_state_dict(scalar.state_dict(), strict=True)
+
+        for source, target in zip(scalar.blocks, vector.blocks):
+            self.assertTrue(torch.equal(
+                target.ssm_res_logit,
+                source.ssm_res_logit.expand_as(target.ssm_res_logit),
+            ))
+            self.assertTrue(torch.equal(
+                target.ff_res_logit,
+                source.ff_res_logit.expand_as(target.ff_res_logit),
+            ))
+
+        u = torch.randn(2, 20, 2)
+        with torch.no_grad():
+            y_scalar, _ = scalar(u, mode="loop", reset_state=True)
+            y_vector, _ = vector(u, mode="loop", reset_state=True)
+        self.assertTrue(torch.allclose(y_scalar, y_vector, atol=1e-6, rtol=1e-6))
+
     def test_chunked_stateful_forward_matches_one_shot_forward(self):
         torch.manual_seed(11)
         model = DeepSSM(

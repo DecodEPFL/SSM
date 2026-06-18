@@ -7,9 +7,9 @@ This is a self-contained benchmark harness:
 * loads any subset of the ``nonlinear_benchmarks`` datasets (SISO *and* MIMO),
   handling the tuple-of-datasets splits (CED, Silverbox, ParWH, F16, …) and the
   not-splitted MIMO ``Industrial_robot`` benchmark;
-* trains models in **open-loop simulation** mode with windowed mini-batches
-  (GPU-ready, all window tensors live on the device, no DataLoader overhead);
-* evaluates with the official protocol (free-run simulation, skipping each test
+* trains models in **open-loop simulation** mode on every complete training
+  trajectory, without temporal windows or a derived holdout split;
+* validates with the benchmark-provided second split (free-run simulation, skipping each
   sequence's ``state_initialization_window_length``) and the package metrics
   (RMSE / NRMSE / R² / fit-index, per channel, in physical units);
 * draws **animated training plots** — a reference-trajectory + loss view that is
@@ -70,7 +70,7 @@ from nonlinear_benchmarks.not_splitted_benchmarks import (
     WienerHammerstein_Process_Noise,
 )
 
-from src.neural_ssm.ssm import DeepSSM, SSMConfig
+from src.neural_ssm.ssm import DeepSSM, SSMConfig, CertifiedTransformer
 
 
 # ============================================================================
@@ -87,7 +87,7 @@ _SPLITTED: Dict[str, Callable] = {
     "ParWH": nlb.ParWH,
     "F16": nlb.F16,
 }
-# Not-splitted loaders return (train_list, test_list) but lack those kwargs.
+# Not-splitted loaders return (train_list, validation_list) but lack those kwargs.
 _NOT_SPLITTED: Dict[str, Callable] = {
     "Industrial_robot": Industrial_robot,                       # MIMO: 6-in / 6-out
     "WienerHammerstein_Process_Noise": WienerHammerstein_Process_Noise,  # large download
@@ -108,7 +108,7 @@ class BenchmarkData:
     """A loaded benchmark, normalized to lists of 2D ``Input_output_data``."""
     name: str
     train: List[Input_output_data]
-    test: List[Input_output_data]
+    validation: List[Input_output_data]
     n_u: int
     n_y: int
     sampling_time: Optional[float]
@@ -124,27 +124,35 @@ def _as_dataset_list(obj) -> List[Input_output_data]:
 
 
 def load_benchmark(name: str) -> BenchmarkData:
-    """Load one benchmark and normalize it to ``(train_list, test_list)`` of 2D data."""
+    """Load native splits, treating the loader's second split as validation.
+
+    The upstream package commonly calls this second split ``test``. This harness
+    intentionally uses it for validation/checkpoint selection as an experiment
+    protocol, rather than claiming strict benchmark-submission semantics.
+    """
     if name in _SPLITTED:
-        train, test = _SPLITTED[name](atleast_2d=True, always_return_tuples_of_datasets=True)
-        train_list, test_list = _as_dataset_list(train), _as_dataset_list(test)
+        train, validation = _SPLITTED[name](
+            atleast_2d=True, always_return_tuples_of_datasets=True
+        )
+        train_list = _as_dataset_list(train)
+        validation_list = _as_dataset_list(validation)
     elif name in _NOT_SPLITTED:
-        train, test = _NOT_SPLITTED[name](train_test_split=True)
+        train, validation = _NOT_SPLITTED[name](train_test_split=True)
         train_list = [d.atleast_2d() for d in _as_dataset_list(train)]
-        test_list = [d.atleast_2d() for d in _as_dataset_list(test)]
+        validation_list = [d.atleast_2d() for d in _as_dataset_list(validation)]
     else:
         raise KeyError(f"Unknown benchmark {name!r}. Available: {sorted(_ALL_LOADERS)}")
 
-    if not train_list or not test_list:
-        raise RuntimeError(f"Benchmark {name!r} produced an empty train/test split.")
+    if not train_list or not validation_list:
+        raise RuntimeError(f"Benchmark {name!r} produced an empty train/validation split.")
 
     n_u = int(train_list[0].u.shape[-1])
     n_y = int(train_list[0].y.shape[-1])
-    init_window = test_list[0].state_initialization_window_length or 0
+    init_window = validation_list[0].state_initialization_window_length or 0
     return BenchmarkData(
         name=name,
         train=train_list,
-        test=test_list,
+        validation=validation_list,
         n_u=n_u,
         n_y=n_y,
         sampling_time=getattr(train_list[0], "sampling_time", None),
@@ -207,70 +215,38 @@ class Standardizer:
 
 
 # ============================================================================
-# Windowing for open-loop simulation training
+# Complete-sequence batching for open-loop simulation training
 # ============================================================================
 
-def make_windows(
-    sequences: List[Tuple[np.ndarray, np.ndarray]],
-    *,
-    seq_len: int,
-    stride: int,
-    washout: int,
-    max_windows: Optional[int],
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
-    """Cut (already-normalized) sequences into fixed-length windows for batched training.
+NormalizedSequence = Tuple[np.ndarray, np.ndarray, int]
 
-    Each window starts from zero state; a per-window mask zeroes the loss over the
-    ``washout`` warm-up and any zero-padding (for sequences shorter than ``seq_len``),
-    so simulation training works uniformly across very different sequence lengths.
 
-    Returns ``(U, Y, M, L)`` with ``U:(Nw,L,n_u)``, ``Y:(Nw,L,n_y)``, ``M:(Nw,L)``.
-    """
-    max_len = max(len(u) for u, _ in sequences)
-    L = min(seq_len, max_len)
-    n_u = sequences[0][0].shape[-1]
-    n_y = sequences[0][1].shape[-1]
+def pack_full_sequences(
+    sequences: Sequence[NormalizedSequence],
+    indices: Sequence[int],
+    device: torch.device,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pad complete trajectories for one batch and mask padding/initialization only."""
+    selected = [sequences[int(i)] for i in indices]
+    if not selected:
+        raise ValueError("cannot pack an empty sequence batch")
 
-    u_wins, y_wins, masks = [], [], []
-    for u, y in sequences:
-        n = len(u)
-        if n >= L:
-            starts = list(range(0, n - L + 1, stride))
-            if (n - L) % stride != 0:
-                starts.append(n - L)
-        else:
-            starts = [0]
-        for s in starts:
-            seg = min(L, n - s)
-            wo = min(washout, seg // 2)        # keep at least half the window supervised
-            if seg - wo <= 0:
-                continue
-            uw = np.zeros((L, n_u), dtype=np.float32)
-            yw = np.zeros((L, n_y), dtype=np.float32)
-            mw = np.zeros((L,), dtype=np.float32)
-            uw[:seg] = u[s:s + seg]
-            yw[:seg] = y[s:s + seg]
-            mw[wo:seg] = 1.0
-            u_wins.append(uw)
-            y_wins.append(yw)
-            masks.append(mw)
+    max_len = max(len(u) for u, _, _ in selected)
+    n_u = selected[0][0].shape[-1]
+    n_y = selected[0][1].shape[-1]
+    U = torch.zeros((len(selected), max_len, n_u), dtype=torch.float32, device=device)
+    Y = torch.zeros((len(selected), max_len, n_y), dtype=torch.float32, device=device)
+    M = torch.zeros((len(selected), max_len), dtype=torch.float32, device=device)
 
-    if not u_wins:
-        raise RuntimeError("No training windows were produced (sequences too short?).")
-
-    U = torch.from_numpy(np.stack(u_wins))
-    Y = torch.from_numpy(np.stack(y_wins))
-    M = torch.from_numpy(np.stack(masks))
-
-    if max_windows is not None and U.shape[0] > max_windows:
-        g = torch.Generator().manual_seed(0)
-        idx = torch.randperm(U.shape[0], generator=g)[:max_windows]
-        dropped = U.shape[0] - max_windows
-        print(f"    [windows] capping {U.shape[0]} -> {max_windows} windows "
-              f"({dropped} dropped at random; raise --max-windows to keep all).")
-        U, Y, M = U[idx], Y[idx], M[idx]
-
-    return U, Y, M, L
+    for row, (u, y, loss_start) in enumerate(selected):
+        if len(u) != len(y):
+            raise ValueError("input and output trajectory lengths differ")
+        length = len(u)
+        start = min(max(int(loss_start), 0), length)
+        U[row, :length] = torch.as_tensor(u, dtype=torch.float32, device=device)
+        Y[row, :length] = torch.as_tensor(y, dtype=torch.float32, device=device)
+        M[row, start:length] = 1.0
+    return U, Y, M
 
 
 # ============================================================================
@@ -321,6 +297,7 @@ MODEL_ZOO: Dict[str, dict] = {
     "tv":    dict(kind="deepssm", param="tv",    gamma=5.0,  ff="MBLIP"),   # certified selective
     "tvc":   dict(kind="deepssm", param="tvc",   gamma=5.0,  ff="MBLIP"),   # certified selective LTI
     "raven": dict(kind="deepssm", param="raven", gamma=5.0,  ff="MBLIP"),   # certified Raven cell
+    "ctransformer": dict(kind="ctransformer", gamma_total=20.0),            # certified softmax transformer (conservative attn bound -> needs more budget)
     "lstm":  dict(kind="lstm",    hidden=64, layers=2),
     "gru":   dict(kind="gru",     hidden=64, layers=2),
 }
@@ -328,6 +305,20 @@ MODEL_ZOO: Dict[str, dict] = {
 
 def _count_params(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def _effective_width(model: nn.Module) -> Optional[int]:
+    """Return the width knob changed by parameter matching, when available."""
+    core = getattr(model, "core", None)
+    if core is not None:
+        return int(core.config.d_model)
+    rnn = getattr(model, "rnn", None)
+    if rnn is not None:
+        return int(rnn.hidden_size)
+    encoder = getattr(model, "encoder", None)
+    if encoder is not None and hasattr(encoder, "d_out"):
+        return int(encoder.d_out)
+    return None
 
 
 def _make_ssm_config(spec: dict, gconf: "GlobalModelConfig") -> SSMConfig:
@@ -342,7 +333,20 @@ def _make_ssm_config(spec: dict, gconf: "GlobalModelConfig") -> SSMConfig:
         d_hidden=gconf.d_hidden, nl_layers=gconf.nl_layers, scale=gconf.scale,
         param=spec["param"], gamma=gamma, ff=ff, init=gconf.init,
         train_gamma=True, learn_x0=False,
+        rmin=gconf.lru_rmin, rmax=gconf.lru_rmax, max_phase=gconf.lru_max_phase,
+        l2ru_eye_scale=gconf.l2ru_eye_scale, l2ru_rand_scale=gconf.l2ru_rand_scale,
+        rho=gconf.l2n_rho, max_phase_b=gconf.l2n_max_phase,
+        phase_center=gconf.l2n_phase_center, random_phase=gconf.l2n_random_phase,
+        offdiag_scale=gconf.l2n_offdiag_scale,
+        tv_init_rho=gconf.tv_init_rho, tv_init_delta0=gconf.tv_init_delta0,
+        tv_init_param_scale=gconf.tv_init_param_scale,
+        tvc_init_rho=gconf.tvc_init_rho, tvc_init_delta0=gconf.tvc_init_delta0,
+        tvc_init_param_scale=gconf.tvc_init_param_scale,
+        tvc_init_sign=gconf.tvc_init_sign,
+        tvc_init_b=gconf.tvc_init_b, tvc_init_c=gconf.tvc_init_c,
+        tvc_init_d=gconf.tvc_init_d,
         raven_heads=gconf.raven_heads, raven_slots=gconf.raven_slots, raven_top_k=gconf.raven_top_k,
+        per_channel_gates=gconf.per_channel_gates,
     )
 
 
@@ -395,11 +399,14 @@ def build_model(name: str, n_u: int, n_y: int, gconf: "GlobalModelConfig",
 
     if kind == "deepssm":
         if param_budget and param_budget > 0:
-            best = _closest_width(
-                lambda w: _count_params(
-                    DeepSSMSim(n_u, n_y, _make_ssm_config(spec, replace(gconf, d_model=w)))),
-                param_budget, lo=max(2, gconf.raven_heads),
-            )
+            # Width probes construct temporary modules. Isolate their RNG use so
+            # parameter matching does not change the final seeded initialization.
+            with torch.random.fork_rng(devices=[]):
+                best = _closest_width(
+                    lambda w: _count_params(
+                        DeepSSMSim(n_u, n_y, _make_ssm_config(spec, replace(gconf, d_model=w)))),
+                    param_budget, lo=max(2, gconf.raven_heads),
+                )
             gconf = replace(gconf, d_model=best)
         if spec.get("param") == "l2n" and gconf.d_state % 2 != 0:
             raise ValueError(
@@ -410,13 +417,64 @@ def build_model(name: str, n_u: int, n_y: int, gconf: "GlobalModelConfig",
 
     if kind in ("lstm", "gru"):
         if param_budget and param_budget > 0:
-            spec["hidden"] = _closest_width(
-                lambda w: _count_params(RNNSim(n_u, n_y, kind=kind, hidden=w, layers=spec["layers"])),
-                param_budget,
-            )
+            with torch.random.fork_rng(devices=[]):
+                spec["hidden"] = _closest_width(
+                    lambda w: _count_params(
+                        RNNSim(n_u, n_y, kind=kind, hidden=w, layers=spec["layers"])
+                    ),
+                    param_budget,
+                )
         return RNNSim(n_u, n_y, kind=kind, hidden=spec["hidden"], layers=spec["layers"])
 
+    if kind == "ctransformer":
+        gt = float(spec.get("gamma_total", 5.0))
+        ov = str(gconf.gamma_override).lower()
+        if ov not in ("auto", "none", ""):
+            gt = float(gconf.gamma_override)
+
+        def _make_ct(dm):
+            # Causal: simulation must not peek at future inputs. FFN width scales with
+            # d_model (avoids a bottleneck when param-matching inflates d_model).
+            return CertifiedTransformer(
+                d_input=n_u, d_model=int(dm), d_output=n_y,
+                n_layers=max(1, gconf.n_layers), n_heads=gconf.raven_heads,
+                d_ff=max(int(gconf.d_hidden), 2 * int(dm)), gamma_total=gt, causal=True,
+                max_len=16384,
+            )
+
+        if param_budget and param_budget > 0:
+            with torch.random.fork_rng(devices=[]):
+                best = _closest_width(lambda w: _count_params(_make_ct(w)), param_budget,
+                                      lo=max(2, gconf.raven_heads))
+            return _make_ct(best)
+        return _make_ct(gconf.d_model)
+
     raise ValueError(f"Unknown model kind {kind!r}.")
+
+
+def resolve_param_budget(value: object, n_u: int, n_y: int,
+                         gconf: "GlobalModelConfig") -> Tuple[int, str]:
+    """Resolve an integer/off/model-name parameter-budget CLI value.
+
+    A model name means "use that model's unscaled trainable parameter count".
+    This is resolved per benchmark because input/output dimensions affect it.
+    """
+    token = str(value).strip().lower()
+    if token in ("", "0", "off", "none"):
+        return 0, "off"
+    if token in MODEL_ZOO:
+        reference = build_model(token, n_u, n_y, gconf, param_budget=0)
+        return _count_params(reference), f"reference:{token}"
+    try:
+        budget = int(token)
+    except ValueError as exc:
+        raise ValueError(
+            "--param-budget must be a positive integer, 'off', or a model name "
+            f"from {sorted(MODEL_ZOO)}; got {value!r}."
+        ) from exc
+    if budget <= 0:
+        raise ValueError(f"--param-budget must be positive or 'off'; got {value!r}.")
+    return budget, "fixed"
 
 
 @dataclass
@@ -430,9 +488,106 @@ class GlobalModelConfig:
     raven_heads: int = 4
     raven_slots: int = 8
     raven_top_k: int = 2
+    per_channel_gates: bool = False
+    lru_rmin: float = 0.8
+    lru_rmax: float = 0.95
+    lru_max_phase: float = 2.0 * math.pi
+    l2ru_eye_scale: float = 0.01
+    l2ru_rand_scale: float = 1.0
+    l2n_rho: float = 0.9
+    l2n_max_phase: float = 0.04
+    l2n_phase_center: float = 0.0
+    l2n_random_phase: bool = True
+    l2n_offdiag_scale: float = 0.05
+    tv_init_rho: float = 0.99
+    tv_init_delta0: float = 1.0
+    tv_init_param_scale: float = 0.02
+    tvc_init_rho: float = 0.9
+    tvc_init_delta0: float = 1.0
+    tvc_init_param_scale: float = 0.02
+    tvc_init_sign: float = 0.995
+    tvc_init_b: float = 0.10
+    tvc_init_c: float = 0.10
+    tvc_init_d: float = 0.10
     init: str = "eye"                      # recurrent-cell init for l2ru/zak/...
     gamma_override: str = "none"           # "auto" (per-model), "none", or a float string
     ff_override: Optional[str] = "GLU"      # override the per-model feedforward
+
+
+def _validate_initialization(models: Sequence[str], cfg: GlobalModelConfig) -> None:
+    """Validate only the initialization settings used by selected models."""
+    selected = set(models)
+
+    def finite(**values):
+        for option, value in values.items():
+            if not math.isfinite(value):
+                raise ValueError(f"--{option.replace('_', '-')} must be finite, got {value}.")
+
+    if "lru" in selected:
+        finite(lru_rmin=cfg.lru_rmin, lru_rmax=cfg.lru_rmax,
+               lru_max_phase=cfg.lru_max_phase)
+        if not 0.0 < cfg.lru_rmin < cfg.lru_rmax < 1.0:
+            raise ValueError("LRU requires 0 < --lru-rmin < --lru-rmax < 1.")
+        if cfg.lru_max_phase <= 0.0:
+            raise ValueError("--lru-max-phase must be positive.")
+
+    if "l2ru" in selected:
+        finite(l2ru_eye_scale=cfg.l2ru_eye_scale,
+               l2ru_rand_scale=cfg.l2ru_rand_scale)
+        if cfg.init not in ("eye", "rand"):
+            raise ValueError("--init must be 'eye' or 'rand' for L2RU.")
+        if cfg.l2ru_eye_scale < 0.0 or cfg.l2ru_rand_scale < 0.0:
+            raise ValueError("L2RU initialization scales must be non-negative.")
+
+    if "l2n" in selected:
+        finite(l2n_rho=cfg.l2n_rho, l2n_max_phase=cfg.l2n_max_phase,
+               l2n_phase_center=cfg.l2n_phase_center,
+               l2n_offdiag_scale=cfg.l2n_offdiag_scale)
+        if not 0.0 < cfg.l2n_rho < 1.0:
+            raise ValueError("--l2n-rho must be in (0, 1).")
+        if cfg.l2n_max_phase < 0.0 or cfg.l2n_offdiag_scale < 0.0:
+            raise ValueError("L2N phase width and off-diagonal scale must be non-negative.")
+
+    if "tv" in selected:
+        finite(tv_init_rho=cfg.tv_init_rho, tv_init_delta0=cfg.tv_init_delta0,
+               tv_init_param_scale=cfg.tv_init_param_scale)
+        if not 0.0 < cfg.tv_init_rho < 1.0:
+            raise ValueError("--tv-init-rho must be in (0, 1).")
+        if cfg.tv_init_delta0 <= 0.0 or cfg.tv_init_param_scale < 0.0:
+            raise ValueError("TV delta0 must be positive and parameter scale non-negative.")
+
+    if "tvc" in selected:
+        finite(tvc_init_rho=cfg.tvc_init_rho, tvc_init_delta0=cfg.tvc_init_delta0,
+               tvc_init_param_scale=cfg.tvc_init_param_scale,
+               tvc_init_sign=cfg.tvc_init_sign, tvc_init_b=cfg.tvc_init_b,
+               tvc_init_c=cfg.tvc_init_c, tvc_init_d=cfg.tvc_init_d)
+        if not 0.0 < cfg.tvc_init_rho < 1.0:
+            raise ValueError("--tvc-init-rho must be in (0, 1).")
+        if cfg.tvc_init_delta0 <= 0.0 or cfg.tvc_init_param_scale < 0.0:
+            raise ValueError("TVC delta0 must be positive and parameter scale non-negative.")
+        if not -1.0 < cfg.tvc_init_sign < 1.0:
+            raise ValueError("--tvc-init-sign must be strictly between -1 and 1.")
+        if any(abs(v) > 0.99 for v in (cfg.tvc_init_b, cfg.tvc_init_c, cfg.tvc_init_d)):
+            raise ValueError("TVC initial b, c, and d must each be in [-0.99, 0.99].")
+
+
+def _initialization_metadata(cfg: GlobalModelConfig) -> dict:
+    return {
+        "lru": {"rmin": cfg.lru_rmin, "rmax": cfg.lru_rmax,
+                "max_phase": cfg.lru_max_phase},
+        "l2ru": {"mode": cfg.init, "eye_scale": cfg.l2ru_eye_scale,
+                 "rand_scale": cfg.l2ru_rand_scale},
+        "l2n": {"rho": cfg.l2n_rho, "max_phase": cfg.l2n_max_phase,
+                "phase_center": cfg.l2n_phase_center,
+                "random_phase": cfg.l2n_random_phase,
+                "offdiag_scale": cfg.l2n_offdiag_scale},
+        "tv": {"rho": cfg.tv_init_rho, "delta0": cfg.tv_init_delta0,
+               "param_scale": cfg.tv_init_param_scale},
+        "tvc": {"rho": cfg.tvc_init_rho, "delta0": cfg.tvc_init_delta0,
+                "param_scale": cfg.tvc_init_param_scale,
+                "sign": cfg.tvc_init_sign, "b": cfg.tvc_init_b,
+                "c": cfg.tvc_init_c, "d": cfg.tvc_init_d},
+    }
 
 
 # ============================================================================
@@ -481,26 +636,8 @@ class TrainConfig:
     lr: float = 3e-3
     weight_decay: float = 0.0
     grad_clip: float = 1.0
-    seq_len: int = 1024
-    stride: Optional[int] = None       # default: non-overlapping (= L)
-    washout: int = 50
-    val_frac: float = 0.2
-    max_windows: Optional[int] = 4000
     amp: bool = False
     seed: int = 0
-
-
-def _split_tail(seqs, frac):
-    """Per-sequence time split into (head, tail) by fraction; tail used for validation."""
-    head, tail = [], []
-    for u, y in seqs:
-        n = len(u)
-        cut = int(round(n * (1.0 - frac)))
-        cut = min(max(cut, 1), n - 1) if n > 1 else n
-        head.append((u[:cut], y[:cut]))
-        if frac > 0 and cut < n:
-            tail.append((u[cut:], y[cut:]))
-    return head, tail
 
 
 def train_model(
@@ -511,37 +648,27 @@ def train_model(
     device: torch.device,
     monitor: "Optional[TrainingMonitor]" = None,
 ) -> dict:
-    """Windowed open-loop simulation training for the full epoch schedule.
+    """Open-loop training on complete native trajectories for the full schedule.
 
-    Validation loss is tracked for the live plot / report only; training is not
-    stopped early and the final model (not a best checkpoint) is returned.
+    The loader-provided second-split trajectories are never sliced or used for
+    optimization. Validation loss selects the returned checkpoint.
     """
     model.to(device)
     rng = np.random.default_rng(tcfg.seed)
 
-    # Normalize all train sequences, then per-sequence tail-split into train/val.
-    def _norm_pair(d):
+    def _norm_pair(d, *, use_initialization_window: bool) -> NormalizedSequence:
         u = norm.norm_u(torch.from_numpy(d.u.astype(np.float32))).numpy()
         y = norm.norm_y(torch.from_numpy(d.y.astype(np.float32))).numpy()
-        return u, y
+        loss_start = int(d.state_initialization_window_length or 0) if use_initialization_window else 0
+        return u, y, loss_start
 
-    norm_seqs = [_norm_pair(d) for d in bench.train]
-    train_seqs, val_seqs = _split_tail(norm_seqs, tcfg.val_frac)
-
-    stride = tcfg.stride or tcfg.seq_len
-    Ut, Yt, Mt, L = make_windows(
-        train_seqs, seq_len=tcfg.seq_len, stride=stride,
-        washout=tcfg.washout, max_windows=tcfg.max_windows,
-    )
-    Ut, Yt, Mt = Ut.to(device), Yt.to(device), Mt.to(device)
-
-    has_val = len(val_seqs) > 0
-    if has_val:
-        Uv, Yv, Mv, _ = make_windows(
-            val_seqs, seq_len=L, stride=L, washout=min(tcfg.washout, L // 2),
-            max_windows=tcfg.max_windows,
-        )
-        Uv, Yv, Mv = Uv.to(device), Yv.to(device), Mv.to(device)
+    # Every training sample contributes to optimization. For validation, the
+    # complete signal initializes the state while the official prefix is masked
+    # from the metric, matching nonlinear_benchmarks.error_metrics.
+    train_seqs = [_norm_pair(d, use_initialization_window=False) for d in bench.train]
+    val_seqs = [
+        _norm_pair(d, use_initialization_window=True) for d in bench.validation
+    ]
 
     n_y = bench.n_y
     opt = torch.optim.AdamW(model.parameters(), lr=tcfg.lr, weight_decay=tcfg.weight_decay)
@@ -554,49 +681,53 @@ def train_model(
         return diff2.sum() / (mask.sum().clamp_min(1.0) * n_y)
 
     @torch.no_grad()
-    def eval_windows(U, Y, M):
+    def eval_sequences(sequences):
         model.eval()
-        if U.shape[0] == 0:
-            return 0.0
-        tot = torch.zeros((), device=device)  # accumulate on-device; one host sync at the end
-        for i in range(0, U.shape[0], tcfg.batch_size):
-            pred = model(U[i:i + tcfg.batch_size])
-            m = M[i:i + tcfg.batch_size]
-            tot = tot + (((pred - Y[i:i + tcfg.batch_size]) ** 2) * m.unsqueeze(-1)).sum()
-        denom = (M.sum() * n_y).clamp_min(1.0)
+        tot = torch.zeros((), device=device)
+        denom = torch.zeros((), device=device)
+        for i in range(0, len(sequences), tcfg.batch_size):
+            batch_indices = range(i, min(i + tcfg.batch_size, len(sequences)))
+            U, Y, M = pack_full_sequences(sequences, batch_indices, device)
+            pred = model(U)
+            tot = tot + (((pred - Y) ** 2) * M.unsqueeze(-1)).sum()
+            denom = denom + M.sum() * n_y
+        denom = denom.clamp_min(1.0)
         return (tot / denom).item()
 
-    n_win = Ut.shape[0]
+    n_train = len(train_seqs)
     train_losses, val_losses = [], []
     best_val, best_state, best_epoch = float("inf"), None, 0
     t0 = time.time()
 
     for epoch in range(tcfg.epochs):
         model.train()
-        perm = torch.from_numpy(rng.permutation(n_win)).to(device)
-        running, seen = torch.zeros((), device=device), 0
-        for i in range(0, n_win, tcfg.batch_size):
+        perm = rng.permutation(n_train)
+        running = torch.zeros((), device=device)
+        seen = torch.zeros((), device=device)
+        for i in range(0, n_train, tcfg.batch_size):
             idx = perm[i:i + tcfg.batch_size]
+            Ut, Yt, Mt = pack_full_sequences(train_seqs, idx, device)
             opt.zero_grad(set_to_none=True)
             # autocast only when AMP is active (CUDA). Avoid passing 'mps'/'cpu' to
             # torch.autocast, which can raise on some torch builds even when disabled.
             amp_ctx = torch.autocast(device_type="cuda") if use_amp else contextlib.nullcontext()
             with amp_ctx:
-                pred = model(Ut[idx])
-                loss = masked_mse(pred, Yt[idx], Mt[idx])
+                pred = model(Ut)
+                loss = masked_mse(pred, Yt, Mt)
             scaler.scale(loss).backward()
             if tcfg.grad_clip:
                 scaler.unscale_(opt)
                 nn.utils.clip_grad_norm_(model.parameters(), tcfg.grad_clip)
             scaler.step(opt)
             scaler.update()
-            running = running + loss.detach() * idx.numel()
-            seen += idx.numel()
+            valid_values = Mt.sum() * n_y
+            running = running + loss.detach() * valid_values
+            seen = seen + valid_values
         sched.step()
-        train_loss = (running / max(seen, 1)).item()  # single host sync per epoch
+        train_loss = (running / seen.clamp_min(1.0)).item()
         train_losses.append(train_loss)
 
-        val_loss = eval_windows(Uv, Yv, Mv) if has_val else train_loss
+        val_loss = eval_sequences(val_seqs)
         val_losses.append(val_loss)
         if val_loss < best_val:
             best_val, best_epoch = val_loss, epoch
@@ -605,8 +736,7 @@ def train_model(
         if monitor is not None:
             monitor.update(epoch, train_losses, val_losses, model)
 
-    # No early stopping (full schedule runs), but restore the best-validation
-    # checkpoint so the model evaluated / plotted / reported is the best one.
+    # No early stopping (full schedule runs), but restore the best-validation checkpoint.
     if best_state is not None:
         model.load_state_dict(best_state)
     return {
@@ -617,8 +747,10 @@ def train_model(
         "final_val_loss": val_losses[-1] if val_losses else float("inf"),
         "epochs_run": len(train_losses),
         "train_time_s": time.time() - t0,
-        "n_windows": int(n_win),
-        "window_len": int(L),
+        "n_train_sequences": int(n_train),
+        "n_validation_sequences": int(len(val_seqs)),
+        "train_samples": int(sum(len(u) for u, _, _ in train_seqs)),
+        "validation_samples": int(sum(len(u) for u, _, _ in val_seqs)),
     }
 
 
@@ -626,11 +758,11 @@ def train_model(
 # Evaluation
 # ============================================================================
 
-def evaluate(model: nn.Module, bench: BenchmarkData, norm: Standardizer,
-             device: torch.device) -> Tuple[List[dict], List[np.ndarray]]:
-    """Per-test-sequence metrics (physical units) + the predictions for plotting."""
+def evaluate_validation(model: nn.Module, bench: BenchmarkData, norm: Standardizer,
+                        device: torch.device) -> Tuple[List[dict], List[np.ndarray]]:
+    """Per-validation-trajectory metrics in physical units, plus predictions."""
     rows, preds = [], []
-    for d in bench.test:
+    for d in bench.validation:
         y_pred = simulate(model, d.u, norm, device)        # (T,n_y) physical
         # Package metrics auto-skip d.state_initialization_window_length.
         rmse = np.atleast_1d(RMSE(d, y_pred))
@@ -639,7 +771,7 @@ def evaluate(model: nn.Module, bench: BenchmarkData, norm: Standardizer,
         mae = np.atleast_1d(MAE(d, y_pred))
         fit = np.atleast_1d(fit_index(d, y_pred))
         rows.append({
-            "test_name": d.name or "test",
+            "validation_name": d.name or "validation",
             "rmse": float(rmse.mean()), "rmse_per_channel": rmse.tolist(),
             "nrmse": float(nrmse.mean()),
             "r2": float(r2.mean()),
@@ -669,8 +801,8 @@ class TrainingMonitor:
 
     Dark theme, glow lines, blitted + tweened updates, a loss-trajectory panel
     with the best-val marker, and epoch/stats overlays. SISO shows a training-
-    and a test-sequence prediction panel (as in Benchmark.py); MIMO shows up to
-    ``max_channels`` per-output-channel panels of the test sequence. Each update
+    and a validation-sequence prediction panel; MIMO shows up to
+    ``max_channels`` per-output-channel panels of the validation sequence. Each update
     also captures a frame so the same animation is exported as a GIF (headless).
     """
 
@@ -686,6 +818,9 @@ class TrainingMonitor:
         self.norm = norm
         self.device = device
         self.plot_every = max(1, plot_every)
+        if max_preview_len <= 0:
+            raise ValueError("max_preview_len must be positive")
+        self.max_preview_len = int(max_preview_len)
         self.gif = gif
         self.show = show
         self.total_epochs = max(1, total_epochs)
@@ -699,27 +834,27 @@ class TrainingMonitor:
         def _slice(d):
             u = np.asarray(d.u, dtype=np.float32)
             y = np.asarray(d.y, dtype=np.float32)
-            if len(u) > max_preview_len:
-                u, y = u[:max_preview_len], y[:max_preview_len]
+            if len(u) > self.max_preview_len:
+                u, y = u[:self.max_preview_len], y[:self.max_preview_len]
             return u, y
 
-        # Pick preview sequences + panels: SISO = train+test, MIMO = test channels.
-        test_u, test_y = _slice(bench.test[0])
+        # Pick preview sequences + panels: SISO = train+validation, MIMO = validation channels.
+        val_u, val_y = _slice(bench.validation[0])
         if bench.n_y == 1:
             train_u, train_y = _slice(bench.train[0])
-            self._previews = {"train": (train_u, train_y), "test": (test_u, test_y)}
+            self._previews = {"train": (train_u, train_y), "validation": (val_u, val_y)}
             self._panels = [
                 dict(source="train", channel=0, title="Training sequence",
                      color=self._PALETTE[0], init_window=0),
-                dict(source="test", channel=0, title="Test sequence",
+                dict(source="validation", channel=0, title="Validation sequence",
                      color=self._PALETTE[1], init_window=bench.init_window),
             ]
             self._layout = "pair"
         else:
-            self._previews = {"test": (test_u, test_y)}
+            self._previews = {"validation": (val_u, val_y)}
             n_show = min(max_channels, bench.n_y)
             self._panels = [
-                dict(source="test", channel=c, title=f"output $y_{{{c + 1}}}$",
+                dict(source="validation", channel=c, title=f"output $y_{{{c + 1}}}$",
                      color=self._PALETTE[c % len(self._PALETTE)],
                      init_window=bench.init_window)
                 for c in range(n_show)
@@ -1112,8 +1247,24 @@ def write_reports(results: List[dict], out_dir: Path, meta: dict,
     lines = ["# Nonlinear-benchmarks report", ""]
     lines.append(f"- generated: {meta['timestamp']}")
     lines.append(f"- device: `{meta['device']}`  · dtype: `{meta['dtype']}`  · seed: {meta['seed']}")
-    lines.append(f"- epochs: {meta['epochs']}  · batch: {meta['batch_size']}  · "
-                 f"seq_len: {meta['seq_len']}  · model dims: {meta['model_dims']}")
+    lines.append(f"- epochs: {meta['epochs']}  · trajectory batch: {meta['batch_size']}  · "
+                 f"model dims: {meta['model_dims']}")
+    lines.append("- data protocol: complete native training and validation trajectories; no windows")
+    lines.append(f"- live-plot trajectory preview: first {meta['plot_max_length']} samples")
+    lines.append(f"- optimizer: AdamW  · lr: {meta['lr']}  · weight decay: {meta['weight_decay']}  · "
+                 f"gradient clip: {meta['grad_clip']}")
+    gate_mode = "per-channel" if meta["per_channel_gates"] else "scalar"
+    lines.append(f"- model policy: parameter budget `{meta['param_budget']}`  · "
+                 f"gamma `{meta['gamma']}`  · feedforward `{meta['ff']}`  · "
+                 f"residual gates `{gate_mode}`")
+    present_models = {r.get("model") for r in results}
+    for model, settings in meta["model_initialization"].items():
+        if model in present_models:
+            values = "  · ".join(f"{key} {value}" for key, value in settings.items())
+            lines.append(f"- {model.upper()} init: {values}")
+    lines.append("")
+    lines.append("> Parameter matching controls trainable model size, not optimization difficulty. "
+                 "Gain-certified models remain more constrained than the unconstrained LSTM/GRU baselines.")
     lines.append("")
 
     if summary_paths:
@@ -1133,7 +1284,7 @@ def write_reports(results: List[dict], out_dir: Path, meta: dict,
         n_y = rows[0].get("n_y", "?")
         lines.append(f"## {bench}  (n_u={n_u}, n_y={n_y})")
         lines.append("")
-        lines.append("| model | params | RMSE | NRMSE | fit % | R² | best val | best ep | epochs | train s | status |")
+        lines.append("| model | params | mean RMSE | mean NRMSE | mean fit % | mean R² | best val | best ep | epochs | train s | status |")
         lines.append("|---|---|---|---|---|---|---|---|---|---|---|")
         for r in sorted(rows, key=lambda x: (x.get("rmse") is None, x.get("rmse", math.inf))):
             lines.append("| {model} | {params} | {rmse} | {nrmse} | {fit} | {r2} | "
@@ -1153,18 +1304,18 @@ def write_reports(results: List[dict], out_dir: Path, meta: dict,
             lines.append("")
             lines.append(f"**Best model (by validation loss): `{bm['model']}`** — "
                          f"val {_fmt(bm['best_val_loss'])} @ epoch {bm.get('best_epoch', '?')}, "
-                         f"test RMSE {_fmt(bm.get('rmse'))}, fit {_fmt(bm.get('fit'))}%.")
-        # Per-test-sequence detail when a split has several test signals.
+                         f"validation RMSE {_fmt(bm.get('rmse'))}, fit {_fmt(bm.get('fit'))}%.")
+        # Per-validation-sequence detail when a split has several signals.
         for r in rows:
-            seqs = r.get("test_sequences", [])
+            seqs = r.get("validation_sequences", [])
             if len(seqs) > 1:
                 lines.append("")
-                lines.append(f"<details><summary>{r['model']}: per-test-sequence</summary>")
+                lines.append(f"<details><summary>{r['model']}: per-validation-sequence</summary>")
                 lines.append("")
-                lines.append("| test sequence | RMSE | NRMSE | fit % |")
+                lines.append("| validation sequence | RMSE | NRMSE | fit % |")
                 lines.append("|---|---|---|---|")
                 for s in seqs:
-                    lines.append(f"| {s['test_name']} | {_fmt(s['rmse'])} | "
+                    lines.append(f"| {s['validation_name']} | {_fmt(s['rmse'])} | "
                                  f"{_fmt(s['nrmse'])} | {_fmt(s['fit'])} |")
                 lines.append("</details>")
         if rows[0].get("artifacts"):
@@ -1191,6 +1342,16 @@ def set_seed(seed: int):
         torch.cuda.manual_seed_all(seed)
 
 
+def _positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
 def run(args) -> None:
     device = pick_device(args.device)
     if device.type == "cuda":
@@ -1206,13 +1367,34 @@ def run(args) -> None:
         d_model=args.d_model, d_state=args.d_state, n_layers=args.n_layers,
         d_hidden=args.d_hidden, nl_layers=args.nl_layers,
         raven_heads=args.raven_heads, raven_slots=args.raven_slots, raven_top_k=args.raven_top_k,
+        per_channel_gates=args.per_channel_gates,
+        lru_rmin=args.lru_rmin, lru_rmax=args.lru_rmax,
+        lru_max_phase=args.lru_max_phase,
+        l2ru_eye_scale=args.l2ru_eye_scale,
+        l2ru_rand_scale=args.l2ru_rand_scale,
+        l2n_rho=args.l2n_rho, l2n_max_phase=args.l2n_max_phase,
+        l2n_phase_center=args.l2n_phase_center,
+        l2n_random_phase=args.l2n_random_phase,
+        l2n_offdiag_scale=args.l2n_offdiag_scale,
+        tv_init_rho=args.tv_init_rho,
+        tv_init_delta0=args.tv_init_delta0,
+        tv_init_param_scale=args.tv_init_param_scale,
+        tvc_init_rho=args.tvc_init_rho,
+        tvc_init_delta0=args.tvc_init_delta0,
+        tvc_init_param_scale=args.tvc_init_param_scale,
+        tvc_init_sign=args.tvc_init_sign,
+        tvc_init_b=args.tvc_init_b, tvc_init_c=args.tvc_init_c,
+        tvc_init_d=args.tvc_init_d,
         init=args.init, gamma_override=args.gamma, ff_override=args.ff,
     )
+    try:
+        _validate_initialization(args.models, gconf)
+    except ValueError as exc:
+        raise SystemExit(f"Invalid initialization setting: {exc}") from exc
     tcfg = TrainConfig(
         epochs=args.epochs, batch_size=args.batch_size, lr=args.lr,
         weight_decay=args.weight_decay, grad_clip=args.grad_clip,
-        seq_len=args.seq_len, stride=args.stride, washout=args.washout,
-        val_frac=args.val_frac, max_windows=args.max_windows, amp=args.amp, seed=args.seed,
+        amp=args.amp, seed=args.seed,
     )
 
     bench_names = resolve_benchmark_names(args.benchmarks)
@@ -1240,10 +1422,22 @@ def run(args) -> None:
             print(f"  [skip] failed to load {bname}: {exc}")
             continue
         print(f"  loaded: n_u={bench.n_u} n_y={bench.n_y} "
-              f"train_seqs={len(bench.train)} test_seqs={len(bench.test)} "
+              f"train_seqs={len(bench.train)} validation_seqs={len(bench.validation)} "
               f"init_window={bench.init_window} "
-              f"train_len={[len(d) for d in bench.train][:6]}{'...' if len(bench.train) > 6 else ''}")
+              f"train_len={[len(d) for d in bench.train][:6]}{'...' if len(bench.train) > 6 else ''} "
+              f"validation_len={[len(d) for d in bench.validation][:6]}"
+              f"{'...' if len(bench.validation) > 6 else ''}")
         norm = Standardizer.fit(bench.train)
+        try:
+            param_budget, budget_policy = resolve_param_budget(
+                args.param_budget, bench.n_u, bench.n_y, gconf,
+            )
+        except Exception as exc:
+            raise SystemExit(f"Invalid parameter-budget policy: {exc}") from exc
+        if param_budget:
+            print(f"  parameter matching: {budget_policy} -> {param_budget} trainable parameters")
+        else:
+            print("  parameter matching: off (using each architecture's raw width defaults)")
 
         for mname in args.models:
             if mname not in MODEL_ZOO:
@@ -1256,14 +1450,15 @@ def run(args) -> None:
             try:
                 set_seed(args.seed)
                 model = build_model(mname, bench.n_u, bench.n_y, gconf,
-                                    param_budget=args.param_budget)
-                rec["n_params"] = sum(p.numel() for p in model.parameters())
-                if args.param_budget:
-                    core = getattr(model, "core", None)
-                    rec["width_eff"] = (core.config.d_model if core is not None
-                                        else getattr(getattr(model, "rnn", None), "hidden_size", None))
+                                    param_budget=param_budget)
+                rec["n_params"] = _count_params(model)
+                rec["n_params_total"] = sum(p.numel() for p in model.parameters())
+                rec["width_eff"] = _effective_width(model)
+                rec["param_budget"] = param_budget or None
+                rec["param_budget_policy"] = budget_policy
+                if param_budget:
                     print(f"     [param-match] width={rec['width_eff']} -> "
-                          f"{rec['n_params']} params (target {args.param_budget})")
+                          f"{rec['n_params']} trainable params (target {param_budget})")
 
                 monitor = None
                 if not args.no_plot:
@@ -1271,20 +1466,31 @@ def run(args) -> None:
                         out_dir=run_dir, bench=bench, model_name=mname, norm=norm,
                         device=device, total_epochs=tcfg.epochs,
                         plot_every=args.plot_every, gif=not args.no_gif, show=show_live,
+                        max_preview_len=args.plot_max_length,
                     )
 
                 hist = train_model(model, bench, norm, tcfg, device, monitor)
                 rec.update({k: hist[k] for k in
                             ("best_val_loss", "final_val_loss", "best_epoch", "epochs_run",
-                             "train_time_s", "n_windows", "window_len")})
+                             "train_time_s", "n_train_sequences", "n_validation_sequences",
+                             "train_samples", "validation_samples")})
 
-                seq_rows, _ = evaluate(model, bench, norm, device)
-                rec["test_sequences"] = seq_rows
+                seq_rows, _ = evaluate_validation(model, bench, norm, device)
+                rec["validation_sequences"] = seq_rows
                 rec["rmse"] = float(np.mean([s["rmse"] for s in seq_rows]))
                 rec["nrmse"] = float(np.mean([s["nrmse"] for s in seq_rows]))
                 rec["r2"] = float(np.mean([s["r2"] for s in seq_rows]))
                 rec["mae"] = float(np.mean([s["mae"] for s in seq_rows]))
                 rec["fit"] = float(np.mean([s["fit"] for s in seq_rows]))
+
+                if len(seq_rows) > 1:
+                    print("     validation trajectories:")
+                    for split in seq_rows:
+                        print(
+                            f"       {split['validation_name']}: "
+                            f"RMSE={split['rmse']:.4g}  "
+                            f"NRMSE={split['nrmse']:.4g}  fit={split['fit']:.3g}%"
+                        )
 
                 diag = model.diagnostics() if hasattr(model, "diagnostics") else None
                 if diag is not None:
@@ -1313,7 +1519,12 @@ def run(args) -> None:
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         "device": str(device), "dtype": "float16-amp" if tcfg.amp else "float32",
         "seed": args.seed, "epochs": tcfg.epochs, "batch_size": tcfg.batch_size,
-        "seq_len": tcfg.seq_len,
+        "data_protocol": "complete_native_splits_no_windows",
+        "plot_max_length": args.plot_max_length,
+        "lr": tcfg.lr, "weight_decay": tcfg.weight_decay, "grad_clip": tcfg.grad_clip,
+        "gamma": args.gamma, "ff": args.ff, "param_budget": args.param_budget,
+        "per_channel_gates": gconf.per_channel_gates,
+        "model_initialization": _initialization_metadata(gconf),
         "model_dims": f"d_model={gconf.d_model},d_state={gconf.d_state},n_layers={gconf.n_layers}",
     }
     console_table(results)
@@ -1328,7 +1539,7 @@ def run(args) -> None:
             bm = min(ok, key=lambda r: r["best_val_loss"])
             print(f"Best on {b} (by val loss): {bm['model']}  "
                   f"(val {_fmt(bm['best_val_loss'])} @ epoch {bm.get('best_epoch', '?')}, "
-                  f"test RMSE {_fmt(bm.get('rmse'))}, fit {_fmt(bm.get('fit'))}%)")
+                  f"validation RMSE {_fmt(bm.get('rmse'))}, fit {_fmt(bm.get('fit'))}%)")
 
     try:
         summary_paths = write_summary_plots(results, out_root, metric=args.report_metric)
@@ -1357,11 +1568,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--lr", type=float, default=3e-3)
     p.add_argument("--weight-decay", type=float, default=0.0)
     p.add_argument("--grad-clip", type=float, default=1.0)
-    p.add_argument("--seq-len", type=int, default=1024)
-    p.add_argument("--stride", type=int, default=None)
-    p.add_argument("--washout", type=int, default=50)
-    p.add_argument("--val-frac", type=float, default=0.2)
-    p.add_argument("--max-windows", type=int, default=4000)
     p.add_argument("--amp", action="store_true", help="cuda mixed precision (loosens certified caps)")
     p.add_argument("--seed", type=int, default=0)
     # model dims
@@ -1373,7 +1579,52 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--raven-heads", type=int, default=4)
     p.add_argument("--raven-slots", type=int, default=8)
     p.add_argument("--raven-top-k", type=int, default=2)
-    p.add_argument("--init", default="eye", help="recurrent-cell init: eye | rand (l2ru/zak/...)")
+    p.add_argument("--per-channel-gates", action="store_true",
+                   help="Use per-channel (d_model-dim) residual gates instead of scalar gates "
+                        "in DeepSSM layers. Certified models use the worst-channel gain.")
+    # Model-specific initialization. The desktop UI reveals these conditionally.
+    p.add_argument("--lru-rmin", type=float, default=0.8,
+                   help="LRU minimum initial pole radius")
+    p.add_argument("--lru-rmax", type=float, default=0.95,
+                   help="LRU maximum initial pole radius")
+    p.add_argument("--lru-max-phase", type=float, default=2.0 * math.pi,
+                   help="LRU maximum initial pole phase in radians")
+    p.add_argument("--l2ru-eye-scale", type=float, default=0.01,
+                   help="L2RU triangular-factor scale for eye initialization")
+    p.add_argument("--l2ru-rand-scale", type=float, default=1.0,
+                   help="L2RU free-matrix standard deviation for random initialization")
+    p.add_argument("--l2n-rho", type=float, default=0.9,
+                   help="L2N target initial recurrent pole radius before contraction normalization")
+    p.add_argument("--l2n-max-phase", type=float, default=0.04,
+                   help="L2N initial phase half-width around --l2n-phase-center")
+    p.add_argument("--l2n-phase-center", type=float, default=0.0,
+                   help="L2N initial phase-window center in radians")
+    p.add_argument("--l2n-random-phase", action=argparse.BooleanOptionalAction, default=True,
+                   help="sample L2N phases in the configured window; disable to use the center")
+    p.add_argument("--l2n-offdiag-scale", type=float, default=0.05,
+                   help="initial standard deviation of L2N K12/K21/K22")
+    p.add_argument("--tv-init-rho", type=float, default=0.99,
+                   help="TV initial diagonal-state decay")
+    p.add_argument("--tv-init-delta0", type=float, default=1.0,
+                   help="TV initial selective step size")
+    p.add_argument("--tv-init-param-scale", type=float, default=0.02,
+                   help="TV parameter-network weight standard deviation")
+    p.add_argument("--tvc-init-rho", type=float, default=0.9,
+                   help="TVC initial unsigned state decay")
+    p.add_argument("--tvc-init-delta0", type=float, default=1.0,
+                   help="TVC initial selective step size")
+    p.add_argument("--tvc-init-param-scale", type=float, default=0.02,
+                   help="TVC parameter-network weight standard deviation")
+    p.add_argument("--tvc-init-sign", type=float, default=0.995,
+                   help="TVC initial signed-decay multiplier")
+    p.add_argument("--tvc-init-b", type=float, default=0.10,
+                   help="TVC initial input coupling")
+    p.add_argument("--tvc-init-c", type=float, default=0.10,
+                   help="TVC initial output coupling")
+    p.add_argument("--tvc-init-d", type=float, default=0.10,
+                   help="TVC initial direct feedthrough")
+    p.add_argument("--init", default="eye", choices=["eye", "rand"],
+                   help="L2RU initialization mode")
     p.add_argument("--gamma", default="auto",
                    help="prescribed gain: 'auto' (per-model), 'none' (uncertified), or a float")
     p.add_argument("--ff", default="auto",
@@ -1386,11 +1637,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-show", action="store_true",
                    help="force the live interactive window off (still saves GIF/PNG)")
     p.add_argument("--plot-every", type=int, default=10)
+    p.add_argument(
+        "--plot-max-length",
+        type=_positive_int,
+        default=4000,
+        metavar="SAMPLES",
+        help="maximum number of leading samples shown from both training and validation trajectories",
+    )
     p.add_argument("--report-metric", default="rmse", choices=["rmse", "nrmse", "fit", "r2", "mae"],
                    help="metric for the per-benchmark summary bar charts")
-    p.add_argument("--param-budget", type=int, default=0,
-                   help="if >0, tune each model's width (d_model / RNN hidden) so its "
-                        "trainable param count is ~this, for a capacity-matched comparison")
+    p.add_argument("--param-budget", default="lstm",
+                   help="capacity matching target: a positive trainable-parameter count, "
+                        "a model name whose raw count is used as the per-benchmark target, "
+                        "or 'off'. The default matches every model to the LSTM baseline")
     # misc
     p.add_argument("--list", action="store_true", help="list benchmarks/models and exit")
     p.add_argument("--verbose", action="store_true")
