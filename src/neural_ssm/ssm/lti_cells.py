@@ -19,11 +19,13 @@ from .scan_utils import (
     binary_operator_diag,
     compute_linear_recurrence_parallel_scan,
     compute_linear_recurrence_parallel_block2x2,
+    _conv_diag_complex,
 )
 from .state_utils import (
     resolve_runtime_state as _resolve_runtime_state,
     reset_runtime_state as _reset_runtime_state,
 )
+from .cache_utils import EvalCacheMixin
 
 # Margin applied when normalizing K to a strict contraction (||K||_2 < 1).
 # Both L2BoundedLTICell and Block2x2DenseL2SSM divide by (sigma + _CONTRACTION_EPS)
@@ -71,6 +73,34 @@ def _scan_diag_linear(lambdas: torch.Tensor, Bu: torch.Tensor, x0: torch.Tensor)
     states[:, 0] = x0
     states[:, 1:] = x_next
     return states
+
+
+def _conv_diag_linear(lambdas: torch.Tensor, Bu: torch.Tensor, x0: torch.Tensor) -> torch.Tensor:
+    """Batch-major FFT-convolution twin of :func:`_scan_diag_linear`.
+
+    Returns the same state trajectory ``states`` (B, L+1, N) — i.e.
+    ``states[:, s] = lambdas**s * x0 + sum_{k<s} lambdas**(s-1-k) Bu[:, k]`` — but
+    computes it with two FFTs instead of the associative scan. Maths are identical
+    up to floating-point rounding (see :func:`scan_utils._conv_diag_complex`).
+
+    lambdas: (N,) complex ; Bu: (B, L, N) complex ; x0: (B, N) complex.
+    """
+    Bsz, L, N = Bu.shape
+
+    # ensure x0 is (B,N) — mirror _scan_diag_linear's shape handling
+    if x0.dim() == 1:
+        x0 = x0.unsqueeze(0).expand(Bsz, -1)
+    elif x0.dim() == 2 and x0.size(0) == 1 and Bsz > 1:
+        x0 = x0.expand(Bsz, -1)
+    if x0.shape != (Bsz, N):
+        raise ValueError(f"x0 has shape {tuple(x0.shape)}, expected {(Bsz, N)}")
+
+    if L == 0:
+        return x0.unsqueeze(1)  # (B,1,N) = [x0]
+
+    Bu_tb = Bu.transpose(0, 1).contiguous()              # (L, B, N)
+    states_tb = _conv_diag_complex(lambdas, Bu_tb, x0)   # (L+1, B, N)
+    return states_tb.transpose(0, 1).contiguous()        # (B, L+1, N)
 
 
 @torch.jit.script
@@ -267,6 +297,21 @@ class LRU(nn.Module):
         output = (states[:, :-1, :] @ C.mT).real + input @ D.T
         return output, states
 
+    @torch.compiler.disable
+    def forward_conv(self, input: torch.Tensor, state: Optional[torch.Tensor] = None, detach_state: bool = True):
+        """FFT-convolution simulation. Same state trajectory and output as
+        :meth:`forward_scan`; only the diagonal recurrence solver differs."""
+        lambdas, B, C, D = self.set_param()
+
+        x0 = state.to(B.dtype)
+        Bu = input.to(B.dtype) @ B.mT
+        # compute state trajectory [x_0, ..., x_L] via FFT convolution
+        states = _conv_diag_linear(lambdas, Bu, x0)  # (B, L+1, N)
+
+        self.state = states[:, -1, :].detach() if detach_state else states[:, -1, :]
+        output = (states[:, :-1, :] @ C.mT).real + input @ D.T
+        return output, states
+
     def forward(
             self,
             input: torch.Tensor,
@@ -288,16 +333,18 @@ class LRU(nn.Module):
         )
         if mode == "scan":
             return self.forward_scan(input, self.state, detach_state=detach_state)
+        if mode == "conv":
+            return self.forward_conv(input, self.state, detach_state=detach_state)
         if mode in ("loop", "loop_efficient"):
             return self.forward_loop(input, self.state, detach_state=detach_state)
-        raise ValueError(f"Unknown mode: {mode}. Expected 'scan', 'loop', or 'loop_efficient'.")
+        raise ValueError(f"Unknown mode: {mode}. Expected 'scan', 'conv', 'loop', or 'loop_efficient'.")
 
     def reset(self):
         self.state = _reset_runtime_state(self.state, x0=self.x0_param)
 
 
 # python
-class L2RU(nn.Module):
+class L2RU(EvalCacheMixin, nn.Module):
     """LRU with learnable or fixed l2 gain gamma."""
 
     def __init__(self, state_features: int, gamma: float = None, init: str = "eye", q: int = 1, eye_scale=0.01,
@@ -366,6 +413,13 @@ class L2RU(nn.Module):
         return Sk
 
     def set_param(self):
+        # The certified (A, B, D) require an SVD + two Cholesky factorizations +
+        # solves; cache them in eval (fixed weights), recompute in training.
+        A, B, C, D = self._eval_cached("ssm", self._compute_ssm)
+        self.A, self.B, self.D = A, B, D
+        return A, B, C, D
+
+    def _compute_ssm(self):
         ID = self.ID
         n = self.state_features
 
@@ -407,7 +461,6 @@ class L2RU(nn.Module):
         C = self.C
         D = torch.sqrt(beta) * self.Dt
 
-        self.A, self.B, self.D = A, B, D
         return A, B, C, D
 
     def forward(
@@ -455,7 +508,7 @@ class L2RU(nn.Module):
 
 # python
 
-class lruz(nn.Module):
+class lruz(EvalCacheMixin, nn.Module):
     """LRU (complex-diagonal ZAK-style parametrization) with fixed or learnable l2-gain bound gamma.
 
     This version uses a learning-oriented default initialization:
@@ -640,6 +693,13 @@ class lruz(nn.Module):
         return tuple(mats)
 
     def set_param(self):
+        # The certified (A, B, C, D) require Cholesky-balanced spectral norms;
+        # cache them in eval (fixed weights), recompute in training.
+        A, B, C, D = self._eval_cached("ssm", self._compute_ssm)
+        self.A, self.B, self.C, self.D = A, B, C, D
+        return A, B, C, D
+
+    def _compute_ssm(self):
         nx, nu, ny = self.state_features, self.input_features, self.output_features
         eps = 1e-2
 
@@ -689,7 +749,7 @@ class lruz(nn.Module):
         B = torch.linalg.solve(P, Y21)
         C = Y22.conj().mT
 
-        self.A, self.B, self.C, self.D = A, B, C, D
+        # Diagnostic intermediates (not cached; valid as long as params are fixed).
         self.P, self.W, self.Z, self.Y = P, W, Z, Y
         return A, B, C, D
 
@@ -762,7 +822,7 @@ class lruz(nn.Module):
     def reset(self):
         self.state = _reset_runtime_state(self.state, x0=self.x0_param)
 
-class L2BoundedLTICell(nn.Module):
+class L2BoundedLTICell(EvalCacheMixin, nn.Module):
     """
     Dense LTI cell with *hard* L2-gain bound via:
 
@@ -817,6 +877,10 @@ class L2BoundedLTICell(nn.Module):
 
     # ---- map (S,K) -> (A,B,C,D,P) correctly ----
     def compute_ssm_matrices(self):
+        # Exact spectral-norm contraction (SVD) + an inverse; cache in eval.
+        return self._eval_cached("ssm", self._compute_ssm_matrices)
+
+    def _compute_ssm_matrices(self):
         d_x = self.d_state
         d_u = self.d_input
         d_y = self.d_output
@@ -1100,7 +1164,7 @@ class L2BoundedLTICell(nn.Module):
         self.state = _reset_runtime_state(self.state, x0=self.x0_param)
 
 
-class Block2x2DenseL2SSM(nn.Module):
+class Block2x2DenseL2SSM(EvalCacheMixin, nn.Module):
     r"""
     L2-bounded SSM with:
 
@@ -1300,7 +1364,13 @@ class Block2x2DenseL2SSM(nn.Module):
         y_t     = C_z z_t + D_z u_t
 
         with A_z block-diag (2x2), and ||K||_2 <= 1 ⇒ ℓ₂ gain <= γ.
+
+        The contraction K needs an exact spectral norm (SVD); cache the result in
+        eval (fixed weights), recompute in training.
         """
+        return self._eval_cached("z", self._compute_z_matrices)
+
+    def _compute_z_matrices(self):
         K11, K12, K21, K22 = self._build_K_blocks()
         gamma = self.gamma
 
@@ -1538,7 +1608,7 @@ class Block2x2DenseL2SSM(nn.Module):
         # S used for x<->z
         S = self.S.to(device=u_bt.device, dtype=u_bt.dtype)
 
-        if mode != "scan":
+        if mode not in ("scan", "conv"):
             # Row convention:
             #   z = x @ S^T
             #   z_{t+1} = z_t @ A_z^T + u_t @ B_z^T
@@ -1578,7 +1648,7 @@ class Block2x2DenseL2SSM(nn.Module):
 
         else:
             # ==========================================================
-            # SCAN (in z-basis)
+            # SCAN / CONV (in z-basis) — identical maths, different engine
             # ==========================================================
             z0 = x0 @ S.T  # (B,dx)
 
@@ -1586,7 +1656,8 @@ class Block2x2DenseL2SSM(nn.Module):
             u_tb = u_bt.transpose(0, 1).contiguous()  # (L,B,du)
 
             # states: (L+1,B,dx) = z_0..z_{T+1}
-            states = compute_linear_recurrence_parallel_block2x2(A_z, B_z, u_tb, z0)
+            solver = "conv" if mode == "conv" else "scan"
+            states = compute_linear_recurrence_parallel_block2x2(A_z, B_z, u_tb, z0, solver=solver)
 
             # batch-first
             z_seq = states.transpose(0, 1).contiguous()  # (B,L+1,dx)
@@ -1598,12 +1669,12 @@ class Block2x2DenseL2SSM(nn.Module):
             # Convert states to x-basis only if needed
             if return_state:
                 z_flat_T = z_seq.reshape(B_sz * (L + 1), dx).T
-                x_flat = torch.linalg.solve(S.T, z_flat_T).T
+                x_flat = torch.linalg.solve(S, z_flat_T).T  # x = z @ S^{-T} (row conv: z = x @ S^T)
                 x_seq = x_flat.reshape(B_sz, L + 1, dx)
                 x_last = x_seq[:, -1, :]
             else:
                 x_seq = None
-                x_last = torch.linalg.solve(S.T, z_last.T).T  # (B,dx)
+                x_last = torch.linalg.solve(S, z_last.T).T  # (B,dx); x = z @ S^{-T}
 
         self.state = x_last.detach() if detach_state else x_last
 

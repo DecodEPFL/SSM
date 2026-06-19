@@ -12,11 +12,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .scan_utils import associative_scan, binary_operator_diag
+from .scan_utils import associative_scan, binary_operator_diag, diag_affine_scan, GraphedDiagScan
 from .state_utils import (
     resolve_runtime_state as _resolve_runtime_state,
     reset_runtime_state as _reset_runtime_state,
 )
+from .cache_utils import EvalCacheMixin
 from ..static_layers.lipschitz_mlps import L2BoundedLinearExact
 
 
@@ -71,7 +72,7 @@ def spectral_norm_2x2_abcd(
 # Diagonal time-varying recurrence scan
 # ----------------------------
 def _diag_scan(
-    a_tb: torch.Tensor, bu_tb: torch.Tensor, z0: torch.Tensor
+    a_tb: torch.Tensor, bu_tb: torch.Tensor, z0: torch.Tensor, scan_impl=None
 ) -> torch.Tensor:
     """
     Parallel prefix scan for the diagonal real recurrence:
@@ -84,6 +85,10 @@ def _diag_scan(
 
     a_tb, bu_tb : (T, B, N)  — time-major
     z0          : (B, N)     — initial state
+    scan_impl   : optional callable(a, b) -> inclusive scan (T,B,N). Defaults to
+                  the eager :func:`diag_affine_scan`. A :class:`GraphedDiagScan`
+                  instance can be passed to replay a captured CUDA graph instead
+                  (same maths, far less launch overhead).
     Returns states : (T+1, B, N)  — [z_0, z_1, ..., z_T]
     """
     T, B, N = a_tb.shape
@@ -95,7 +100,8 @@ def _diag_scan(
     bu_tb = bu_tb.clone()
     bu_tb[0] = bu_tb[0] + a_tb[0] * z0
 
-    _, z_next = associative_scan(binary_operator_diag, (a_tb, bu_tb), axis=0)  # (T,B,N)
+    scan = scan_impl if scan_impl is not None else diag_affine_scan
+    z_next = scan(a_tb, bu_tb)  # (T,B,N)
 
     states = torch.empty(T + 1, B, N, device=a_tb.device, dtype=a_tb.dtype)
     states[0] = z0
@@ -178,12 +184,15 @@ class RobustMambaDiagSSM(nn.Module):
         exact_norm: bool = True,
         power_iters: int = 1,
         learn_x0: bool = False,
+        use_cuda_graph: bool = False,
     ):
         super().__init__()
         self.D = int(d_model)
         self.N = int(d_state if d_state is not None else d_model)
         self.D_out = int(d_out if d_out is not None else d_model)
         self.state: Optional[torch.Tensor] = None
+        # CUDA-graph cache for the diagonal scan (no-op when disabled / on CPU).
+        self._graphed_scan = GraphedDiagScan(enabled=use_cuda_graph)
 
         if bc_nonlinearity == "identity":
             warnings.warn(
@@ -351,7 +360,7 @@ class RobustMambaDiagSSM(nn.Module):
             a_tb  = a_bt.transpose(0, 1).contiguous()   # (T,B,N)
             bu_tb = bu_bt.transpose(0, 1).contiguous()  # (T,B,N)
 
-            states = _diag_scan(a_tb, bu_tb, z0)         # (T+1,B,N)
+            states = _diag_scan(a_tb, bu_tb, z0, scan_impl=self._graphed_scan)  # (T+1,B,N)
             z_last = states[-1]                           # (B,N)
 
             if return_state:
@@ -420,12 +429,15 @@ class RobustMambaDiagLTI(nn.Module):
         power_iters: int = 1,
         output_uses_post_state: bool = False,
         learn_x0: bool = False,
+        use_cuda_graph: bool = False,
     ):
         super().__init__()
         self.D = int(d_model)
         self.N = int(d_state if d_state is not None else d_model)
         self.D_out = int(d_out if d_out is not None else d_model)
         self.state: Optional[torch.Tensor] = None
+        # CUDA-graph cache for the diagonal scan (no-op when disabled / on CPU).
+        self._graphed_scan = GraphedDiagScan(enabled=use_cuda_graph)
 
         self.eps_a = float(eps_a)
         self.bcd_nonlinearity = bcd_nonlinearity
@@ -665,7 +677,7 @@ class RobustMambaDiagLTI(nn.Module):
             a_tb = a_bt.transpose(0, 1).contiguous()     # (T,B,N)
             bu_tb = bu_bt.transpose(0, 1).contiguous()   # (T,B,N)
 
-            states = _diag_scan(a_tb, bu_tb, z0)         # (T+1,B,N)
+            states = _diag_scan(a_tb, bu_tb, z0, scan_impl=self._graphed_scan)  # (T+1,B,N)
             z_last = states[-1]
 
             if return_state:
@@ -699,7 +711,7 @@ class RobustMambaDiagLTI(nn.Module):
 # ----------------------------
 # Raven-like selective slot-memory cell with a prescribed ℓ2 gain
 # ----------------------------
-class L2SelectiveRavenCell(nn.Module):
+class L2SelectiveRavenCell(EvalCacheMixin, nn.Module):
     r"""Scan-compatible Raven-style selective SSM cell with a certified ℓ2 gain.
 
     Interface-wise this is an "LTI cell": it has the same
@@ -942,8 +954,10 @@ class L2SelectiveRavenCell(nn.Module):
         S_k0, S_v0 = self._resolve_state(state, reset_state, B, device, dtype)
 
         c, gamma_skip_eff, rho = self._gain_budget(device, dtype)
-        W_v_eff = _spectral_cap(self.W_v.weight, c)
-        W_o_eff = _spectral_cap(self.W_o.weight, c)
+        # SVD-based spectral caps on W_v/W_o (and the optional skip D); cache in
+        # eval (fixed weights), recompute in training.
+        W_v_eff = self._eval_cached("W_v_eff", lambda: _spectral_cap(self.W_v.weight, c))
+        W_o_eff = self._eval_cached("W_o_eff", lambda: _spectral_cap(self.W_o.weight, c))
 
         q = self.W_q(z).view(B, T, self.H, self.d_k)
         k = self.W_k(z).view(B, T, self.H, self.d_k)
@@ -969,7 +983,7 @@ class L2SelectiveRavenCell(nn.Module):
         o = o.reshape(B, T, self.H * self.d_v)
         y = F.linear(o, W_o_eff)                                           # (B,T,d_model)
         if self.use_skip:
-            y = y + F.linear(z, _spectral_cap(self.D.weight, gamma_skip_eff))
+            y = y + F.linear(z, self._eval_cached("D_eff", lambda: _spectral_cap(self.D.weight, gamma_skip_eff)))
 
         Sk_last = Sk_post[:, -1] if T > 0 else S_k0
         Sv_last = Sv_post[:, -1] if T > 0 else S_v0

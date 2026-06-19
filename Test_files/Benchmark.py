@@ -35,7 +35,7 @@ class TrainingConfig:
     batch_size: int = 32
     num_epochs: int = 2000
     seed: int = 9
-    device: str = "cpu" if torch.cuda.is_available() else "cpu"
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
     # Validation init window (timesteps skipped in loss computation)
     init_window: int = 50
 
@@ -639,7 +639,7 @@ class SystemIDTrainer:
         y_norm = self._normalize_y(y)
 
         # Forward pass
-        y_pred_norm, _ = self.model(u_norm)
+        y_pred_norm, _ = self.model(u_norm, mode = 'scan')
         y_pred = self._denormalize_y(y_pred_norm).squeeze()
         y_norm = y_norm.squeeze()
 
@@ -1614,7 +1614,7 @@ def main():
     # Load data
     print("Loading data...")
 
-    train_val, test = nonlinear_benchmarks.Cascaded_Tanks()
+    train_val, test = nonlinear_benchmarks.EMPS()
     print(test.state_initialization_window_length)  # = 50
     u_train, y_train = train_val
     u_val, y_val = test
@@ -1643,7 +1643,7 @@ def main():
     )
 
     # Initialize configurations
-    model_config = ModelConfig(n_u=u_train.shape[1], n_y=y_train.shape[1], param='raven', d_model=18, d_state=18,
+    model_config = ModelConfig(n_u=u_train.shape[1], n_y=y_train.shape[1], param='tv', d_model=18, d_state=18,
                                gamma= None, ff='GLU', init='eye', max_phase=0.4,
                                n_layers=5, d_amp=3, rho=0.99, phase_center=0.0, max_phase_b=.04, d_hidden=12, nl_layers=3, learn_x0=False,
                                # ---- Raven knobs (optional; these now feed the cell) ----

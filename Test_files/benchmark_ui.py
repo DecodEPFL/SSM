@@ -40,6 +40,8 @@ INITS = ["eye", "rand"]
 FFS = ["auto", "GLU", "MLP", "LGLU2", "MBLIP", "BLGLU2", "BudgetedLGLU2", "TLIP", "LMLP"]
 DEVICES = ["auto", "cpu", "cuda", "mps"]
 GAMMAS = ["auto", "none", "0.5", "1", "2", "5", "10", "20"]
+# SSM execution mode. "auto" = fastest per model (conv for lru/l2n, scan otherwise).
+MODES = ["auto", "loop", "scan", "conv"]
 
 
 class BenchmarkUI:
@@ -112,6 +114,7 @@ class BenchmarkUI:
         spin(opt, "nl_layers", "nl_layers", 1, 12, 3)
         combo(opt, "gamma", "gamma", GAMMAS, "auto", editable=True)
         combo(opt, "ff", "ff (override)", FFS, "auto")
+        combo(opt, "mode", "exec mode", MODES, "auto")
         spin(opt, "epochs", "epochs", 1, 20000, 200)
         spin(opt, "batch_size", "batch_size", 1, 1024, 32)
         entry(opt, "lr", "lr", "3e-3")
@@ -191,10 +194,12 @@ class BenchmarkUI:
         self.gif_var = tk.BooleanVar(value=True)
         self.amp_var = tk.BooleanVar(value=False)
         self.pcg_var = tk.BooleanVar(value=False)
+        self.cudagraph_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(self.toggles, text="live window (--show)", variable=self.show_var).pack(side="left")
         ttk.Checkbutton(self.toggles, text="save GIF", variable=self.gif_var).pack(side="left", padx=12)
         ttk.Checkbutton(self.toggles, text="mixed precision (--amp, CUDA)", variable=self.amp_var).pack(side="left")
         ttk.Checkbutton(self.toggles, text="per-channel gates", variable=self.pcg_var).pack(side="left", padx=12)
+        ttk.Checkbutton(self.toggles, text="CUDA graph (tv/tvc)", variable=self.cudagraph_var).pack(side="left")
 
         self.model_list.bind("<<ListboxSelect>>", self._update_model_options)
         self._update_model_options()
@@ -298,6 +303,8 @@ class BenchmarkUI:
             cmd += ["--device", g("device")]
         if g("ff") != "auto":
             cmd += ["--ff", g("ff")]
+        if g("mode") != "auto":
+            cmd += ["--mode", g("mode")]
         if "lru" in models:
             cmd += [
                 "--lru-rmin", g("lru_rmin"),
@@ -342,6 +349,7 @@ class BenchmarkUI:
             cmd += ["--amp"]
         if self.pcg_var.get():
             cmd += ["--per-channel-gates"]
+        cmd += ["--use-cuda-graph"] if self.cudagraph_var.get() else ["--no-use-cuda-graph"]
         return cmd
 
     # ---- run / stream ---------------------------------------------------------
