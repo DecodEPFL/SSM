@@ -40,6 +40,7 @@ import math
 import os
 import sys
 import time
+import warnings
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
@@ -277,13 +278,49 @@ class RNNSim(nn.Module):
                  hidden: int = 64, layers: int = 2, dropout: float = 0.0):
         super().__init__()
         rnn_cls = {"lstm": nn.LSTM, "gru": nn.GRU}[kind]
+        self.kind = kind
         self.rnn = rnn_cls(n_u, hidden, num_layers=layers, batch_first=True,
                            dropout=dropout if layers > 1 else 0.0)
         self.proj = nn.Linear(hidden, n_y)
+        # Whether cuDNN's fused RNN works for this instance; set False after a
+        # CUDNN_STATUS_NOT_SUPPORTED so we stop retrying it.
+        self._cudnn_ok = True
+
+    def _run_rnn(self, u: torch.Tensor) -> torch.Tensor:
+        # cuDNN's fused RNN needs a contiguous input and an up-to-date flat weight
+        # buffer (the latter goes stale after load_state_dict / .to()). On some
+        # (shape, GPU, cuDNN) combinations it still raises CUDNN_STATUS_NOT_SUPPORTED
+        # — e.g. configurations not yet covered on very new hardware. Try cuDNN,
+        # then retry once after compacting the weights, then fall back to the
+        # native (slower but always-correct) RNN and remember to skip cuDNN.
+        u = u.contiguous()
+        if self._cudnn_ok and u.is_cuda:
+            try:
+                h, _ = self.rnn(u)
+                return h
+            except RuntimeError as exc:
+                if "cudnn" not in str(exc).lower():
+                    raise
+                try:
+                    self.rnn.flatten_parameters()
+                    h, _ = self.rnn(u)
+                    return h
+                except RuntimeError as exc2:
+                    if "cudnn" not in str(exc2).lower():
+                        raise
+                    warnings.warn(
+                        f"cuDNN {self.kind.upper()} unsupported for this configuration "
+                        f"({str(exc2).splitlines()[0]}); falling back to the native "
+                        "RNN path (slower) for this model.",
+                        RuntimeWarning, stacklevel=2,
+                    )
+                    self._cudnn_ok = False
+        with torch.backends.cudnn.flags(enabled=False):
+            h, _ = self.rnn(u)
+        return h
 
     def forward(self, u: torch.Tensor) -> torch.Tensor:
-        h, _ = self.rnn(u)
-        return self.proj(h)
+        return self.proj(self._run_rnn(u))
 
     def diagnostics(self) -> Optional[dict]:
         return None
@@ -301,6 +338,28 @@ MODEL_ZOO: Dict[str, dict] = {
     "lstm":  dict(kind="lstm",    hidden=64, layers=2),
     "gru":   dict(kind="gru",     hidden=64, layers=2),
 }
+
+# Fastest equivalent execution mode per SSM parametrization (used when
+# --mode auto). lru/l2n are LTI diagonal-complex systems -> FFT convolution;
+# the rest only have the parallel scan. lstm/gru/ctransformer don't use `mode`.
+CONV_CAPABLE = {"lru", "l2n"}
+BEST_MODE: Dict[str, str] = {
+    "lru": "conv", "l2n": "conv",
+    "l2ru": "scan", "tv": "scan", "tvc": "scan", "raven": "scan",
+}
+
+
+def _resolve_mode(param: Optional[str], override: str) -> str:
+    """Pick the SSM execution mode for ``param`` given the global override.
+
+    ``override="auto"`` -> the best mode for that parametrization; otherwise the
+    explicit override, with ``"conv"`` clamped to ``"scan"`` for models that do
+    not implement it (only lru/l2n do)."""
+    mode = BEST_MODE.get(param, "scan") if (not override or override == "auto") else override
+    if mode == "conv" and param not in CONV_CAPABLE:
+        print(f"[run_benchmarks] mode='conv' is unsupported for param='{param}'; using 'scan'.")
+        mode = "scan"
+    return mode
 
 
 def _count_params(model: nn.Module) -> int:
@@ -332,7 +391,7 @@ def _make_ssm_config(spec: dict, gconf: "GlobalModelConfig") -> SSMConfig:
         d_model=gconf.d_model, d_state=gconf.d_state, n_layers=gconf.n_layers,
         d_hidden=gconf.d_hidden, nl_layers=gconf.nl_layers, scale=gconf.scale,
         param=spec["param"], gamma=gamma, ff=ff, init=gconf.init,
-        train_gamma=True, learn_x0=False,
+        train_gamma=True, learn_x0=False, use_cuda_graph=gconf.use_cuda_graph,
         rmin=gconf.lru_rmin, rmax=gconf.lru_rmax, max_phase=gconf.lru_max_phase,
         l2ru_eye_scale=gconf.l2ru_eye_scale, l2ru_rand_scale=gconf.l2ru_rand_scale,
         rho=gconf.l2n_rho, max_phase_b=gconf.l2n_max_phase,
@@ -413,7 +472,10 @@ def build_model(name: str, n_u: int, n_y: int, gconf: "GlobalModelConfig",
                 f"param='l2n' (Block2x2DenseL2SSM) needs an even d_state (2x2 blocks); "
                 f"got {gconf.d_state}. Pass an even --d-state (e.g. {gconf.d_state + 1})."
             )
-        return DeepSSMSim(n_u, n_y, _make_ssm_config(spec, gconf))
+        mode = _resolve_mode(spec.get("param"), gconf.mode_override)
+        print(f"  [{name}] exec mode: {mode}"
+              + (" (+cuda-graph)" if gconf.use_cuda_graph and spec.get("param") in ("tv", "tvc") else ""))
+        return DeepSSMSim(n_u, n_y, _make_ssm_config(spec, gconf), mode=mode)
 
     if kind in ("lstm", "gru"):
         if param_budget and param_budget > 0:
@@ -512,6 +574,10 @@ class GlobalModelConfig:
     init: str = "eye"                      # recurrent-cell init for l2ru/zak/...
     gamma_override: str = "none"           # "auto" (per-model), "none", or a float string
     ff_override: Optional[str] = "GLU"      # override the per-model feedforward
+    mode_override: str = "auto"            # SSM execution mode: "auto" (best per model),
+    # "loop" | "scan" | "conv". "conv" only applies to lru/l2n; falls back to "scan" elsewhere.
+    use_cuda_graph: bool = True            # tv/tvc: replay the diagonal scan from a captured
+    # CUDA graph (same maths; removes launch overhead). No-op for other models / on CPU.
 
 
 def _validate_initialization(models: Sequence[str], cfg: GlobalModelConfig) -> None:
@@ -1386,6 +1452,7 @@ def run(args) -> None:
         tvc_init_b=args.tvc_init_b, tvc_init_c=args.tvc_init_c,
         tvc_init_d=args.tvc_init_d,
         init=args.init, gamma_override=args.gamma, ff_override=args.ff,
+        mode_override=args.mode, use_cuda_graph=args.use_cuda_graph,
     )
     try:
         _validate_initialization(args.models, gconf)
@@ -1629,6 +1696,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="prescribed gain: 'auto' (per-model), 'none' (uncertified), or a float")
     p.add_argument("--ff", default="auto",
                    help="feedforward: auto (per-model) | GLU|MLP|LGLU2|MBLIP|BLGLU2|TLIP|LMLP")
+    p.add_argument("--mode", default="auto", choices=["auto", "loop", "scan", "conv"],
+                   help="SSM execution mode: auto (fastest per model: conv for lru/l2n, "
+                        "scan otherwise) | loop | scan | conv (lru/l2n only)")
+    p.add_argument("--use-cuda-graph", action=argparse.BooleanOptionalAction, default=True,
+                   help="tv/tvc: replay the diagonal scan from a captured CUDA graph "
+                        "(same maths; removes launch overhead). --no-use-cuda-graph to disable.")
     # plotting
     p.add_argument("--no-plot", action="store_true", help="disable the training monitor entirely")
     p.add_argument("--no-gif", action="store_true", help="disable GIF export (keep final PNG)")

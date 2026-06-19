@@ -99,6 +99,8 @@ class SSMConfig:
     tvc_init_c: float = 0.10
     tvc_init_d: float = 0.10
     learn_x0: bool = False  # if True, the initial hidden state is a learnable parameter
+    use_cuda_graph: bool = False  # tv/tvc only: replay the diagonal scan from a captured CUDA
+    # graph instead of eager dispatch (same maths; removes launch overhead for fixed-shape runs)
     zak_d_margin: float = 0.5  # ZAK-only: initialize the direct term strictly inside the feasible set
     zak_x2_margin: float = 0.5  # ZAK-only: initialize the off-diagonal coupling strictly inside the feasible set
     zak_x2_init_scale: float = 0.1  # ZAK-only: scale of the free real X2 initialization
@@ -287,6 +289,7 @@ def _build_tv_cell(config: SSMConfig, block_gamma: Optional[float]) -> nn.Module
         init_delta0=config.tv_init_delta0,
         init_param_scale=config.tv_init_param_scale,
         learn_x0=config.learn_x0,
+        use_cuda_graph=config.use_cuda_graph,
     )
 
 
@@ -309,6 +312,7 @@ def _build_tvc_cell(config: SSMConfig, block_gamma: Optional[float]) -> nn.Modul
         bcd_nonlinearity="tanh",
         output_uses_post_state=False,
         learn_x0=config.learn_x0,
+        use_cuda_graph=config.use_cuda_graph,
     )
 
 

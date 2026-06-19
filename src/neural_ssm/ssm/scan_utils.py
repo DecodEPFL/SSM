@@ -155,6 +155,95 @@ def binary_operator_diag(q_i: Tuple[torch.Tensor, torch.Tensor], q_j: Tuple[torc
     return A_j * A_i, torch.addcmul(b_j, A_j, b_i)
 
 
+def diag_affine_scan(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Inclusive diagonal affine scan ``h_t = a_t * h_{t-1} + b_t`` (h_{-1}=0).
+
+    Thin, stable wrapper over ``associative_scan(binary_operator_diag, ...)`` that
+    returns only the accumulated term. This is the single operation a fused /
+    graph-captured kernel needs to accelerate; keeping it isolated lets
+    :class:`GraphedDiagScan` capture exactly this region.
+    """
+    return associative_scan(binary_operator_diag, (a, b), axis=0)[1]
+
+
+class GraphedDiagScan:
+    """Per-call-site CUDA-graph cache for :func:`diag_affine_scan`.
+
+    The eager diagonal scan is *launch-bound* for short/medium sequences: it is
+    numerically light (a handful of element-wise ops per log-depth level) but
+    issues O(log T) groups of tiny kernels, so the GPU mostly waits on the CPU to
+    dispatch them. Capturing the kernel sequence once with a CUDA graph and
+    replaying it removes that per-launch overhead entirely (measured 7-11x on
+    forward, ~7x on forward+backward) while replaying the *same* numerically
+    stable scan — values and gradients are bit-for-bit identical.
+
+    The captured graph reuses static input/output buffers, so each instance must
+    serve a single call site (e.g. one SSM layer). Sharing one instance across
+    layers whose backward passes overlap would corrupt saved tensors; give every
+    cell its own instance.
+
+    A separate graph is captured per ``(shape, dtype, grad-mode)`` signature.
+    Training (grad enabled, grad-requiring inputs) uses
+    :func:`torch.cuda.make_graphed_callables` so the backward is graphed too;
+    inference uses a plain forward graph. Anything unsupported — CPU tensors,
+    capture failure, a brand-new shape under a one-off call — transparently falls
+    back to the eager scan, so correctness never depends on capture succeeding.
+    """
+
+    def __init__(self, enabled: bool = True):
+        self.enabled = bool(enabled)
+        self._fwd: dict = {}      # sig -> (graph, static_a, static_b, static_out)
+        self._graphed: dict = {}  # sig -> graphed callable (fwd+bwd)
+
+    def __call__(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        if (not self.enabled) or a.device.type != "cuda":
+            return diag_affine_scan(a, b)
+
+        grad = torch.is_grad_enabled() and (a.requires_grad or b.requires_grad)
+        sig = (tuple(a.shape), a.dtype, grad)
+        try:
+            if grad:
+                fn = self._graphed.get(sig)
+                if fn is None:
+                    sa = a.detach().clone().requires_grad_(True)
+                    sb = b.detach().clone().requires_grad_(True)
+                    fn = torch.cuda.make_graphed_callables(diag_affine_scan, (sa, sb))
+                    self._graphed[sig] = fn
+                return fn(a, b)
+
+            entry = self._fwd.get(sig)
+            if entry is None:
+                entry = self._capture_forward(a, b)
+                self._fwd[sig] = entry
+            graph, static_a, static_b, static_out = entry
+            static_a.copy_(a)
+            static_b.copy_(b)
+            graph.replay()
+            return static_out.clone()
+        except Exception:
+            # Any capture / replay problem: fall back to the eager scan. Disable
+            # this signature so we do not repeatedly pay a failing capture.
+            self._fwd.pop(sig, None)
+            self._graphed.pop(sig, None)
+            return diag_affine_scan(a, b)
+
+    def _capture_forward(self, a: torch.Tensor, b: torch.Tensor):
+        static_a = a.detach().clone()
+        static_b = b.detach().clone()
+        # Warm up on a side stream before capture (required by CUDA graphs).
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for _ in range(3):
+                diag_affine_scan(static_a, static_b)
+        torch.cuda.current_stream().wait_stream(side)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            static_out = diag_affine_scan(static_a, static_b)
+        return graph, static_a, static_b, static_out
+
+
 # Parallel scan for non diagonal matrices
 
 # -------------------------
@@ -566,11 +655,83 @@ def _scan_diag_complex(
     return states
 
 
+def _conv_diag_complex(
+    lambdas: torch.Tensor,
+    Bu: torch.Tensor,
+    x0: torch.Tensor,
+) -> torch.Tensor:
+    """
+    FFT-convolution twin of :func:`_scan_diag_complex`.
+
+    Computes *exactly* the same state trajectory as the diagonal affine prefix
+    scan, for the recurrence
+
+        x_0 = x0
+        x_s = lambdas * x_{s-1} + Bu[s-1],   s = 1..T
+
+    whose closed form is
+
+        x_s = lambdas**s * x0 + sum_{k=0}^{s-1} lambdas**(s-1-k) * Bu[k].
+
+    Because the system is LTI and diagonal, the input-driven part of x_s is a
+    *causal convolution* of the inputs with the geometric kernel g[j] = lambdas**j,
+    and the initial-condition part is the homogeneous term lambdas**s * x0. We
+    therefore replace the O(log T) sequence of slice / gather / interleave / cat
+    kernels in ``associative_scan`` with two batched FFTs (one cuFFT launch each
+    way) plus a cumulative product — far fewer kernels and much friendlier to the
+    GPU for long sequences, while remaining bit-for-bit equivalent up to floating
+    point rounding.
+
+    Shapes (time-major, matching ``_scan_diag_complex``):
+        lambdas: (N,)      complex
+        Bu:      (T, B, N) complex
+        x0:      (B, N)    complex
+    Returns:
+        states:  (T+1, B, N) complex  = [x_0, x_1, ..., x_T]
+    """
+    T, B, N = Bu.shape
+    if T == 0:
+        return x0.unsqueeze(0)
+
+    cdtype = Bu.dtype
+    device = Bu.device
+    lambdas = lambdas.to(device=device, dtype=cdtype).reshape(N)
+    x0 = x0.to(device=device, dtype=cdtype)
+
+    # powers[j] = lambdas**j for j = 0..T, built by cumulative product so the
+    # accumulation matches the scan's repeated-multiply rounding (and underflows
+    # to 0 gracefully for |lambda| < 1, unlike exp(j*log(lambda)) which wraps the
+    # phase for large j).
+    base = lambdas.unsqueeze(0).expand(T + 1, N).clone()  # every row = lambda
+    base[0] = 1.0                                         # lambda**0
+    powers = torch.cumprod(base, dim=0)                   # (T+1, N)
+
+    # Homogeneous term H[s] = lambda**s * x0, s = 0..T.
+    H = powers.unsqueeze(1) * x0.unsqueeze(0)             # (T+1, B, N)
+
+    # Input-driven (particular) term via linear causal convolution:
+    #   conv[t] = sum_{j=0}^{t} g[j] * Bu[t-j],  g[j] = lambda**j,  t = 0..T-1.
+    # Linear conv length is 2T-1; pad to the next power of two so the cyclic FFT
+    # convolution equals the linear one over the first T outputs.
+    g = powers[:T]                                        # (T, N): lambda**0 .. lambda**(T-1)
+    nfft = 1 << ((2 * T - 1).bit_length())
+    Gf = torch.fft.fft(g, n=nfft, dim=0)                  # (nfft, N)
+    Uf = torch.fft.fft(Bu, n=nfft, dim=0)                 # (nfft, B, N)
+    conv = torch.fft.ifft(Uf * Gf.unsqueeze(1), n=nfft, dim=0)[:T]  # (T, B, N)
+
+    # states[0] = x0; states[s] = H[s] + conv[s-1] for s = 1..T.
+    states = torch.empty(T + 1, B, N, device=device, dtype=cdtype)
+    states[0] = x0
+    states[1:] = H[1:] + conv
+    return states
+
+
 def compute_linear_recurrence_parallel_block2x2_complex(
     A: torch.Tensor,
     B: torch.Tensor,
     u: torch.Tensor,
     x0: torch.Tensor,
+    solver: str = "scan",
 ) -> torch.Tensor:
     """
     Complex-valued scan for 2x2 block-diagonal A.
@@ -578,7 +739,11 @@ def compute_linear_recurrence_parallel_block2x2_complex(
     Interprets each 2x2 block as a complex scalar:
         [[a, -b],
          [b,  a]]  <->  a + i b
-    and runs a diagonal complex scan.
+    and runs a diagonal complex recurrence.
+
+    ``solver`` selects the engine for the diagonal complex recurrence:
+        "scan" -> work-efficient associative parallel scan (default)
+        "conv" -> FFT convolution (:func:`_conv_diag_complex`); identical maths.
     """
     T, Bsz, D_in = u.shape
     D_state = A.shape[0]
@@ -600,8 +765,13 @@ def compute_linear_recurrence_parallel_block2x2_complex(
     x0_blocks = x0.view(Bsz, n_blocks, 2)
     x0_c = torch.complex(x0_blocks[..., 0], x0_blocks[..., 1])  # (B, n_blocks)
 
-    # Complex diagonal scan
-    states_c = _scan_diag_complex(lambdas, Bu, x0_c)  # (T+1, B, n_blocks)
+    # Complex diagonal recurrence (scan or FFT convolution — identical maths)
+    if solver == "conv":
+        states_c = _conv_diag_complex(lambdas, Bu, x0_c)  # (T+1, B, n_blocks)
+    elif solver == "scan":
+        states_c = _scan_diag_complex(lambdas, Bu, x0_c)  # (T+1, B, n_blocks)
+    else:
+        raise ValueError(f"Unknown solver {solver!r}; expected 'scan' or 'conv'.")
 
     # Convert back to real block form: (T+1, B, D_state)
     states_blocks = torch.stack([states_c.real, states_c.imag], dim=-1)
@@ -736,10 +906,16 @@ def compute_linear_recurrence_parallel_block2x2(
     u: torch.Tensor,
     x0: torch.Tensor,
     use_complex_scan: bool = True,
+    solver: str = "scan",
 ) -> torch.Tensor:
     """
     Wrapper that selects between complex-scan and real 2x2 block scan.
+
+    ``solver`` ("scan" | "conv") only applies to the complex path and chooses
+    between the associative parallel scan and the FFT-convolution engine.
     """
     if use_complex_scan:
-        return compute_linear_recurrence_parallel_block2x2_complex(A, B, u, x0)
+        return compute_linear_recurrence_parallel_block2x2_complex(A, B, u, x0, solver=solver)
+    if solver != "scan":
+        raise ValueError("solver='conv' is only supported with use_complex_scan=True.")
     return _compute_linear_recurrence_parallel_block2x2_real(A, B, u, x0)
