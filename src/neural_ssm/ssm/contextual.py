@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 from typing import Any, Callable, Optional, Sequence, Union
 
 import torch
@@ -10,7 +11,7 @@ from .layers import DeepSSM, SSMConfig
 from .lti_cells import _normalize_to_3d
 
 
-_VALID_CONTEXT_MODES = frozenset({"input", "gate", "mixer"})
+_VALID_CONTEXT_MODES = frozenset({"input", "gate", "mixer", "select"})
 
 
 def timewise_matrix_vector_product(matrices: torch.Tensor, vectors: torch.Tensor) -> torch.Tensor:
@@ -373,6 +374,9 @@ class ContextualDeepSSM(nn.Module):
     - ``"input"``: concatenate ``L2``-filtered context to the SSM input.
     - ``"gate"``: use bounded context gates inside every residual SSM block.
     - ``"mixer"``: use a bounded timewise matrix ``A_t`` on the core features.
+    - ``"select"``: feed context into the selective cells' ``param_net`` so it
+      shapes the per-step dynamics (requires a selective ``param`` like ``"tv"``
+      or ``"tvc"``). Gain-safe for arbitrary context -- no l2 projection needed.
 
     The recurrent core is still a standard ``DeepSSM``. Therefore, when
     ``gamma`` is set, the usual certified recurrent parametrizations and
@@ -423,6 +427,8 @@ class ContextualDeepSSM(nn.Module):
         if self.context_modes and self.d_context == 0:
             if "input" in self.context_modes:
                 raise ValueError("input context mode requires d_context > 0.")
+            if "select" in self.context_modes:
+                raise ValueError("select context mode requires d_context > 0.")
             if "gate" in self.context_modes and not gate_include_disturbance:
                 raise ValueError(
                     "gate mode with d_context=0 requires gate_include_disturbance=True."
@@ -443,12 +449,27 @@ class ContextualDeepSSM(nn.Module):
             self.d_input + (self.d_context if "input" in self.context_modes else 0)
         )
         self.core_output_dim = self.d_features if "mixer" in self.context_modes else self.d_output
+        if "select" in self.context_modes:
+            # Context conditions the selective cells' param_net. Gain-safe for ANY
+            # context: each cell renormalizes its per-step transition, so the gamma
+            # certificate holds regardless and no l2 projection of context is needed.
+            if ssm_config is not None:
+                ssm_config = replace(ssm_config, select_context_dim=self.d_context)
+            else:
+                core_kwargs["select_context_dim"] = self.d_context
         self.core = DeepSSM(
             self.core_input_dim,
             self.core_output_dim,
             config=ssm_config,
             **core_kwargs,
         )
+        if "select" in self.context_modes and not any(
+            getattr(b.lru, "supports_select_context", False) for b in self.core.blocks
+        ):
+            raise ValueError(
+                "select mode requires a selective core (e.g. param='tv' or 'tvc'); "
+                f"got param={self.core.config.param!r}."
+            )
 
         self.context_filter = None
         if "input" in self.context_modes:
@@ -547,6 +568,7 @@ class ContextualDeepSSM(nn.Module):
             time_offset=time_offset,
         )
         context_gates = self.gate(w, z) if self.gate is not None else None
+        select_context = z if "select" in self.context_modes else None
         features, next_state = self.core(
             core_input,
             state=state,
@@ -555,6 +577,7 @@ class ContextualDeepSSM(nn.Module):
             reset_state=reset_state,
             detach_state=detach_state,
             context_gates=context_gates,
+            select_context=select_context,
         )
 
         mixer_matrices = None
