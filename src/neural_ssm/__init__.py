@@ -9,6 +9,10 @@ from . import static_layers as layers  # public alias
 
 # Top-level classes and configs
 from .ssm.layers import LRU, L2RU, lruz, SSMConfig, SSL, DeepSSM, PureLRUR
+from .ssm.contextual import (
+    ContextualDeepSSM,
+    timewise_matrix_vector_product,
+)
 from .rens.ren import REN
 
 # Common layers exposed at top-level for convenience
@@ -27,6 +31,7 @@ except ImportError:
 # Export only names that are available
 __all__ = [n for n in (
     "LRU", "L2RU", "lruz", "SSMConfig", "SSL", "DeepSSM", "PureLRUR",
+    "ContextualDeepSSM", "timewise_matrix_vector_product",
     "REN",
     "layers", "ssm", "rens",
     "LayerConfig", "GLU", "MLP", "LMLP", "TLIP",

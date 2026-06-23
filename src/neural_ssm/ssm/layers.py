@@ -553,6 +553,8 @@ class SSL(nn.Module):
         mode: str = "loop",
         reset_state: bool = True,
         detach_state: bool = False,
+        ssm_context_gate: Optional[torch.Tensor] = None,
+        ff_context_gate: Optional[torch.Tensor] = None,
     ):
         ssm_out, state_trajectory = self.lru(
             x3d,
@@ -561,8 +563,28 @@ class SSL(nn.Module):
             reset_state=reset_state,
             detach_state=detach_state,
         )
-        x = x3d + self.ssm_scale * self.ssm_dropout(ssm_out)
-        x = x + self.ff_scale * self.ff_dropout(self.ff(x))
+
+        if ssm_context_gate is None:
+            ssm_gate = 1.0
+        else:
+            ssm_gate = torch.clamp(
+                ssm_context_gate.to(device=x3d.device, dtype=x3d.dtype),
+                0.0,
+                1.0,
+            )
+
+        x = x3d + self.ssm_scale * ssm_gate * self.ssm_dropout(ssm_out)
+
+        if ff_context_gate is None:
+            ff_gate = 1.0
+        else:
+            ff_gate = torch.clamp(
+                ff_context_gate.to(device=x3d.device, dtype=x3d.dtype),
+                0.0,
+                1.0,
+            )
+
+        x = x + self.ff_scale * ff_gate * self.ff_dropout(self.ff(x))
         return x, state_trajectory
 
     def _load_from_state_dict(
@@ -1064,6 +1086,7 @@ class DeepSSM(nn.Module):
         mode: str = "scan",
         reset_state: bool = True,
         detach_state: bool = False,
+        context_gates: Optional[Sequence[dict[str, torch.Tensor]]] = None,
     ):
         u3d = _normalize_to_3d(u)
         if gamma is not None and not self.use_cert_scaling:
@@ -1085,6 +1108,12 @@ class DeepSSM(nn.Module):
             # Convenience path: broadcast one state tensor to every block.
             layer_states = [state] * n_blocks
 
+        if context_gates is not None and len(context_gates) != n_blocks:
+            raise ValueError(
+                f"context_gates must provide one entry per SSL block: "
+                f"expected {n_blocks}, got {len(context_gates)}"
+            )
+
         # Encode
         if self.use_cert_scaling:
             encoder_eff, decoder_eff = self._capped_encoder_decoder()
@@ -1100,6 +1129,12 @@ class DeepSSM(nn.Module):
                 mode=mode,
                 reset_state=reset_state,
                 detach_state=detach_state,
+                ssm_context_gate=(
+                    None if context_gates is None else context_gates[i].get("ssm")
+                ),
+                ff_context_gate=(
+                    None if context_gates is None else context_gates[i].get("ff")
+                ),
             )
             layer_states[i] = self._last_runtime_state(st)
 
