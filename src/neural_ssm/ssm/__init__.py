@@ -8,6 +8,10 @@ from .experimental import (
     MultiHeadRavenRSM,
 )
 from .layers import SSMConfig, SSL, DeepSSM, PureLRUR, SimpleRNN
+from .contextual import (
+    ContextualDeepSSM,
+    timewise_matrix_vector_product,
+)
 from .stable_recurrent_transformer import (
     StableRecurrentTransformer,
     StableRecurrentTransformerBlock,
@@ -30,6 +34,7 @@ __all__ = [
     "ExpertSelectiveTimeVaryingSSM", "Block2x2SelectiveBCDExpertsL2SSM",
     "MultiHeadRavenRSM",
     "SSMConfig", "SSL", "DeepSSM", "PureLRUR", "SimpleRNN",
+    "ContextualDeepSSM", "timewise_matrix_vector_product",
     "StableRecurrentTransformer", "StableRecurrentTransformerBlock",
     "LipschitzStaticAttention", "split_gain_budget",
     "CertifiedTransformer", "CertifiedTransformerBlock", "CertifiedMHA",
