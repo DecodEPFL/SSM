@@ -132,6 +132,30 @@ def _spectral_cap(weight: torch.Tensor, bound: torch.Tensor, *, eps: float = 1e-
 # ----------------------------
 # Robust Mamba-style selective diagonal SSM with prescribed ℓ2 gain
 # ----------------------------
+def _selector_input(
+    context_dim: int,
+    u_bt: torch.Tensor,
+    ctx_bt: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Concatenate optional selection context to the cell input for ``param_net``.
+
+    The cell renormalizes its per-step transition to spectral norm <= 1 for ANY
+    ``param_net`` output, so conditioning the selector on context preserves the
+    gamma certificate -- context needs no l2 projection and may be non-l2 or
+    endogenous (e.g. the state).
+    """
+    if context_dim == 0:
+        return u_bt
+    if ctx_bt is None:
+        raise ValueError("select_context is required when context_dim > 0.")
+    ctx = _normalize_to_3d(ctx_bt)
+    if ctx.shape[-1] != context_dim:
+        raise ValueError(f"select_context last dim must be {context_dim}, got {ctx.shape[-1]}.")
+    if ctx.shape[:2] != u_bt.shape[:2]:
+        raise ValueError("select_context must match (batch, time) of the cell input.")
+    return torch.cat([u_bt, ctx], dim=-1)
+
+
 class RobustMambaDiagSSM(nn.Module):
     r"""
     Discrete-time selective diagonal SSM (Mamba-like), robustly ℓ2-bounded.
@@ -180,6 +204,7 @@ class RobustMambaDiagSSM(nn.Module):
         init_delta0: float = 1.0,
         init_param_scale: float = 0.02,
         bc_nonlinearity: Literal["tanh", "identity"] = "tanh",
+        context_dim: int = 0,
         proj_bound: float = 1.0,
         exact_norm: bool = True,
         power_iters: int = 1,
@@ -221,12 +246,15 @@ class RobustMambaDiagSSM(nn.Module):
         # alpha > 0 controls base decay: a_t = exp(-delta_t * alpha)
         self.alpha_log = nn.Parameter(torch.zeros(self.N))
 
+        self.context_dim = int(context_dim)
+        self.supports_select_context = True
         out_dim = 3 * self.N
+        pn_in = self.D + self.context_dim
         if param_net == "linear":
-            self.param_net = nn.Linear(self.D, out_dim)
+            self.param_net = nn.Linear(pn_in, out_dim)
         elif param_net == "mlp":
             self.param_net = nn.Sequential(
-                nn.Linear(self.D, hidden),
+                nn.Linear(pn_in, hidden),
                 nn.GELU(),
                 nn.Linear(hidden, out_dim),
             )
@@ -270,7 +298,7 @@ class RobustMambaDiagSSM(nn.Module):
                     nn.init.zeros_(m.bias)
 
     def _compute_params(
-        self, u_bt: torch.Tensor
+        self, u_bt: torch.Tensor, ctx_bt: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         u_bt (B,T,D) → (a_bt, b_bt, c_bt, u_scaled_bt), all (B,T,N).
@@ -285,7 +313,7 @@ class RobustMambaDiagSSM(nn.Module):
         g        = self.gamma.to(device=u_bt.device, dtype=u_bt.dtype)
         u_scaled = g * u_tilde                                         # (B,T,N)
 
-        raw = self.param_net(u_bt)                                     # (B,T,3N)
+        raw = self.param_net(_selector_input(self.context_dim, u_bt, ctx_bt))  # (B,T,3N)
         delta_raw, b_raw, c_raw = raw.split(self.N, dim=-1)
 
         delta = F.softplus(delta_raw + self.delta_bias)                # (B,T,N)
@@ -313,6 +341,7 @@ class RobustMambaDiagSSM(nn.Module):
         return_last: bool = False,
         reset_state: bool = True,
         detach_state: bool = True,
+        select_context: Optional[torch.Tensor] = None,
     ):
         """
         u : (B,T,D) or (T,D) or (D,) — normalized to (B,T,D) internally.
@@ -338,7 +367,7 @@ class RobustMambaDiagSSM(nn.Module):
             x0=self.x0_param,
         )
 
-        a_bt, b_bt, c_bt, u_scaled_bt = self._compute_params(u)   # (B,T,N)
+        a_bt, b_bt, c_bt, u_scaled_bt = self._compute_params(u, select_context)   # (B,T,N)
         bu_bt = b_bt * u_scaled_bt                                 # (B,T,N)
 
         if mode == "loop":
@@ -424,6 +453,7 @@ class RobustMambaDiagLTI(nn.Module):
         init_c: float = 0.10,
         init_d: float = 0.10,
         bcd_nonlinearity: Literal["tanh", "identity"] = "tanh",
+        context_dim: int = 0,
         proj_bound: float = 1.0,
         exact_norm: bool = True,
         power_iters: int = 1,
@@ -487,12 +517,15 @@ class RobustMambaDiagLTI(nn.Module):
         self.sign_bias = nn.Parameter(torch.empty(self.N))
 
         # Param net outputs: delta | sign | b | c | d
+        self.context_dim = int(context_dim)
+        self.supports_select_context = True
         out_dim = 5 * self.N
+        pn_in = self.D + self.context_dim
         if param_net == "linear":
-            self.param_net = nn.Linear(self.D, out_dim)
+            self.param_net = nn.Linear(pn_in, out_dim)
         elif param_net == "mlp":
             self.param_net = nn.Sequential(
-                nn.Linear(self.D, hidden),
+                nn.Linear(pn_in, hidden),
                 nn.GELU(),
                 nn.Linear(hidden, out_dim),
             )
@@ -571,6 +604,7 @@ class RobustMambaDiagLTI(nn.Module):
     def _compute_params(
         self,
         u_bt: torch.Tensor,
+        ctx_bt: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         u_bt (B,T,D) -> (a,b,c,d,u_scaled), all (B,T,N), all real.
@@ -584,7 +618,7 @@ class RobustMambaDiagLTI(nn.Module):
         g = self.gamma.to(device=u_bt.device, dtype=u_bt.dtype)
         u_scaled = g * u_tilde                                         # (B,T,N)
 
-        raw = self.param_net(u_bt)                                     # (B,T,5N)
+        raw = self.param_net(_selector_input(self.context_dim, u_bt, ctx_bt))  # (B,T,5N)
         delta_raw, sign_raw, b_raw, c_raw, d_raw = raw.split(self.N, dim=-1)
 
         delta = F.softplus(delta_raw + self.delta_bias)                # (B,T,N)
@@ -621,6 +655,7 @@ class RobustMambaDiagLTI(nn.Module):
         return_last: bool = False,
         reset_state: bool = True,
         detach_state: bool = True,
+        select_context: Optional[torch.Tensor] = None,
     ):
         """
         Same interface as your old RobustMambaDiagSSM.
@@ -646,7 +681,7 @@ class RobustMambaDiagLTI(nn.Module):
             x0=self.x0_param,
         )
 
-        a_bt, b_bt, c_bt, d_bt, u_scaled_bt = self._compute_params(u)
+        a_bt, b_bt, c_bt, d_bt, u_scaled_bt = self._compute_params(u, select_context)
         bu_bt = b_bt * u_scaled_bt
 
         if mode == "loop":

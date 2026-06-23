@@ -99,6 +99,8 @@ class SSMConfig:
     tvc_init_c: float = 0.10
     tvc_init_d: float = 0.10
     learn_x0: bool = False  # if True, the initial hidden state is a learnable parameter
+    select_context_dim: int = 0  # width of an optional context fed to selective cells'
+    # param_net (the "select" injection); 0 disables it. Only used by selective params.
     use_cuda_graph: bool = False  # tv/tvc only: replay the diagonal scan from a captured CUDA
     # graph instead of eager dispatch (same maths; removes launch overhead for fixed-shape runs)
     zak_d_margin: float = 0.5  # ZAK-only: initialize the direct term strictly inside the feasible set
@@ -290,6 +292,7 @@ def _build_tv_cell(config: SSMConfig, block_gamma: Optional[float]) -> nn.Module
         init_param_scale=config.tv_init_param_scale,
         learn_x0=config.learn_x0,
         use_cuda_graph=config.use_cuda_graph,
+        context_dim=config.select_context_dim,
     )
 
 
@@ -309,10 +312,11 @@ def _build_tvc_cell(config: SSMConfig, block_gamma: Optional[float]) -> nn.Modul
         init_b=config.tvc_init_b,
         init_c=config.tvc_init_c,
         init_d=config.tvc_init_d,
-        bcd_nonlinearity="tanh",
+        bcd_nonlinearity="identity",
         output_uses_post_state=False,
         learn_x0=config.learn_x0,
         use_cuda_graph=config.use_cuda_graph,
+        context_dim=config.select_context_dim,
     )
 
 
@@ -555,14 +559,18 @@ class SSL(nn.Module):
         detach_state: bool = False,
         ssm_context_gate: Optional[torch.Tensor] = None,
         ff_context_gate: Optional[torch.Tensor] = None,
+        select_context: Optional[torch.Tensor] = None,
     ):
-        ssm_out, state_trajectory = self.lru(
-            x3d,
+        lru_kwargs = dict(
             state=state,
             mode=mode,
             reset_state=reset_state,
             detach_state=detach_state,
         )
+        # Only selective cells (tv/tvc/…) accept context in their param_net.
+        if select_context is not None and getattr(self.lru, "supports_select_context", False):
+            lru_kwargs["select_context"] = select_context
+        ssm_out, state_trajectory = self.lru(x3d, **lru_kwargs)
 
         if ssm_context_gate is None:
             ssm_gate = 1.0
@@ -675,6 +683,7 @@ class DeepSSM(nn.Module):
         ssm_residual_init: float = -1.0,
         ff_residual_init: float = -1.0,
         per_channel_gates: bool = False,
+        select_context_dim: int = 0,
         config: Optional[SSMConfig] = None,
     ):
         super().__init__()
@@ -710,6 +719,7 @@ class DeepSSM(nn.Module):
             ssm_residual_init=ssm_residual_init,
             ff_residual_init=ff_residual_init,
             per_channel_gates=per_channel_gates,
+            select_context_dim=select_context_dim,
         )
 
         self._validate_config(self.config)
@@ -1087,6 +1097,7 @@ class DeepSSM(nn.Module):
         reset_state: bool = True,
         detach_state: bool = False,
         context_gates: Optional[Sequence[dict[str, torch.Tensor]]] = None,
+        select_context: Optional[torch.Tensor] = None,
     ):
         u3d = _normalize_to_3d(u)
         if gamma is not None and not self.use_cert_scaling:
@@ -1135,6 +1146,7 @@ class DeepSSM(nn.Module):
                 ff_context_gate=(
                     None if context_gates is None else context_gates[i].get("ff")
                 ),
+                select_context=select_context,
             )
             layer_states[i] = self._last_runtime_state(st)
 
