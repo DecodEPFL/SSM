@@ -72,6 +72,7 @@ from nonlinear_benchmarks.not_splitted_benchmarks import (
 )
 
 from src.neural_ssm.ssm import DeepSSM, SSMConfig, CertifiedTransformer
+from src.neural_ssm.rens.ren import REN
 
 
 # ============================================================================
@@ -326,6 +327,35 @@ class RNNSim(nn.Module):
         return None
 
 
+class RENSim(nn.Module):
+    """Wraps the robust acyclic REN to ``forward(u:(B,T,n_u)) -> y:(B,T,n_y)``.
+
+    REN is l2-stable by construction with induced l2 gain <= gamma in the
+    ``l2stable`` mode. ``gamma=None`` trains gamma; a float fixes it.
+    """
+
+    def __init__(self, n_u: int, n_y: int, *, dim_internal: int, dim_nl: int,
+                 gamma: Optional[float] = None):
+        super().__init__()
+        self.gamma = None if gamma is None else float(gamma)
+        self.ren = REN(
+            dim_in=n_u, dim_out=n_y,
+            dim_internal=int(dim_internal), dim_nl=int(dim_nl),
+            gammat=(None if gamma is None else torch.tensor(float(gamma))),
+            mode="l2stable",
+        )
+
+    def forward(self, u: torch.Tensor) -> torch.Tensor:
+        return self.ren(u)
+
+    @torch.no_grad()
+    def diagnostics(self) -> Optional[dict]:
+        return {
+            "certified_gain_bound": float(self.ren.gamma.abs().flatten()[0]),
+            "gamma_trainable": self.gamma is None,
+        }
+
+
 # name -> spec. `kind` selects the builder; remaining keys are builder kwargs.
 MODEL_ZOO: Dict[str, dict] = {
     "lru":   dict(kind="deepssm", param="lru",   gamma=None, ff="GLU"),     # uncertified baseline
@@ -337,6 +367,7 @@ MODEL_ZOO: Dict[str, dict] = {
     "ctransformer": dict(kind="ctransformer", gamma_total=20.0),            # certified softmax transformer (conservative attn bound -> needs more budget)
     "lstm":  dict(kind="lstm",    hidden=64, layers=2),
     "gru":   dict(kind="gru",     hidden=64, layers=2),
+    "ren":   dict(kind="ren",     gamma=5.0),                            # robust acyclic REN (l2-stable by construction)
 }
 
 # Fastest equivalent execution mode per SSM parametrization (used when
@@ -511,6 +542,26 @@ def build_model(name: str, n_u: int, n_y: int, gconf: "GlobalModelConfig",
             return _make_ct(best)
         return _make_ct(gconf.d_model)
 
+    if kind == "ren":
+        ov = str(gconf.gamma_override).lower()
+        if ov in ("none", ""):
+            gt: Optional[float] = None            # train gamma
+        elif ov == "auto":
+            gt = spec.get("gamma")                # fixed certified gamma from the zoo
+        else:
+            gt = float(gconf.gamma_override)
+
+        def _make_ren(di):
+            return RENSim(n_u, n_y, dim_internal=int(di),
+                          dim_nl=gconf.ren_dim_nl, gamma=gt)
+
+        if param_budget and param_budget > 0:
+            with torch.random.fork_rng(devices=[]):
+                best = _closest_width(lambda w: _count_params(_make_ren(w)),
+                                      param_budget, lo=2)
+            return _make_ren(best)
+        return _make_ren(gconf.ren_dim_internal)
+
     raise ValueError(f"Unknown model kind {kind!r}.")
 
 
@@ -550,6 +601,8 @@ class GlobalModelConfig:
     raven_heads: int = 4
     raven_slots: int = 8
     raven_top_k: int = 2
+    ren_dim_internal: int = 16             # REN internal state dim (n); param-budget width knob
+    ren_dim_nl: int = 16                   # REN nonlinearity dim (l)
     per_channel_gates: bool = False
     lru_rmin: float = 0.8
     lru_rmax: float = 0.95
@@ -653,6 +706,7 @@ def _initialization_metadata(cfg: GlobalModelConfig) -> dict:
                 "param_scale": cfg.tvc_init_param_scale,
                 "sign": cfg.tvc_init_sign, "b": cfg.tvc_init_b,
                 "c": cfg.tvc_init_c, "d": cfg.tvc_init_d},
+        "ren": {"dim_internal": cfg.ren_dim_internal, "dim_nl": cfg.ren_dim_nl},
     }
 
 
@@ -1433,6 +1487,7 @@ def run(args) -> None:
         d_model=args.d_model, d_state=args.d_state, n_layers=args.n_layers,
         d_hidden=args.d_hidden, nl_layers=args.nl_layers,
         raven_heads=args.raven_heads, raven_slots=args.raven_slots, raven_top_k=args.raven_top_k,
+        ren_dim_internal=args.ren_dim_internal, ren_dim_nl=args.ren_dim_nl,
         per_channel_gates=args.per_channel_gates,
         lru_rmin=args.lru_rmin, lru_rmax=args.lru_rmax,
         lru_max_phase=args.lru_max_phase,
@@ -1646,6 +1701,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--raven-heads", type=int, default=4)
     p.add_argument("--raven-slots", type=int, default=8)
     p.add_argument("--raven-top-k", type=int, default=2)
+    p.add_argument("--ren-dim-internal", type=int, default=16,
+                   help="REN internal state dimension (n); the param-budget width knob")
+    p.add_argument("--ren-dim-nl", type=int, default=16,
+                   help="REN nonlinearity dimension (l)")
     p.add_argument("--per-channel-gates", action="store_true",
                    help="Use per-channel (d_model-dim) residual gates instead of scalar gates "
                         "in DeepSSM layers. Certified models use the worst-channel gain.")

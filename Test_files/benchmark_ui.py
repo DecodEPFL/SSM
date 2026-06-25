@@ -35,7 +35,7 @@ BENCHMARKS = [
     "EMPS", "CED", "Cascaded_Tanks", "Silverbox", "WienerHammerBenchMark",
     "ParWH", "F16", "Industrial_robot", "WienerHammerstein_Process_Noise",
 ]
-MODELS = ["lru", "l2ru", "l2n", "tv", "tvc", "raven", "ctransformer", "lstm", "gru"]
+MODELS = ["lru", "l2ru", "l2n", "tv", "tvc", "raven", "ren", "ctransformer", "lstm", "gru"]
 INITS = ["eye", "rand"]
 FFS = ["auto", "GLU", "MLP", "LGLU2", "MBLIP", "BLGLU2", "BudgetedLGLU2", "TLIP", "LMLP"]
 DEVICES = ["auto", "cpu", "cuda", "mps"]
@@ -186,6 +186,10 @@ class BenchmarkUI:
         panel_entry(tvc_panel, 4, "tvc_init_b", "input coupling", "0.10")
         panel_entry(tvc_panel, 5, "tvc_init_c", "output coupling", "0.10")
         panel_entry(tvc_panel, 6, "tvc_init_d", "feedthrough", "0.10")
+
+        ren_panel = model_panel("ren", "REN initialization")
+        panel_entry(ren_panel, 0, "ren_dim_internal", "internal state (n)", "16")
+        panel_entry(ren_panel, 1, "ren_dim_nl", "nonlinearity (l)", "16")
 
         # ---- toggles + output dir --------------------------------------------
         self.toggles = ttk.Frame(outer)
@@ -341,6 +345,11 @@ class BenchmarkUI:
                 "--tvc-init-b", g("tvc_init_b"),
                 "--tvc-init-c", g("tvc_init_c"),
                 "--tvc-init-d", g("tvc_init_d"),
+            ]
+        if "ren" in models:
+            cmd += [
+                "--ren-dim-internal", g("ren_dim_internal"),
+                "--ren-dim-nl", g("ren_dim_nl"),
             ]
         cmd += ["--show"] if self.show_var.get() else ["--no-show"]
         if not self.gif_var.get():
