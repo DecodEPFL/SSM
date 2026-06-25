@@ -47,11 +47,14 @@ class REN(nn.Module):
 
         self.training_param_names = ['X', 'Y', 'B2', 'C2', 'Z3', 'X3', 'Y3', 'D12']
 
-        # Optionally define a trainable gamma
+        # Optionally define a trainable gamma. A fixed gamma is stored as a (1,1)
+        # buffer so it follows .to(device)/.to(dtype) like the other constants; a
+        # None gamma is trained (created by _init_trainable_params via the list).
         if self.gammat is None:
             self.training_param_names.append('gamma')
         else:
-            self.gamma = gammat
+            g = gammat if torch.is_tensor(gammat) else torch.tensor(float(gammat))
+            self.register_buffer('gamma', g.reshape(1, 1).float())
 
         # define trainable params
 
@@ -145,7 +148,10 @@ class REN(nn.Module):
         self.B2_eff = E_inv @ self.B2   # E^{-1} B2
 
     def forward(self, u):
-        # u: (B, T, n_u) — rebuild constrained matrices once, then loop over T
+        # u: (B, T, n_u) — rebuild constrained matrices once, then loop over T.
+        # The state is reset to the (batch-expanded) initial condition on every
+        # call, so the module is a stateless map u -> y (one independent trajectory
+        # per sequence), coherent with the SSM models' reset_state=True semantics.
         self.set_param()
         batch_size, T, _ = u.shape
 
@@ -155,20 +161,22 @@ class REN(nn.Module):
         u_B2   = u @ self.B2_eff.T # (B, T, n_state) — state input part
         u_D22  = u @ self.D22.T    # (B, T, n_y)     — output feedthrough
 
+        # Per-call state (local, so the autograd graph is not carried across calls).
+        x = self.init_x.to(device=u.device, dtype=u.dtype).expand(batch_size, 1, self.dim_internal)
         outputs = []
         for t in range(T):
             w = torch.zeros(batch_size, 1, self.dim_nl, device=u.device, dtype=u.dtype)
             # Precompute the x- and u-dependent parts of v once per timestep
             # (saves dim_nl redundant matmuls in the inner loop below).
-            v_base = F.linear(self.x, self.C1) + u_D12[:, t:t+1, :]  # (B,1,dim_nl)
+            v_base = F.linear(x, self.C1) + u_D12[:, t:t+1, :]  # (B,1,dim_nl)
             # update each row of w — must stay sequential (lower-triangular D11).
             # Use out-of-place w = w + masked_update to keep autograd graph intact.
             for i in range(self.dim_nl):
                 v_i = v_base[:, :, i:i+1] + F.linear(w, self.D11[i:i+1, :])
                 w = w + (self.eye_mask_w[i] * torch.tanh(v_i / self.Lambda[i])).view(batch_size, 1, self.dim_nl)
             # state update (no inverse — uses precomputed effective matrices)
-            self.x = F.linear(self.x, self.A_eff) + F.linear(w, self.B1_eff) + u_B2[:, t:t+1, :]
-            outputs.append(F.linear(self.x, self.C2) + F.linear(w, self.D21) + u_D22[:, t:t+1, :])
+            x = F.linear(x, self.A_eff) + F.linear(w, self.B1_eff) + u_B2[:, t:t+1, :]
+            outputs.append(F.linear(x, self.C2) + F.linear(w, self.D21) + u_D22[:, t:t+1, :])
         return torch.cat(outputs, dim=1)  # (B, T, n_y)
 
     def _set_mode(self, mode, gamma, Q, R, S, eps: float = 1e-4):
