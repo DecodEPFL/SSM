@@ -98,6 +98,8 @@ class SSMConfig:
     tvc_init_b: float = 0.10
     tvc_init_c: float = 0.10
     tvc_init_d: float = 0.10
+    bcd_nonlinearity: str = "identity"  # tvc only: 'tanh' bounds b,c,d before normalization
+    # (more stable training); 'identity' (legacy default) leaves them unbounded.
     learn_x0: bool = False  # if True, the initial hidden state is a learnable parameter
     select_context_dim: int = 0  # width of an optional context fed to selective cells'
     # param_net (the "select" injection); 0 disables it. Only used by selective params.
@@ -312,7 +314,7 @@ def _build_tvc_cell(config: SSMConfig, block_gamma: Optional[float]) -> nn.Modul
         init_b=config.tvc_init_b,
         init_c=config.tvc_init_c,
         init_d=config.tvc_init_d,
-        bcd_nonlinearity="identity",
+        bcd_nonlinearity=config.bcd_nonlinearity,
         output_uses_post_state=False,
         learn_x0=config.learn_x0,
         use_cuda_graph=config.use_cuda_graph,
@@ -684,6 +686,7 @@ class DeepSSM(nn.Module):
         ff_residual_init: float = -1.0,
         per_channel_gates: bool = False,
         select_context_dim: int = 0,
+        bcd_nonlinearity: str = "identity",
         config: Optional[SSMConfig] = None,
     ):
         super().__init__()
@@ -720,6 +723,7 @@ class DeepSSM(nn.Module):
             ff_residual_init=ff_residual_init,
             per_channel_gates=per_channel_gates,
             select_context_dim=select_context_dim,
+            bcd_nonlinearity=bcd_nonlinearity,
         )
 
         self._validate_config(self.config)
