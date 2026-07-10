@@ -14,7 +14,8 @@ import math
 import nonlinear_benchmarks
 from nonlinear_benchmarks.error_metrics import RMSE, NRMSE, R_squared, MAE, fit_index
 import json
-from src.neural_ssm.ssm import DeepSSM, MultiHeadRavenRSM, SSMConfig, SimpleRNN
+from src.neural_ssm.experimental import MultiHeadRavenRSM
+from src.neural_ssm.ssm import DeepSSM, SSMConfig, SimpleRNN
 from src.neural_ssm.rens.ren import REN
 
 try:

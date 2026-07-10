@@ -251,7 +251,10 @@ class LRU(nn.Module):
     def set_param(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         lambda_abs = torch.exp(-torch.exp(self.nu_log))
         lambda_phase = torch.exp(self.theta_log)
-        self.lambdas = lambda_abs * torch.exp(1j * lambda_phase)  # (N,) complex
+        # torch.polar(r, theta) == r * exp(1j*theta) with no Python complex
+        # literal in the graph — Inductor cannot codegen the `1j` constant
+        # ("'complex' object has no attribute 'get_name'"); polar compiles.
+        self.lambdas = torch.polar(lambda_abs, lambda_phase)  # (N,) complex
         gammas = torch.exp(self.gamma_log).unsqueeze(-1)  # (N,1) real
         self.B = gammas * self.Bp  # (N,U) complex
         return self.lambdas, self.B, self.C, self.D
@@ -284,7 +287,6 @@ class LRU(nn.Module):
         self.state = states[:, -1].detach() if detach_state else states[:, -1]
         return output, states
 
-    @torch.compiler.disable
     def forward_scan(self, input: torch.Tensor, state: Optional[torch.Tensor] = None, detach_state: bool = True):
         lambdas, B, C, D = self.set_param()
 
@@ -297,7 +299,6 @@ class LRU(nn.Module):
         output = (states[:, :-1, :] @ C.mT).real + input @ D.T
         return output, states
 
-    @torch.compiler.disable
     def forward_conv(self, input: torch.Tensor, state: Optional[torch.Tensor] = None, detach_state: bool = True):
         """FFT-convolution simulation. Same state trajectory and output as
         :meth:`forward_scan`; only the diagonal recurrence solver differs."""

@@ -1,9 +1,11 @@
+"""Internal regression tests for the Raven-style slot-memory prototype."""
+
 import unittest
 
 import torch
 
 from Test_files.Benchmark import ModelConfig, build_model_from_config
-from src.neural_ssm.ssm import MultiHeadRavenRSM
+from src.neural_ssm.experimental import MultiHeadRavenRSM
 
 
 class MultiHeadRavenRSMTests(unittest.TestCase):

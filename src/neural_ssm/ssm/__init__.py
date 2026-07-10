@@ -1,43 +1,21 @@
-# python
-# file: src/neural_ssm/ssm/__init__.py
+"""Supported state-space-model API.
+
+Research prototypes, including Raven-style memory and transformer experiments,
+live under :mod:`neural_ssm.experimental` and are intentionally excluded from
+this stable namespace.
+"""
+
 from .lti_cells import LRU, L2RU, lruz, L2BoundedLTICell, Block2x2DenseL2SSM
-from .selective_cells import L2SelectiveRavenCell, RobustMambaDiagSSM, RobustMambaDiagLTI
-from .experimental import (
-    Block2x2SelectiveBCDExpertsL2SSM,
-    ExpertSelectiveTimeVaryingSSM,
-    MultiHeadRavenRSM,
-)
+from .selective_cells import RobustMambaDiagSSM, RobustMambaDiagLTI
 from .layers import SSMConfig, SSL, DeepSSM, PureLRUR, SimpleRNN
 from .contextual import (
     ContextualDeepSSM,
     timewise_matrix_vector_product,
 )
-from .stable_recurrent_transformer import (
-    StableRecurrentTransformer,
-    StableRecurrentTransformerBlock,
-    LipschitzStaticAttention,
-    split_gain_budget,
-)
-from .certified_transformer import (
-    CertifiedTransformer,
-    CertifiedTransformerBlock,
-    CertifiedMHA,
-    CertifiedFFN,
-    ColumnBudgetedSoftmaxAttention,
-    BoundedQKVProjection,
-    SpectralLinear,
-)
 
 __all__ = [
     "LRU", "L2RU", "lruz", "L2BoundedLTICell", "Block2x2DenseL2SSM",
-    "RobustMambaDiagSSM", "RobustMambaDiagLTI", "L2SelectiveRavenCell",
-    "ExpertSelectiveTimeVaryingSSM", "Block2x2SelectiveBCDExpertsL2SSM",
-    "MultiHeadRavenRSM",
+    "RobustMambaDiagSSM", "RobustMambaDiagLTI",
     "SSMConfig", "SSL", "DeepSSM", "PureLRUR", "SimpleRNN",
     "ContextualDeepSSM", "timewise_matrix_vector_product",
-    "StableRecurrentTransformer", "StableRecurrentTransformerBlock",
-    "LipschitzStaticAttention", "split_gain_budget",
-    "CertifiedTransformer", "CertifiedTransformerBlock", "CertifiedMHA",
-    "CertifiedFFN", "ColumnBudgetedSoftmaxAttention", "BoundedQKVProjection",
-    "SpectralLinear",
 ]

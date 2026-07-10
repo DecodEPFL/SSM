@@ -1,9 +1,12 @@
+"""Internal regression tests for the certified Raven-style prototype."""
+
 import math
 import unittest
 
 import torch
 
-from src.neural_ssm.ssm import DeepSSM, SSMConfig, L2SelectiveRavenCell
+from src.neural_ssm.experimental import L2SelectiveRavenCell
+from src.neural_ssm.ssm import DeepSSM, SSMConfig
 from src.neural_ssm.ssm.layers import _SSM_PARAMETRIZATIONS, _CERTIFIED_PARAMETRIZATIONS
 from src.neural_ssm.ssm.selective_cells import _spectral_cap
 

@@ -35,13 +35,14 @@ BENCHMARKS = [
     "EMPS", "CED", "Cascaded_Tanks", "Silverbox", "WienerHammerBenchMark",
     "ParWH", "F16", "Industrial_robot", "WienerHammerstein_Process_Noise",
 ]
-MODELS = ["lru", "l2ru", "l2n", "tv", "tvc", "raven", "ren", "ctransformer", "lstm", "gru"]
+MODELS = ["lru", "l2ru", "l2n", "tv", "tvc", "ren", "lstm", "gru"]
 INITS = ["eye", "rand"]
 FFS = ["auto", "GLU", "MLP", "LGLU2", "MBLIP", "BLGLU2", "BudgetedLGLU2", "TLIP", "LMLP"]
 DEVICES = ["auto", "cpu", "cuda", "mps"]
 GAMMAS = ["auto", "none", "0.5", "1", "2", "5", "10", "20"]
 # SSM execution mode. "auto" = fastest per model (conv for lru/l2n, scan otherwise).
 MODES = ["auto", "loop", "scan", "conv"]
+COMPILE_MODES = ["default", "reduce-overhead", "max-autotune"]
 
 
 class BenchmarkUI:
@@ -72,7 +73,7 @@ class BenchmarkUI:
         self.model_list = tk.Listbox(mf, selectmode="extended", height=8, exportselection=False)
         for m in MODELS:
             self.model_list.insert("end", m)
-        self.model_list.selection_set(MODELS.index("raven"))
+        self.model_list.selection_set(MODELS.index("tv"))
         self.model_list.pack(fill="both", expand=True)
 
         # ---- options grid -----------------------------------------------------
@@ -120,9 +121,6 @@ class BenchmarkUI:
         entry(opt, "lr", "lr", "3e-3")
         spin(opt, "plot_every", "plot_every", 1, 1000, 10)
         spin(opt, "plot_max_length", "plot max samples", 1, 10000000, 4000, inc=100)
-        spin(opt, "raven_heads", "raven_heads", 1, 32, 4)
-        spin(opt, "raven_slots", "raven_slots", 1, 256, 8)
-        spin(opt, "raven_top_k", "raven_top_k", 1, 256, 2)
         combo(opt, "report_metric", "report metric", ["rmse", "nrmse", "fit", "r2", "mae"], "rmse")
         entry(opt, "param_budget", "param budget (model/int/off)", "lstm", width=10)
 
@@ -199,11 +197,16 @@ class BenchmarkUI:
         self.amp_var = tk.BooleanVar(value=False)
         self.pcg_var = tk.BooleanVar(value=False)
         self.cudagraph_var = tk.BooleanVar(value=True)
+        self.compile_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(self.toggles, text="live window (--show)", variable=self.show_var).pack(side="left")
         ttk.Checkbutton(self.toggles, text="save GIF", variable=self.gif_var).pack(side="left", padx=12)
         ttk.Checkbutton(self.toggles, text="mixed precision (--amp, CUDA)", variable=self.amp_var).pack(side="left")
         ttk.Checkbutton(self.toggles, text="per-channel gates", variable=self.pcg_var).pack(side="left", padx=12)
         ttk.Checkbutton(self.toggles, text="CUDA graph (tv/tvc)", variable=self.cudagraph_var).pack(side="left")
+        ttk.Checkbutton(self.toggles, text="torch.compile", variable=self.compile_var).pack(side="left", padx=12)
+        self.vars["compile_mode"] = tk.StringVar(value="default")
+        ttk.Combobox(self.toggles, textvariable=self.vars["compile_mode"], values=COMPILE_MODES,
+                     width=15, state="readonly").pack(side="left")
 
         self.model_list.bind("<<ListboxSelect>>", self._update_model_options)
         self._update_model_options()
@@ -297,8 +300,6 @@ class BenchmarkUI:
                "--plot-max-length", g("plot_max_length"),
                "--d-model", g("d_model"), "--d-state", g("d_state"), "--n-layers", g("n_layers"),
                "--d-hidden", g("d_hidden"), "--nl-layers", g("nl_layers"),
-               "--raven-heads", g("raven_heads"), "--raven-slots", g("raven_slots"),
-               "--raven-top-k", g("raven_top_k"),
                "--gamma", g("gamma"),
                "--report-metric", g("report_metric"),
                "--param-budget", g("param_budget"),
@@ -356,6 +357,8 @@ class BenchmarkUI:
             cmd += ["--no-gif"]
         if self.amp_var.get():
             cmd += ["--amp"]
+        if self.compile_var.get():
+            cmd += ["--compile", "--compile-mode", g("compile_mode")]
         if self.pcg_var.get():
             cmd += ["--per-channel-gates"]
         cmd += ["--use-cuda-graph"] if self.cudagraph_var.get() else ["--no-use-cuda-graph"]

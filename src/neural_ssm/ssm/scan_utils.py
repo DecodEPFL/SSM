@@ -3,7 +3,10 @@
 # @title PyTorch associative/parallel scan
 # Taken from https://github.com/i404788/s5-pytorch/blob/74e2fdae00b915a62c914bf3615c0b8a4279eb84/s5/jax_compat.py#L50-L134
 import torch
-from jax.tree_util import tree_flatten, tree_unflatten
+# torch's pytree (not jax's): pure-Python, so torch.compile/Dynamo can trace
+# through the scan instead of crashing on jaxlib's C++ flatten(), and the
+# package does not pull in jax for two tuple-plumbing calls.
+from torch.utils._pytree import tree_flatten, tree_unflatten
 from typing import overload, Callable, Iterable, List, TypeVar, Any, Literal, Union, Sequence, Tuple, Optional
 from functools import partial
 import math
@@ -67,8 +70,9 @@ def associative_scan(operator, elems, axis=0, reverse=False):
 
     def combine(a_flat, b_flat):
         # Lower `fn` to operate on flattened sequences of elems.
-        a = tree_unflatten(tree, a_flat)
-        b = tree_unflatten(tree, b_flat)
+        # (torch pytree argument order: tree_unflatten(leaves, spec).)
+        a = tree_unflatten(a_flat, tree)
+        b = tree_unflatten(b_flat, tree)
         c = operator(a, b)
         c_flat, _ = tree_flatten(c)
         return c_flat
@@ -120,7 +124,7 @@ def associative_scan(operator, elems, axis=0, reverse=False):
     if reverse:
         scans = [torch.flip(scanned, [axis]) for scanned in scans]
 
-    return tree_unflatten(tree, scans)
+    return tree_unflatten(scans, tree)
 
 
 def _interleave(a, b, axis):
@@ -139,7 +143,9 @@ def _interleave(a, b, axis):
 
 
 # Taken from https://github.com/i404788/s5-pytorch/blob/74e2fdae00b915a62c914bf3615c0b8a4279eb84/s5/s5_model.py
-@torch.jit.script
+# Plain Python (not @torch.jit.script): ScriptFunctions are opaque to Dynamo and
+# force a graph break per scan level; as ATen calls the kernel count is identical
+# in eager, and torch.compile/Inductor can now fuse the whole scan.
 def binary_operator_diag(q_i: Tuple[torch.Tensor, torch.Tensor], q_j: Tuple[torch.Tensor, torch.Tensor]):
     """Binary operator for parallel scan of linear recurrence. Assumes a diagonal matrix A.
     Args:
@@ -153,6 +159,23 @@ def binary_operator_diag(q_i: Tuple[torch.Tensor, torch.Tensor], q_j: Tuple[torc
 
     # return A_j * A_i, A_j * b_i + b_j
     return A_j * A_i, torch.addcmul(b_j, A_j, b_i)
+
+
+# torch.compiler.is_compiling() appeared in torch 2.3; fall back for older
+# builds (torch._dynamo.is_compiling in 2.1-2.2, constant False before that).
+# Dynamo special-cases these functions by identity, so the alias still
+# evaluates True inside a compiled region.
+try:
+    _is_compiling = torch.compiler.is_compiling
+except AttributeError:
+    try:
+        # torch._dynamo is lazily imported; touching it can raise ImportError
+        # on stripped builds, so catch broadly — any failure means "no dynamo",
+        # and a constant False simply keeps the eager CUDA-graph path.
+        _is_compiling = torch._dynamo.is_compiling
+    except Exception:
+        def _is_compiling() -> bool:
+            return False
 
 
 def diag_affine_scan(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -196,6 +219,12 @@ class GraphedDiagScan:
         self._graphed: dict = {}  # sig -> graphed callable (fwd+bwd)
 
     def __call__(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        # Under torch.compile, hand the pure scan to the compiler instead of the
+        # manual CUDA-graph machinery: Dynamo cannot trace graph capture/replay,
+        # and compiled runs get whole-graph fusion (or mode="reduce-overhead"
+        # cudagraphs) which subsumes this per-scan graph. Eager runs unchanged.
+        if _is_compiling():
+            return diag_affine_scan(a, b)
         if (not self.enabled) or a.device.type != "cuda":
             return diag_affine_scan(a, b)
 
@@ -583,7 +612,7 @@ def compute_linear_recurrence_parallel_scan(
 
 # scan for blocks
 
-@torch.jit.script
+# Plain Python for the same Dynamo-tracing reason as binary_operator_diag.
 def binary_operator_block2x2(
     q_i: Tuple[torch.Tensor, torch.Tensor],
     q_j: Tuple[torch.Tensor, torch.Tensor],
@@ -715,9 +744,14 @@ def _conv_diag_complex(
     # convolution equals the linear one over the first T outputs.
     g = powers[:T]                                        # (T, N): lambda**0 .. lambda**(T-1)
     nfft = 1 << ((2 * T - 1).bit_length())
-    Gf = torch.fft.fft(g, n=nfft, dim=0)                  # (nfft, N)
-    Uf = torch.fft.fft(Bu, n=nfft, dim=0)                 # (nfft, B, N)
-    conv = torch.fft.ifft(Uf * Gf.unsqueeze(1), n=nfft, dim=0)[:T]  # (T, B, N)
+    # FFT along the LAST dim (time moved to dim=-1): same 1-D transforms over
+    # the same logical axis, but the last-dim path is the layout cuFFT/pocketfft
+    # and Inductor's meta kernels agree on — dim=0 FFTs hit an Inductor stride
+    # assertion (torch 2.11) and are also slower on strided memory.
+    Gf = torch.fft.fft(g.movedim(0, -1), n=nfft, dim=-1)    # (N, nfft)
+    Uf = torch.fft.fft(Bu.movedim(0, -1), n=nfft, dim=-1)   # (B, N, nfft)
+    conv_l = torch.fft.ifft(Uf * Gf.unsqueeze(0), n=nfft, dim=-1)[..., :T]  # (B, N, T)
+    conv = conv_l.movedim(-1, 0)                            # (T, B, N)
 
     # states[0] = x0; states[s] = H[s] + conv[s-1] for s = 1..T.
     states = torch.empty(T + 1, B, N, device=device, dtype=cdtype)
