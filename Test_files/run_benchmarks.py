@@ -20,13 +20,13 @@ This is a self-contained benchmark harness:
 Examples
 --------
     # One benchmark, two models
-    python Test_files/run_benchmarks.py --benchmarks Cascaded_Tanks --models raven lstm
+    python Test_files/run_benchmarks.py --benchmarks Cascaded_Tanks --models tv lstm
 
     # All (small) splitted benchmarks, every model, on GPU
     python Test_files/run_benchmarks.py --benchmarks all --device cuda --epochs 400
 
     # The MIMO industrial robot
-    python Test_files/run_benchmarks.py --benchmarks Industrial_robot --models tv raven
+    python Test_files/run_benchmarks.py --benchmarks Industrial_robot --models tv tvc
 
     # List what is available
     python Test_files/run_benchmarks.py --list
@@ -71,7 +71,7 @@ from nonlinear_benchmarks.not_splitted_benchmarks import (
     WienerHammerstein_Process_Noise,
 )
 
-from src.neural_ssm.ssm import DeepSSM, SSMConfig, CertifiedTransformer
+from src.neural_ssm.ssm import DeepSSM, SSMConfig
 from src.neural_ssm.rens.ren import REN
 
 
@@ -363,8 +363,6 @@ MODEL_ZOO: Dict[str, dict] = {
     "l2n":   dict(kind="deepssm", param="l2n",   gamma=5.0,  ff="LGLU2"),   # certified 2x2 dense LTI (needs even d_state)
     "tv":    dict(kind="deepssm", param="tv",    gamma=5.0,  ff="MBLIP"),   # certified selective
     "tvc":   dict(kind="deepssm", param="tvc",   gamma=5.0,  ff="MBLIP"),   # certified selective LTI
-    "raven": dict(kind="deepssm", param="raven", gamma=5.0,  ff="MBLIP"),   # certified Raven cell
-    "ctransformer": dict(kind="ctransformer", gamma_total=20.0),            # certified softmax transformer (conservative attn bound -> needs more budget)
     "lstm":  dict(kind="lstm",    hidden=64, layers=2),
     "gru":   dict(kind="gru",     hidden=64, layers=2),
     "ren":   dict(kind="ren",     gamma=5.0),                            # robust acyclic REN (l2-stable by construction)
@@ -372,11 +370,11 @@ MODEL_ZOO: Dict[str, dict] = {
 
 # Fastest equivalent execution mode per SSM parametrization (used when
 # --mode auto). lru/l2n are LTI diagonal-complex systems -> FFT convolution;
-# the rest only have the parallel scan. lstm/gru/ctransformer don't use `mode`.
+# the rest only have the parallel scan. LSTM/GRU/REN do not use `mode`.
 CONV_CAPABLE = {"lru", "l2n"}
 BEST_MODE: Dict[str, str] = {
     "lru": "conv", "l2n": "conv",
-    "l2ru": "scan", "tv": "scan", "tvc": "scan", "raven": "scan",
+    "l2ru": "scan", "tv": "scan", "tvc": "scan",
 }
 
 
@@ -435,7 +433,6 @@ def _make_ssm_config(spec: dict, gconf: "GlobalModelConfig") -> SSMConfig:
         tvc_init_sign=gconf.tvc_init_sign,
         tvc_init_b=gconf.tvc_init_b, tvc_init_c=gconf.tvc_init_c,
         tvc_init_d=gconf.tvc_init_d,
-        raven_heads=gconf.raven_heads, raven_slots=gconf.raven_slots, raven_top_k=gconf.raven_top_k,
         per_channel_gates=gconf.per_channel_gates,
     )
 
@@ -495,7 +492,7 @@ def build_model(name: str, n_u: int, n_y: int, gconf: "GlobalModelConfig",
                 best = _closest_width(
                     lambda w: _count_params(
                         DeepSSMSim(n_u, n_y, _make_ssm_config(spec, replace(gconf, d_model=w)))),
-                    param_budget, lo=max(2, gconf.raven_heads),
+                    param_budget, lo=2,
                 )
             gconf = replace(gconf, d_model=best)
         if spec.get("param") == "l2n" and gconf.d_state % 2 != 0:
@@ -518,29 +515,6 @@ def build_model(name: str, n_u: int, n_y: int, gconf: "GlobalModelConfig",
                     param_budget,
                 )
         return RNNSim(n_u, n_y, kind=kind, hidden=spec["hidden"], layers=spec["layers"])
-
-    if kind == "ctransformer":
-        gt = float(spec.get("gamma_total", 5.0))
-        ov = str(gconf.gamma_override).lower()
-        if ov not in ("auto", "none", ""):
-            gt = float(gconf.gamma_override)
-
-        def _make_ct(dm):
-            # Causal: simulation must not peek at future inputs. FFN width scales with
-            # d_model (avoids a bottleneck when param-matching inflates d_model).
-            return CertifiedTransformer(
-                d_input=n_u, d_model=int(dm), d_output=n_y,
-                n_layers=max(1, gconf.n_layers), n_heads=gconf.raven_heads,
-                d_ff=max(int(gconf.d_hidden), 2 * int(dm)), gamma_total=gt, causal=True,
-                max_len=16384,
-            )
-
-        if param_budget and param_budget > 0:
-            with torch.random.fork_rng(devices=[]):
-                best = _closest_width(lambda w: _count_params(_make_ct(w)), param_budget,
-                                      lo=max(2, gconf.raven_heads))
-            return _make_ct(best)
-        return _make_ct(gconf.d_model)
 
     if kind == "ren":
         ov = str(gconf.gamma_override).lower()
@@ -598,9 +572,6 @@ class GlobalModelConfig:
     d_hidden: int = 16
     nl_layers: int = 3
     scale: float = 1.0
-    raven_heads: int = 4
-    raven_slots: int = 8
-    raven_top_k: int = 2
     ren_dim_internal: int = 16             # REN internal state dim (n); param-budget width knob
     ren_dim_nl: int = 16                   # REN nonlinearity dim (l)
     per_channel_gates: bool = False
@@ -1486,7 +1457,6 @@ def run(args) -> None:
     gconf = GlobalModelConfig(
         d_model=args.d_model, d_state=args.d_state, n_layers=args.n_layers,
         d_hidden=args.d_hidden, nl_layers=args.nl_layers,
-        raven_heads=args.raven_heads, raven_slots=args.raven_slots, raven_top_k=args.raven_top_k,
         ren_dim_internal=args.ren_dim_internal, ren_dim_nl=args.ren_dim_nl,
         per_channel_gates=args.per_channel_gates,
         lru_rmin=args.lru_rmin, lru_rmax=args.lru_rmax,
@@ -1573,6 +1543,18 @@ def run(args) -> None:
                 set_seed(args.seed)
                 model = build_model(mname, bench.n_u, bench.n_y, gconf,
                                     param_budget=param_budget)
+                rec["compiled"] = False
+                if args.compile:
+                    kind = MODEL_ZOO[mname].get("kind")
+                    if kind in ("lstm", "gru", "ren"):
+                        print(f"     torch.compile: skipped for {mname} "
+                              f"({'eager-only REN' if kind == 'ren' else 'cuDNN kernel already fused'})")
+                    else:
+                        mode = None if args.compile_mode == "default" else args.compile_mode
+                        model = torch.compile(model, mode=mode)
+                        rec["compiled"] = True
+                        print(f"     torch.compile: on (mode={args.compile_mode}) — "
+                              "first step compiles, then it's cached")
                 rec["n_params"] = _count_params(model)
                 rec["n_params_total"] = sum(p.numel() for p in model.parameters())
                 rec["width_eff"] = _effective_width(model)
@@ -1646,6 +1628,7 @@ def run(args) -> None:
         "lr": tcfg.lr, "weight_decay": tcfg.weight_decay, "grad_clip": tcfg.grad_clip,
         "gamma": args.gamma, "ff": args.ff, "param_budget": args.param_budget,
         "per_channel_gates": gconf.per_channel_gates,
+        "compile": f"{args.compile_mode}" if args.compile else "off",
         "model_initialization": _initialization_metadata(gconf),
         "model_dims": f"d_model={gconf.d_model},d_state={gconf.d_state},n_layers={gconf.n_layers}",
     }
@@ -1680,7 +1663,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--benchmarks", nargs="+", default=["Cascaded_Tanks"],
                    help="benchmark names and/or groups: " + ", ".join(sorted(_GROUPS)))
-    p.add_argument("--models", nargs="+", default=["raven", "tv", "lstm"],
+    p.add_argument("--models", nargs="+", default=["tv", "lstm"],
                    help="model names: " + ", ".join(sorted(MODEL_ZOO)))
     p.add_argument("--out", default=str(_REPO_ROOT / "Test_files" / "benchmark_runs"))
     p.add_argument("--device", default=None, help="cuda | cpu | mps (default: auto)")
@@ -1691,6 +1674,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--weight-decay", type=float, default=0.0)
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--amp", action="store_true", help="cuda mixed precision (loosens certified caps)")
+    p.add_argument("--compile", action=argparse.BooleanOptionalAction, default=False,
+                   help="wrap models in torch.compile (skipped for lstm/gru/ren: cuDNN "
+                        "kernels / eager-only REN). Expect a one-off compile pause on the "
+                        "first training step and again on the first full-length eval.")
+    p.add_argument("--compile-mode", default="default",
+                   choices=["default", "reduce-overhead", "max-autotune"],
+                   help="torch.compile mode; reduce-overhead adds CUDA-graph capture")
     p.add_argument("--seed", type=int, default=0)
     # model dims
     p.add_argument("--d-model", type=int, default=16)
@@ -1698,9 +1688,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--n-layers", type=int, default=2)
     p.add_argument("--d-hidden", type=int, default=16)
     p.add_argument("--nl-layers", type=int, default=3)
-    p.add_argument("--raven-heads", type=int, default=4)
-    p.add_argument("--raven-slots", type=int, default=8)
-    p.add_argument("--raven-top-k", type=int, default=2)
     p.add_argument("--ren-dim-internal", type=int, default=16,
                    help="REN internal state dimension (n); the param-budget width knob")
     p.add_argument("--ren-dim-nl", type=int, default=16,

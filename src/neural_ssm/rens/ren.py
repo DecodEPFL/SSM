@@ -147,7 +147,13 @@ class REN(nn.Module):
         self.B1_eff = E_inv @ self.B1   # E^{-1} B1
         self.B2_eff = E_inv @ self.B2   # E^{-1} B2
 
+    @torch.compiler.disable
     def forward(self, u):
+        # torch.compiler.disable: this forward is a T x dim_nl Python double loop
+        # (inherently sequential — lower-triangular D11 and stateful x). Tracing it
+        # would unroll one graph node per (t, i) pair: enormous graphs and
+        # compile times for zero win. Keeping it eager lets whole-model
+        # torch.compile pipelines pass through REN safely.
         # u: (B, T, n_u) — rebuild constrained matrices once, then loop over T.
         # The state is reset to the (batch-expanded) initial condition on every
         # call, so the module is a stateless map u -> y (one independent trajectory

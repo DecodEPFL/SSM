@@ -115,8 +115,9 @@ class SSMConfig:
     per_channel_gates: bool = False  # if True, the residual gates are per-channel (d_model)
     # vectors instead of scalars; the certificate uses the worst-channel gate (max).
 
-    # Raven selective slot-memory cell (param="raven"). Tune these by passing an
-    # SSMConfig directly; DeepSSM(...) keyword construction uses these defaults.
+    # Internal Raven selective slot-memory prototype (param="raven"). It is
+    # retained for the experimental regression suite and is not part of the
+    # supported public DeepSSM surface.
     raven_heads: int = 4  # number of attention heads (H)
     raven_slots: int = 16  # number of key/value memory slots (M)
     raven_key_dim: int = 16  # per-head key/query dimension (d_k)
@@ -348,6 +349,7 @@ _SSM_PARAMETRIZATIONS: dict[str, SSMParametrization] = {
     "l2nt": SSMParametrization("l2nt", _build_l2nt_cell, certified=True),
     "tv": SSMParametrization("tv", _build_tv_cell, certified=True),
     "tvc": SSMParametrization("tvc", _build_tvc_cell, certified=True),
+    # Internal prototype; exposed only through neural_ssm.experimental.
     "raven": SSMParametrization("raven", _build_raven_cell, certified=True),
 }
 _CERTIFIED_PARAMETRIZATIONS = frozenset(

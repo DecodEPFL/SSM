@@ -4,13 +4,20 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "neural-ssm"
-version = "0.42"
-description = "Neural robust state space models in PyTorch"
+version = "0.43.0"
+description = "Robust, L2-gain-bounded neural state-space models in PyTorch"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
 authors = [
   { name = "Leonardo Massai" }
+]
+keywords = [
+  "state-space-models",
+  "system-identification",
+  "robust-control",
+  "sequence-modeling",
+  "pytorch",
 ]
 classifiers = [
   "Programming Language :: Python :: 3",
@@ -25,23 +32,20 @@ classifiers = [
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-  # Core
+  # Runtime core. Install the PyTorch build matching the target CPU/CUDA platform.
   "torch>=2.2",
-  "numpy>=1.23",
-  # Utilities commonly used in training/eval and plotting
-  "tqdm>=4.66",
-  "matplotlib>=3.7",
-  # Tensor/array rearrangements if used in layers
-  "einops>=0.6",
-  # Backport typing if running older Python or for PyTorch type hints
-  "typing-extensions>=4.5",
-      # JAX (CPU by default; GPU wheels are user specific)
-  "jax>=0.4.26",
-  "jaxlib>=0.4.26",
-  "deel-torchlip",
+  "deel-torchlip>=1.0",
 ]
 
 [project.optional-dependencies]
+experiments = [
+  # Tutorials, visual reports, benchmark harness, and experiment scripts.
+  "nonlinear-benchmarks>=1.0.1",
+  "numpy>=1.23",
+  "matplotlib>=3.7",
+  "scipy>=1.10",
+  "tqdm>=4.66",
+]
 dev = [
   "black>=24.3.0",
   "ruff>=0.3.0",
@@ -50,10 +54,6 @@ dev = [
   "pytest-cov>=4.1",
   "ipykernel>=6.29",
   "jupyter>=1.0",
-]
-examples = [
-  "seaborn>=0.13",
-  "pandas>=2.1",
 ]
 docs = [
   "mkdocs>=1.5",
@@ -75,7 +75,7 @@ include = ["neural_ssm*"]
 
 [tool.pytest.ini_options]
 addopts = "-q"
-testpaths = ["tests", "Test_files"]
+testpaths = ["tests"]
 
 [tool.black]
 line-length = 100

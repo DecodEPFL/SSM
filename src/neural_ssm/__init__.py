@@ -6,6 +6,7 @@ from importlib import import_module as _imp
 from . import ssm as ssm
 from . import rens as rens
 from . import static_layers as layers  # public alias
+from . import experimental as experimental
 
 # Top-level classes and configs
 from .ssm.layers import LRU, L2RU, lruz, SSMConfig, SSL, DeepSSM, PureLRUR
@@ -33,11 +34,11 @@ __all__ = [n for n in (
     "LRU", "L2RU", "lruz", "SSMConfig", "SSL", "DeepSSM", "PureLRUR",
     "ContextualDeepSSM", "timewise_matrix_vector_product",
     "REN",
-    "layers", "ssm", "rens",
+    "layers", "ssm", "rens", "experimental",
     "LayerConfig", "GLU", "MLP", "LMLP", "TLIP",
 ) if n in globals()]
 
-__version__ = "0.1.0"
+__version__ = "0.43.0"
 
 def __getattr__(name):
     # Optional lazy/compat shims; keep internals movable
