@@ -112,6 +112,13 @@ class SSMConfig:
     # the hard min without breaking the guarantee.
     ssm_residual_init: float = -1.0  # logit of the SSM residual gate
     ff_residual_init: float = -1.0  # logit of the FF residual gate
+    # Rescale the residual-gate logits at construction so the stack keeps
+    # `budget_init_utilization` of the achievable decoder scale min(1, gamma).
+    # The block product grows geometrically with depth at a fixed logit, so
+    # without this a deep certified stack starts almost entirely attenuated:
+    # 24 blocks at the default logit open with the decoder scaled to 0.3%.
+    auto_residual_init: bool = False
+    budget_init_utilization: float = 0.7  # in (0, 1)
     per_channel_gates: bool = False  # if True, the residual gates are per-channel (d_model)
     # vectors instead of scalars; the certificate uses the worst-channel gate (max).
 
@@ -728,6 +735,8 @@ class DeepSSM(nn.Module):
         learn_x0: bool = False,
         ssm_residual_init: float = -1.0,
         ff_residual_init: float = -1.0,
+        auto_residual_init: bool = False,
+        budget_init_utilization: float = 0.7,
         per_channel_gates: bool = False,
         select_context_dim: int = 0,
         bcd_nonlinearity: str = "identity",
@@ -765,6 +774,8 @@ class DeepSSM(nn.Module):
             learn_x0=learn_x0,
             ssm_residual_init=ssm_residual_init,
             ff_residual_init=ff_residual_init,
+            auto_residual_init=auto_residual_init,
+            budget_init_utilization=budget_init_utilization,
             per_channel_gates=per_channel_gates,
             select_context_dim=select_context_dim,
             bcd_nonlinearity=bcd_nonlinearity,
@@ -813,6 +824,71 @@ class DeepSSM(nn.Module):
                     "Certified DeepSSM feedforwards must expose a global Lipschitz "
                     "bound through `.lip`."
                 )
+            if self.config.auto_residual_init:
+                self._rescale_residual_init()
+
+    @torch.no_grad()
+    def _rescale_residual_init(self) -> None:
+        """Set the residual-gate logits so the initial block product fits the budget.
+
+        ``prod_i k_i`` grows geometrically in depth at a fixed gate logit, while
+        the decoder attenuation ``sigma`` shrinks to keep the composed bound at
+        ``gamma``. A 24-block certified stack therefore starts with its decoder
+        scaled to a fraction of a percent, which is a poor place to begin
+        training and has nothing to do with what the task needs.
+
+        ``budget_init_utilization`` is the fraction of the *achievable* decoder
+        scale to keep at initialization. The best any stack can do is
+        ``sigma = min(1, gamma)``, reached only by identity blocks, so targeting
+        ``sigma = u * min(1, gamma)`` means
+
+            prod_i k_i = max(gamma, 1) / u,
+
+        which is strictly above one for ``u < 1`` and therefore always reachable.
+        Targeting ``u * gamma`` directly would not be: the product cannot go below
+        one, so for ``gamma <= 1/u`` bisection would drive every gate to zero and
+        leave the blocks as the identity map.
+
+        Solves for one shared logit ``l`` with
+        ``prod_i (1 + s(l) gamma_i)(1 + s(l) L_i) = target`` by bisection. The
+        left side is continuous and strictly increasing in ``l``, from one at
+        ``l -> -inf``, so the root exists and is unique.
+        """
+        if not self.blocks:
+            return
+        utilization = float(self.config.budget_init_utilization)
+        if not 0.0 < utilization < 1.0:
+            raise ValueError(
+                f"budget_init_utilization must be in (0, 1), got {utilization}."
+            )
+        target = max(float(self._prescribed_gamma), 1.0) / utilization
+        device = self.encoder_w.device
+        dtype = self.encoder_w.dtype
+        terms = self._block_gain_terms(device=device, dtype=dtype, training=False)
+        gammas = [float(t["gamma"]) for t in terms]
+        lips = [float(t["ff_lip"]) for t in terms]
+        if not all(math.isfinite(g) and math.isfinite(l) for g, l in zip(gammas, lips)):
+            return  # uncertified components: nothing meaningful to balance
+
+        def log_product(logit: float) -> float:
+            alpha = 1.0 / (1.0 + math.exp(-logit))
+            return sum(
+                math.log1p(alpha * g) + math.log1p(alpha * l)
+                for g, l in zip(gammas, lips)
+            )
+
+        log_target = math.log(target)
+        lo, hi = -30.0, 30.0
+        for _ in range(80):
+            mid = 0.5 * (lo + hi)
+            if log_product(mid) < log_target:
+                lo = mid
+            else:
+                hi = mid
+        logit = 0.5 * (lo + hi)
+        for block in self.blocks:
+            block.ssm_res_logit.fill_(logit)
+            block.ff_res_logit.fill_(logit)
 
     @staticmethod
     def _validate_config(config: SSMConfig) -> None:
@@ -1229,6 +1305,14 @@ class DeepSSM(nn.Module):
             "conservative_gamma_prod": float(conservative.detach().cpu()),
             "smooth_scale": smooth_scale,
             "hard_scale": hard_scale,
+            # How much of the prescribed budget the blocks actually use. Well
+            # below 1 means the decoder is being attenuated to compensate for an
+            # oversized block product, which costs signal scale at no benefit --
+            # it grows geometrically with depth at a fixed residual-gate init.
+            # See ``auto_residual_init``.
+            "budget_utilization": (
+                None if global_gamma is None else float(gamma_prod) / global_gamma
+            ),
             "certified_gain_bound": certified_bound,
             "encoder_norm": encoder_norm,
             "decoder_norm": decoder_norm,
