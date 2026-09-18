@@ -321,6 +321,90 @@ class DeploymentFreezeTests(unittest.TestCase):
         self.assertLessEqual(float(energy(y).max()), bound ** 2 * float(energy(u).max()) + 1e-4)
 
 
+class BudgetInitTests(unittest.TestCase):
+    """The block product grows geometrically with depth at a fixed gate logit."""
+
+    def setUp(self):
+        torch.manual_seed(0)
+
+    def test_default_init_attenuates_the_decoder_exponentially_with_depth(self):
+        """The motivation: without rescaling, a deep stack starts nearly silent."""
+        scales = [
+            build(n_layers=n).gain_diagnostics()["smooth_scale"] for n in (4, 12, 24)
+        ]
+        self.assertTrue(
+            scales[0] > scales[1] > scales[2],
+            f"expected decreasing decoder scale with depth, got {scales}",
+        )
+        self.assertLess(scales[2], 0.02)
+
+    def test_auto_init_hits_the_utilization_target_at_any_depth_and_gamma(self):
+        """The solver controls the block product; sigma follows it.
+
+        Asserted on the product, which is what bisection targets. The realized
+        ``smooth_scale`` sits just under the hard ``min(1, gamma/prod)`` because
+        the soft cap errs on the safe side, so it is checked with that slack.
+        """
+        for gamma in (0.3, 1.0, 2.0):
+            for n_layers in (2, 8, 24):
+                for util in (0.5, 0.7, 0.9):
+                    model = build(
+                        n_layers=n_layers, gamma=gamma,
+                        auto_residual_init=True, budget_init_utilization=util,
+                    )
+                    diag = model.gain_diagnostics()
+                    where = f"gamma={gamma} n_layers={n_layers} util={util}"
+                    self.assertAlmostEqual(
+                        diag["gamma_prod"], max(gamma, 1.0) / util, places=3, msg=where
+                    )
+                    achieved = diag["smooth_scale"] / min(1.0, gamma)
+                    self.assertLessEqual(achieved, util + 1e-4, msg=where)
+                    self.assertGreater(achieved, 0.94 * util, msg=where)
+
+    def test_auto_init_keeps_the_residual_gates_alive(self):
+        """Targeting u*gamma instead of max(gamma,1)/u zeroes every gate.
+
+        The block product cannot fall below one, so for gamma <= 1/u the
+        bisection would run to its lower bracket and leave each block as the
+        identity map -- a silently dead network that still reports a valid bound.
+        """
+        for gamma in (0.1, 0.3, 1.0, 2.0):
+            model = build(n_layers=12, gamma=gamma, auto_residual_init=True)
+            for block in model.blocks:
+                with torch.no_grad():
+                    self.assertGreater(float(block.ssm_scale.min()), 1e-4, f"gamma={gamma}")
+                    self.assertGreater(float(block.ff_scale.min()), 1e-4, f"gamma={gamma}")
+
+            u = torch.randn(2, 16, 3)
+            with torch.no_grad():
+                y, _ = model(u, mode="loop", reset_state=True)
+            self.assertGreater(float(y.abs().max()), 0.0, f"dead network at gamma={gamma}")
+
+    def test_auto_init_preserves_the_certificate(self):
+        for gamma in (0.3, 1.0):
+            model = build(n_layers=12, gamma=gamma, auto_residual_init=True)
+            bound = float(model.certified_gain_bound())
+            self.assertLessEqual(bound, gamma + 1e-5)
+            u = torch.randn(4, 40, 3) * 2.0
+            with torch.no_grad():
+                y, _ = model(u, mode="loop", reset_state=True)
+            self.assertLessEqual(
+                float(energy(y).max()), bound ** 2 * float(energy(u).max()) + 1e-5
+            )
+
+    def test_budget_utilization_is_reported(self):
+        model = build(n_layers=8)
+        diag = model.gain_diagnostics()
+        self.assertAlmostEqual(
+            diag["budget_utilization"], diag["gamma_prod"] / diag["global_gamma"], places=5
+        )
+
+    def test_invalid_utilization_is_rejected(self):
+        for bad in (0.0, 1.0, -0.5, 2.0):
+            with self.assertRaises(ValueError):
+                build(n_layers=4, auto_residual_init=True, budget_init_utilization=bad)
+
+
 class PostStateOutputTests(unittest.TestCase):
     def test_post_state_output_withdraws_the_gain_contract(self):
         """Normalizing [[a,b],[c,d]] does not bound [[a,b],[c*a,c*b+d]]."""
