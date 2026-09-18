@@ -70,9 +70,16 @@ class _ContextFilter(nn.Module):
       on the operating horizon, then zero), ``taper`` (smooth raised-cosine
       roll-off, kinder gradients), ``exponential``/``polynomial`` (anytime l2),
       ``none`` (no projection: sys-ID / finite-gain regime, NOT l2);
-    * differencing ``z_t - z_{t-1}`` (``difference``) -- l2 for free on
-      bounded-variation / switching context, loss-free, and self-vanishing once
-      the context settles.
+    * differencing ``z_t - z_{t-1}`` (``difference``) -- loss-free and
+      self-vanishing once the context settles.
+
+    ``difference`` is l2 only for context of *summable variation*: finitely many
+    switches, or steps whose sizes are square-summable. An arbitrarily switching
+    bounded context is not made l2 by differencing, because every switch
+    contributes a fixed increment and the squares do not sum. A bounded constant
+    sequence is not an infinite-horizon l2 signal either.
+    :meth:`weight_l2_norm` therefore reports ``inf`` for this mode; measure the
+    realized ``filtered_context`` norm via ``return_aux`` instead.
     """
 
     def __init__(
@@ -608,6 +615,39 @@ class ContextualDeepSSM(nn.Module):
         return bound * float(self.matrix_norm_bound)
 
     @torch.no_grad()
+    def storage_value(self, state, gamma=None) -> torch.Tensor:
+        """``V_Q(s)`` for the contextual stack.
+
+        A bounded mixer ``v_t = A_t f_t`` with ``||A_t||_2 <= m`` multiplies both
+        sides of the core's dissipation inequality by ``m^2``, so the storage
+        scales the same way the gain does. Without a mixer ``m = 1``.
+        """
+        return self.core.storage_value(state, gamma=gamma) * float(self.matrix_norm_bound) ** 2
+
+    @torch.no_grad()
+    def initial_storage_bound(self, state, gamma=None) -> torch.Tensor:
+        """``b_Q = sqrt(V_Q(s_0))`` for the contextual stack."""
+        return torch.sqrt(self.storage_value(state, gamma=gamma).clamp_min(0.0))
+
+    @torch.no_grad()
+    def certificate_fingerprint(self) -> str:
+        """Hash of everything the certificate depends on.
+
+        Deliberately excludes the context encoder, selector, gate and mixer
+        *weights*: with ``context_modes=("select",)`` the per-step
+        renormalization holds for any value they take, so they stay free to adapt
+        online without invalidating the bound. The mixer's norm *bound* is
+        included, because that one does enter the certificate.
+        """
+        return f"{self.core.certificate_fingerprint()}|mixer={self.matrix_norm_bound:.12e}"
+
+    @torch.no_grad()
+    def freeze_certificate(self) -> str:
+        """Freeze the core's certificate parameters; leave the context ports free."""
+        self.core.freeze_certificate()
+        return self.certificate_fingerprint()
+
+    @torch.no_grad()
     def additive_channel_gain(self, gamma=None) -> float:
         """l2 gain from the (filtered) additive context channel to the output.
 
@@ -665,6 +705,12 @@ class ContextualDeepSSM(nn.Module):
             diagnostics["core"] = self.core.gain_diagnostics()
         if hasattr(self.core, "certified_gain_bound"):
             diagnostics["certified_gain_bound"] = float(self.certified_gain_bound().detach().cpu())
+        if getattr(self.core, "use_cert_scaling", False):
+            m2 = float(self.matrix_norm_bound) ** 2
+            diagnostics["storage_weights"] = [
+                w * m2 for w in self.core.storage_weights().detach().cpu().tolist()
+            ]
+            diagnostics["certificate_fingerprint"] = self.certificate_fingerprint()
         return diagnostics
 
     def reset(self):

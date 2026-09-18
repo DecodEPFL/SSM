@@ -416,6 +416,34 @@ def _module_lip_bound(
     return torch.as_tensor(bound, device=device, dtype=dtype).abs()
 
 
+def _state_energy(
+    state: Any,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Optional[torch.Tensor]:
+    """Return ``||s||^2`` per batch element, or ``None`` when there is no state.
+
+    Cells hold their state either as one ``(batch, n_state)`` tensor or as a
+    nested tuple of them. Complex states (the LRU family) contribute
+    ``sum_k |s_k|^2``, which is what ``vector_norm`` computes for complex input.
+    """
+    if state is None:
+        return None
+    if torch.is_tensor(state):
+        flat = state.reshape(state.shape[0], -1) if state.ndim > 1 else state.reshape(1, -1)
+        energy = torch.linalg.vector_norm(flat, dim=-1) ** 2
+        return energy.real.to(device=device, dtype=dtype) if energy.is_complex() \
+            else energy.to(device=device, dtype=dtype)
+    if isinstance(state, (tuple, list)):
+        parts = [_state_energy(item, device=device, dtype=dtype) for item in state]
+        parts = [p for p in parts if p is not None]
+        if not parts:
+            return None
+        return torch.stack(parts).sum(dim=0)
+    raise TypeError(f"Unsupported state type: {type(state).__name__}.")
+
+
 def _build_ssm_cell(config: SSMConfig, block_gamma: Optional[float]) -> nn.Module:
     """Build one recurrent cell from the registry and initialize its gain."""
     cell = _get_ssm_parametrization(config.param).factory(config, block_gamma)
@@ -540,6 +568,18 @@ class SSL(nn.Module):
         ff_branch_gain = ff_lip * ff_drop_factor
         ssm_factor = 1.0 + alpha_ssm * ssm_branch_gain
         ff_factor = 1.0 + alpha_ff * ff_branch_gain
+        # Effective residual weights after dropout inflation. Dropout scales the
+        # branch, which is equivalent to inflating the gate, so ssm_factor reads
+        # 1 + alpha_eff*gamma and ff_factor reads 1 + beta_eff*ff_lip.
+        alpha_eff = alpha_ssm * ssm_drop_factor
+        # Storage weight of the SSM residual, c = alpha_eff*(alpha_eff + 1/gamma)
+        # from the Young's-inequality split of the cross term in ||p + alpha*G*o||^2.
+        # A cell with no positive finite gain contract has no such storage.
+        c_ssm = torch.where(
+            (gamma > 0) & torch.isfinite(gamma),
+            alpha_eff * (alpha_eff + 1.0 / gamma.clamp_min(torch.finfo(dtype).tiny)),
+            torch.full_like(gamma, float("inf")),
+        )
         return {
             "gamma": gamma,
             "ff_lip": ff_lip,
@@ -547,11 +587,13 @@ class SSL(nn.Module):
             "ff_drop_factor": ff_drop_factor,
             "alpha_ssm": alpha_ssm,
             "alpha_ff": alpha_ff,
+            "alpha_eff": alpha_eff,
             "ssm_branch_gain": ssm_branch_gain,
             "ff_branch_gain": ff_branch_gain,
             "ssm_factor": ssm_factor,
             "ff_factor": ff_factor,
             "block_factor": ssm_factor * ff_factor,
+            "c_ssm": c_ssm,
         }
 
     def forward(
@@ -985,6 +1027,115 @@ class DeepSSM(nn.Module):
         return torch.where(torch.isfinite(log_scale), bound, torch.zeros_like(bound))
 
     @torch.no_grad()
+    def storage_weights(self, gamma=None) -> torch.Tensor:
+        """Per-block weights of the stack's storage function.
+
+        The certificate ``||f||^2 <= Gamma^2 ||e||^2`` holds from zero state. For a
+        nonzero state it becomes a dissipation inequality that needs a storage
+        function, and this returns its per-block weights ``w_i`` so that
+
+            V_Q(s) = sum_i w_i * ||s_i||^2,
+            V_Q(s_{t+1}) - V_Q(s_t) + ||f_t||^2 <= Gamma^2 ||e_t||^2.
+
+        Writing ``c_i`` for the SSM residual storage weight, ``l_i`` for the
+        feedforward factor and ``k_i`` for the block factor,
+
+            w_i = (||D|| * sigma)^2 * prod_{j>i} k_j^2 * l_i^2 * c_i,
+
+        which is block ``i``'s storage carried through the blocks above it, the
+        decoder and its attenuation. Composed in log space for the same reason
+        :meth:`certified_gain_bound` is: ``prod k_j^2`` overflows and ``sigma^2``
+        underflows well inside float32 for deep stacks.
+
+        Returns a ``(n_blocks,)`` tensor; empty when the stack has no blocks.
+        """
+        if not self.use_cert_scaling:
+            raise RuntimeError("storage_weights requires a prescribed gamma.")
+
+        device = self.encoder_w.device
+        dtype = self.encoder_w.dtype
+        if len(self.blocks) == 0:
+            return torch.zeros(0, device=device, dtype=dtype)
+
+        terms = self._block_gain_terms(device=device, dtype=dtype)
+        tiny = torch.finfo(dtype).tiny
+        log_kappa = torch.stack(
+            [torch.log(t["block_factor"].clamp_min(tiny)) for t in terms]
+        )
+        log_ell = torch.stack([torch.log(t["ff_factor"].clamp_min(tiny)) for t in terms])
+        log_c = torch.stack([torch.log(t["c_ssm"].clamp_min(tiny)) for t in terms])
+
+        # suffix_i = sum_{j>i} log k_j
+        total = log_kappa.sum()
+        suffix = total - torch.cumsum(log_kappa, dim=0)
+
+        decoder_eff = self._spectrally_capped_weight(self.decoder_w)
+        decoder_norm = torch.linalg.matrix_norm(decoder_eff.float(), ord=2).to(dtype=dtype)
+        log_scale = self._smooth_capped_log_scale_from_logs(
+            gamma_t=self._effective_gamma_cap(gamma=gamma, device=device, dtype=dtype),
+            log_gamma_prod=self._log_block_gain_product(device=device, dtype=dtype),
+            temperature=self.config.cert_scale_temperature,
+        )
+        log_out = 2.0 * (torch.log(decoder_norm.clamp_min(tiny)) + log_scale)
+
+        log_w = log_out + 2.0 * suffix + 2.0 * log_ell + log_c
+        weights = torch.exp(log_w)
+        # A non-finite log_scale means the decoder is fully attenuated: no state
+        # energy reaches the output, so the storage vanishes rather than blows up.
+        return torch.where(torch.isfinite(log_scale), weights, torch.zeros_like(weights))
+
+    @torch.no_grad()
+    def storage_value(
+        self,
+        state: Optional[Sequence[Optional[torch.Tensor]]],
+        gamma=None,
+    ) -> torch.Tensor:
+        """Evaluate ``V_Q(s) = sum_i w_i ||s_i||^2`` for a stack state.
+
+        ``state`` is the per-block state list :meth:`forward` returns. Returns a
+        ``(batch,)`` tensor, or a scalar zero for ``None`` / an empty stack.
+
+        This assumes every cell's storage is ``V(s) = ||s||^2``, which is what the
+        per-step ``||M_t||_2 <= 1`` normalization of the ``tv`` and ``tvc`` cells
+        establishes. A cell certified by a different storage would need its own
+        quadratic form here.
+        """
+        weights = self.storage_weights(gamma=gamma)
+        if state is None or weights.numel() == 0:
+            return torch.zeros((), device=self.encoder_w.device, dtype=self.encoder_w.dtype)
+        if len(state) != len(self.blocks):
+            raise ValueError(
+                f"state must provide exactly one entry per SSL block: "
+                f"expected {len(self.blocks)}, got {len(state)}"
+            )
+
+        total = None
+        for w_i, s_i in zip(weights, state):
+            energy = _state_energy(s_i, device=weights.device, dtype=weights.dtype)
+            if energy is None:
+                continue
+            contribution = w_i * energy
+            total = contribution if total is None else total + contribution
+        if total is None:
+            return torch.zeros((), device=weights.device, dtype=weights.dtype)
+        return total
+
+    @torch.no_grad()
+    def initial_storage_bound(
+        self,
+        state: Optional[Sequence[Optional[torch.Tensor]]],
+        gamma=None,
+    ) -> torch.Tensor:
+        """``b_Q = sqrt(V_Q(s_0))``, the offset a nonzero initial state adds.
+
+        This is the term the closed-loop finite-gain argument needs:
+        ``||v||_T <= gamma_Q ||e||_T + b_Q(s_0)``. A chunk of a continuing
+        trajectory starts from a nonzero state, so it is not a fresh zero-state
+        experiment and this term does not vanish.
+        """
+        return torch.sqrt(self.storage_value(state, gamma=gamma).clamp_min(0.0))
+
+    @torch.no_grad()
     def gain_diagnostics(self) -> dict[str, Any]:
         """Return certificate data using the same factors as :meth:`forward`.
 
@@ -1018,6 +1169,7 @@ class DeepSSM(nn.Module):
                 "ssm_factor": float(term["ssm_factor"].detach().cpu()),
                 "ff_factor": float(term["ff_factor"].detach().cpu()),
                 "block_factor": float(term["block_factor"].detach().cpu()),
+                "c_ssm": float(term["c_ssm"].detach().cpu()),
             })
 
         if terms:
@@ -1065,6 +1217,9 @@ class DeepSSM(nn.Module):
             certified_bound = float(self.certified_gain_bound().detach().cpu())
             encoder_norm = float(encoder_norm_t.detach().cpu())
             decoder_norm = float(decoder_norm_t.detach().cpu())
+            storage = self.storage_weights()
+            for row, w_i in zip(block_rows, storage.detach().cpu().tolist()):
+                row["storage_weight"] = w_i
 
         return {
             "mode": "train" if self.training else "eval",
@@ -1080,6 +1235,69 @@ class DeepSSM(nn.Module):
             "n_blocks": len(block_rows),
             "blocks": block_rows,
         }
+
+    @torch.no_grad()
+    def certificate_fingerprint(self) -> str:
+        """Hash every quantity the certificate depends on.
+
+        Freezing deployment parameters is an assumption of the whole argument:
+        the storage weights and the decoder attenuation are derived from the
+        layer gains, so recomputing a cap after those gains move does not account
+        for energy already stored under the old ones. This gives a value to
+        assert on either side of a deployment, or across an online update, to
+        show that nothing which determines the bound has changed.
+
+        Covers the encoder and decoder weights, every block's gain terms, the
+        prescribed gain and the resulting bound -- not the selector, gate or
+        mixer weights, which the certificate is deliberately indifferent to.
+        """
+        import hashlib
+
+        device = self.encoder_w.device
+        dtype = self.encoder_w.dtype
+        digest = hashlib.sha256()
+        digest.update(f"cert-v1|{self.config.param}|{self.config.ff}|".encode())
+        digest.update(f"{self.use_cert_scaling}|{self._prescribed_gamma}|".encode())
+        for name in ("encoder_w", "decoder_w"):
+            w = getattr(self, name)
+            digest.update(name.encode())
+            digest.update(w.detach().float().cpu().contiguous().numpy().tobytes())
+        for index, term in enumerate(self._block_gain_terms(device=device, dtype=dtype)):
+            digest.update(f"block{index}".encode())
+            for key in ("gamma", "ff_lip", "alpha_ssm", "alpha_ff", "c_ssm", "block_factor"):
+                digest.update(f"{key}={float(term[key].detach().cpu()):.12e}|".encode())
+        if self.use_cert_scaling:
+            digest.update(f"bound={float(self.certified_gain_bound()):.12e}".encode())
+        return digest.hexdigest()
+
+    @torch.no_grad()
+    def freeze_certificate(self) -> str:
+        """Freeze every parameter the certificate depends on; return its fingerprint.
+
+        Leaves the selector, gate and mixer pathways trainable: the per-step
+        renormalization means the bound holds for any value they take, so they
+        remain free to adapt online. Encoder, decoder, cell gains, residual gates
+        and feedforward Lipschitz budgets are fixed, because the bound is derived
+        from them and a change invalidates the stored energy accounted for by
+        :meth:`storage_weights`.
+        """
+        for name in ("encoder_w", "decoder_w"):
+            weight = getattr(self, name, None)
+            if isinstance(weight, nn.Parameter):
+                weight.requires_grad_(False)
+        for block in self.blocks:
+            block.ssm_res_logit.requires_grad_(False)
+            block.ff_res_logit.requires_grad_(False)
+            raw_lip = getattr(block.ff, "raw_lip", None)
+            if isinstance(raw_lip, nn.Parameter):
+                raw_lip.requires_grad_(False)
+            for attr in ("log_gamma", "gamma"):
+                value = getattr(block.lru, attr, None)
+                if isinstance(value, nn.Parameter):
+                    value.requires_grad_(False)
+        if isinstance(getattr(self, "gamma_t", None), nn.Parameter):
+            self.gamma_t.requires_grad_(False)
+        return self.certificate_fingerprint()
 
     @staticmethod
     def _last_runtime_state(state: Any) -> Any:

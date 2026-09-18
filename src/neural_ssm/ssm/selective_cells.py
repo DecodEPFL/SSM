@@ -475,9 +475,11 @@ class RobustMambaDiagLTI(nn.Module):
 
         if output_uses_post_state:
             warnings.warn(
-                "RobustMambaDiagLTI: output_uses_post_state=True may improve expressivity, "
-                "but the simple exact local certificate based on [[a,b],[c,d]] is no longer "
-                "the exact forward-map certificate.",
+                "RobustMambaDiagLTI: output_uses_post_state=True VOIDS the l2-gain "
+                "certificate. Normalizing [[a,b],[c,d]] does not bound the realized "
+                "matrix [[a,b],[c*a,c*b+d]] of the post-state output path, so gamma is "
+                "not a gain bound here and gain_bound() reports inf. Use it only for "
+                "uncertified experiments.",
                 UserWarning,
                 stacklevel=2,
             )
@@ -551,6 +553,20 @@ class RobustMambaDiagLTI(nn.Module):
     @property
     def gamma(self) -> torch.Tensor:
         return self.log_gamma.exp()
+
+    def gain_bound(self) -> torch.Tensor:
+        """The cell's zero-state l2-gain contract, or ``inf`` when it has none.
+
+        Normalizing ``[[a, b], [c, d]]`` certifies the map that reads the output
+        from the *pre-update* state. With ``output_uses_post_state=True`` the
+        realized matrix is ``[[a, b], [c*a, c*b + d]]``, whose norm is not
+        controlled by normalizing the original, so ``gamma`` is not a bound on
+        that path. Reporting ``inf`` makes any stack built on this cell surface an
+        infinite certificate rather than a number the forward map does not obey.
+        """
+        if self.output_uses_post_state:
+            return torch.full_like(self.log_gamma, float("inf"))
+        return self.gamma
 
     @torch.no_grad()
     def reset_parameters(
