@@ -451,6 +451,11 @@ class ContextualDeepSSM(nn.Module):
         if ssm_config is not None and core_kwargs:
             raise ValueError("Pass either ssm_config or DeepSSM keyword args, not both.")
 
+        self.select_input = str(
+            (ssm_config.select_input if ssm_config is not None else None)
+            or core_kwargs.get("select_input", "both")
+        )
+
         self.d_features = int(d_features or d_output)
         self.core_input_dim = (
             self.d_input + (self.d_context if "input" in self.context_modes else 0)
@@ -613,6 +618,39 @@ class ContextualDeepSSM(nn.Module):
         """Return a conservative bound from the core input to the output."""
         bound = self.core.certified_gain_bound(gamma=gamma)
         return bound * float(self.matrix_norm_bound)
+
+    @property
+    def is_lpv(self) -> bool:
+        """True when every port depends on context alone, not on the input.
+
+        The core's cells must be in ``select_input='context'`` mode, and the gate
+        and mixer must not see the disturbance: a gate or mixing matrix computed
+        from the input would make the block nonlinear again and cost the
+        incremental bound, even with an LPV core.
+
+        The ``input`` mode is also disqualifying. It adds context to the input
+        channel rather than scheduling the dynamics, so its contribution does not
+        cancel in the difference of two trajectories.
+        """
+        if "input" in self.context_modes:
+            return False
+        if self.gate is not None and self.gate.include_disturbance:
+            return False
+        if self.mixer is not None and self.mixer.include_disturbance:
+            return False
+        return bool(getattr(self.core, "is_lpv", False))
+
+    @torch.no_grad()
+    def incremental_gain_bound(self, gamma=None) -> torch.Tensor:
+        """Incremental gain from the core input to the output, or ``inf``.
+
+        A context-only mixer ``A_t`` is a fixed linear map at each step, so it
+        scales the difference of two trajectories by the same ``m`` it scales a
+        single one. See :meth:`DeepSSM.incremental_gain_bound`.
+        """
+        if not self.is_lpv:
+            return torch.full((), float("inf"))
+        return self.core.incremental_gain_bound(gamma=gamma) * float(self.matrix_norm_bound)
 
     @torch.no_grad()
     def storage_value(self, state, gamma=None) -> torch.Tensor:

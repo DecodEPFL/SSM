@@ -103,6 +103,12 @@ class SSMConfig:
     learn_x0: bool = False  # if True, the initial hidden state is a learnable parameter
     select_context_dim: int = 0  # width of an optional context fed to selective cells'
     # param_net (the "select" injection); 0 disables it. Only used by selective params.
+    # What the selective cells' param_net may see. 'both' is Mamba-style input
+    # selectivity and certifies a zero-state l2 bound only. 'context' makes the
+    # per-step matrices depend on the exogenous context alone, so the map is
+    # linear time-varying for a fixed context and the same bound becomes
+    # *incremental*. See DeepSSM.incremental_gain_bound.
+    select_input: str = "both"
     use_cuda_graph: bool = False  # tv/tvc only: replay the diagonal scan from a captured CUDA
     # graph instead of eager dispatch (same maths; removes launch overhead for fixed-shape runs)
     zak_d_margin: float = 0.5  # ZAK-only: initialize the direct term strictly inside the feasible set
@@ -203,11 +209,16 @@ class SSMParametrization:
 
     ``certified`` means the produced cell exposes a finite zero-state L2-gain
     bound through either ``gain_bound()`` or the legacy ``.gamma`` attribute.
+
+    ``selective`` means the cell builds its per-step transition from a
+    ``param_net``, so a context signal can shape the dynamics and the cell
+    accepts ``select_input``.
     """
 
     name: str
     factory: CellFactory
     certified: bool
+    selective: bool = False
 
 
 def _fixed_gamma(config: SSMConfig, block_gamma: Optional[float]) -> Optional[float]:
@@ -303,6 +314,7 @@ def _build_tv_cell(config: SSMConfig, block_gamma: Optional[float]) -> nn.Module
         learn_x0=config.learn_x0,
         use_cuda_graph=config.use_cuda_graph,
         context_dim=config.select_context_dim,
+        select_input=config.select_input,
     )
 
 
@@ -327,6 +339,7 @@ def _build_tvc_cell(config: SSMConfig, block_gamma: Optional[float]) -> nn.Modul
         learn_x0=config.learn_x0,
         use_cuda_graph=config.use_cuda_graph,
         context_dim=config.select_context_dim,
+        select_input=config.select_input,
     )
 
 
@@ -354,8 +367,8 @@ _SSM_PARAMETRIZATIONS: dict[str, SSMParametrization] = {
     "zak": SSMParametrization("zak", _build_zak_cell, certified=True),
     "l2n": SSMParametrization("l2n", _build_l2n_cell, certified=True),
     "l2nt": SSMParametrization("l2nt", _build_l2nt_cell, certified=True),
-    "tv": SSMParametrization("tv", _build_tv_cell, certified=True),
-    "tvc": SSMParametrization("tvc", _build_tvc_cell, certified=True),
+    "tv": SSMParametrization("tv", _build_tv_cell, certified=True, selective=True),
+    "tvc": SSMParametrization("tvc", _build_tvc_cell, certified=True, selective=True),
     # Internal prototype; exposed only through neural_ssm.experimental.
     "raven": SSMParametrization("raven", _build_raven_cell, certified=True),
 }
@@ -739,6 +752,7 @@ class DeepSSM(nn.Module):
         budget_init_utilization: float = 0.7,
         per_channel_gates: bool = False,
         select_context_dim: int = 0,
+        select_input: str = "both",
         bcd_nonlinearity: str = "identity",
         config: Optional[SSMConfig] = None,
     ):
@@ -778,6 +792,7 @@ class DeepSSM(nn.Module):
             budget_init_utilization=budget_init_utilization,
             per_channel_gates=per_channel_gates,
             select_context_dim=select_context_dim,
+            select_input=select_input,
             bcd_nonlinearity=bcd_nonlinearity,
         )
 
@@ -920,6 +935,23 @@ class DeepSSM(nn.Module):
             )
 
         cell_spec = _get_ssm_parametrization(config.param)
+
+        if config.select_input not in ("both", "context"):
+            raise ValueError(
+                f"select_input must be 'both' or 'context', got {config.select_input!r}."
+            )
+        if config.select_input == "context":
+            if config.select_context_dim <= 0:
+                raise ValueError(
+                    "select_input='context' requires select_context_dim > 0: the "
+                    "selector would otherwise have no input at all."
+                )
+            if config.n_layers > 0 and not cell_spec.selective:
+                raise ValueError(
+                    f"select_input='context' requires a selective parametrization "
+                    f"whose per-step matrices the context can shape; got "
+                    f"param={config.param!r}. Use 'tv' or 'tvc'."
+                )
 
         if config.gamma is None:
             return
@@ -1101,6 +1133,55 @@ class DeepSSM(nn.Module):
         )
         bound = torch.exp(log_bound)
         return torch.where(torch.isfinite(log_scale), bound, torch.zeros_like(bound))
+
+    @property
+    def is_lpv(self) -> bool:
+        """True when the per-step matrices depend only on exogenous context.
+
+        Every selective cell must be in ``select_input='context'`` mode. The map
+        from input to output is then linear time-varying for a fixed context
+        sequence, which is what turns the zero-state certificate into an
+        incremental one.
+        """
+        if not self.blocks:
+            return False
+        return all(
+            getattr(block.lru, "select_input", "both") == "context"
+            for block in self.blocks
+        )
+
+    @torch.no_grad()
+    def incremental_gain_bound(self, gamma=None) -> torch.Tensor:
+        """Bound on ``||Q(e) - Q(e~)|| <= g ||e - e~||``, or ``inf`` if none holds.
+
+        With an input-dependent selector the two inputs choose *different*
+        per-step matrices, so the zero-state bound says nothing about the
+        difference of two trajectories and this returns ``inf``.
+
+        Under ``select_input='context'`` and a fixed context sequence every factor
+        in the cascade has an incremental counterpart with the *same* constant:
+        each cell is linear time-varying, so the difference of two trajectories
+        obeys the same recursion and the same ``gamma``; each feedforward branch
+        is ``L``-Lipschitz, which is already a statement about differences; and
+        the encoder, decoder and residual gates are linear. Composing them gives
+        the same ``k_i = (1 + b_i L_i)(1 + a_i gamma_i)`` per block, so the
+        incremental gain equals :meth:`certified_gain_bound`.
+
+        Note the stack is *not* linear even in this mode -- the feedforward
+        branches are nonlinear, so superposition does not hold. What holds is the
+        bound on differences, which is what the interconnection argument needs.
+
+        This is what makes tracking about a nonzero equilibrium well posed and
+        gives the interconnection argument something stronger than finite gain to
+        work with. It holds per context trajectory: two runs compared under
+        *different* contexts are not covered, which is the usual LPV situation
+        where the scheduling signal is treated as an exogenous input.
+        """
+        device = self.encoder_w.device if self.use_cert_scaling else next(self.parameters()).device
+        dtype = self.encoder_w.dtype if self.use_cert_scaling else next(self.parameters()).dtype
+        if not self.use_cert_scaling or not self.is_lpv:
+            return torch.full((), float("inf"), device=device, dtype=dtype)
+        return self.certified_gain_bound(gamma=gamma)
 
     @torch.no_grad()
     def storage_weights(self, gamma=None) -> torch.Tensor:

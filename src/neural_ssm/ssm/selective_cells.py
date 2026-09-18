@@ -136,14 +136,41 @@ def _selector_input(
     context_dim: int,
     u_bt: torch.Tensor,
     ctx_bt: Optional[torch.Tensor],
+    select_input: str = "both",
 ) -> torch.Tensor:
-    """Concatenate optional selection context to the cell input for ``param_net``.
+    """Build the ``param_net`` input from the cell input and optional context.
 
     The cell renormalizes its per-step transition to spectral norm <= 1 for ANY
     ``param_net`` output, so conditioning the selector on context preserves the
-    gamma certificate -- context needs no l2 projection and may be non-l2 or
-    endogenous (e.g. the state).
+    gamma certificate either way -- context needs no l2 projection and may be
+    non-l2 or endogenous.
+
+    ``select_input`` decides what the selector is allowed to see, and that choice
+    changes which guarantee holds:
+
+    ``"both"``
+        ``param_net([u_t, ctx_t])``. Mamba-style selectivity: the per-step
+        matrices depend on the input, so the map is nonlinear and the certificate
+        is a *zero-state* l2 bound only. Two different inputs select different
+        matrices, so no incremental bound follows.
+
+    ``"context"``
+        ``param_net(ctx_t)``. The matrices depend only on the exogenous context,
+        so for a fixed context sequence the map from input to output is linear
+        time-varying. The same normalization then certifies the *difference* of
+        two trajectories as well, which upgrades the guarantee to an incremental
+        l2 bound and makes tracking about a nonzero equilibrium well posed.
+        See :meth:`DeepSSM.incremental_gain_bound`.
     """
+    if select_input not in ("both", "context"):
+        raise ValueError(
+            f"select_input must be 'both' or 'context', got {select_input!r}."
+        )
+    if select_input == "context" and context_dim == 0:
+        raise ValueError(
+            "select_input='context' requires context_dim > 0: the selector would "
+            "otherwise have no input at all."
+        )
     if context_dim == 0:
         return u_bt
     if ctx_bt is None:
@@ -153,6 +180,8 @@ def _selector_input(
         raise ValueError(f"select_context last dim must be {context_dim}, got {ctx.shape[-1]}.")
     if ctx.shape[:2] != u_bt.shape[:2]:
         raise ValueError("select_context must match (batch, time) of the cell input.")
+    if select_input == "context":
+        return ctx
     return torch.cat([u_bt, ctx], dim=-1)
 
 
@@ -205,6 +234,7 @@ class RobustMambaDiagSSM(nn.Module):
         init_param_scale: float = 0.02,
         bc_nonlinearity: Literal["tanh", "identity"] = "tanh",
         context_dim: int = 0,
+        select_input: Literal["both", "context"] = "both",
         proj_bound: float = 1.0,
         exact_norm: bool = True,
         power_iters: int = 1,
@@ -248,8 +278,15 @@ class RobustMambaDiagSSM(nn.Module):
 
         self.context_dim = int(context_dim)
         self.supports_select_context = True
+        self.select_input = str(select_input)
+        if self.select_input not in ("both", "context"):
+            raise ValueError(
+                f"select_input must be 'both' or 'context', got {select_input!r}."
+            )
+        if self.select_input == "context" and self.context_dim == 0:
+            raise ValueError("select_input='context' requires context_dim > 0.")
         out_dim = 3 * self.N
-        pn_in = self.D + self.context_dim
+        pn_in = self.context_dim if self.select_input == "context" else self.D + self.context_dim
         if param_net == "linear":
             self.param_net = nn.Linear(pn_in, out_dim)
         elif param_net == "mlp":
@@ -313,7 +350,7 @@ class RobustMambaDiagSSM(nn.Module):
         g        = self.gamma.to(device=u_bt.device, dtype=u_bt.dtype)
         u_scaled = g * u_tilde                                         # (B,T,N)
 
-        raw = self.param_net(_selector_input(self.context_dim, u_bt, ctx_bt))  # (B,T,3N)
+        raw = self.param_net(_selector_input(self.context_dim, u_bt, ctx_bt, self.select_input))  # (B,T,3N)
         delta_raw, b_raw, c_raw = raw.split(self.N, dim=-1)
 
         delta = F.softplus(delta_raw + self.delta_bias)                # (B,T,N)
@@ -454,6 +491,7 @@ class RobustMambaDiagLTI(nn.Module):
         init_d: float = 0.10,
         bcd_nonlinearity: Literal["tanh", "identity"] = "tanh",
         context_dim: int = 0,
+        select_input: Literal["both", "context"] = "both",
         proj_bound: float = 1.0,
         exact_norm: bool = True,
         power_iters: int = 1,
@@ -521,8 +559,15 @@ class RobustMambaDiagLTI(nn.Module):
         # Param net outputs: delta | sign | b | c | d
         self.context_dim = int(context_dim)
         self.supports_select_context = True
+        self.select_input = str(select_input)
+        if self.select_input not in ("both", "context"):
+            raise ValueError(
+                f"select_input must be 'both' or 'context', got {select_input!r}."
+            )
+        if self.select_input == "context" and self.context_dim == 0:
+            raise ValueError("select_input='context' requires context_dim > 0.")
         out_dim = 5 * self.N
-        pn_in = self.D + self.context_dim
+        pn_in = self.context_dim if self.select_input == "context" else self.D + self.context_dim
         if param_net == "linear":
             self.param_net = nn.Linear(pn_in, out_dim)
         elif param_net == "mlp":
@@ -634,7 +679,7 @@ class RobustMambaDiagLTI(nn.Module):
         g = self.gamma.to(device=u_bt.device, dtype=u_bt.dtype)
         u_scaled = g * u_tilde                                         # (B,T,N)
 
-        raw = self.param_net(_selector_input(self.context_dim, u_bt, ctx_bt))  # (B,T,5N)
+        raw = self.param_net(_selector_input(self.context_dim, u_bt, ctx_bt, self.select_input))  # (B,T,5N)
         delta_raw, sign_raw, b_raw, c_raw, d_raw = raw.split(self.N, dim=-1)
 
         delta = F.softplus(delta_raw + self.delta_bias)                # (B,T,N)
