@@ -21,7 +21,6 @@ from nonlinear_benchmarks.error_metrics import RMSE
 import numpy as np
 import torch
 import torch.nn as nn
-from nonlinear_benchmarks.error_metrics import RMSE
 
 try:
     # Preferred package API (after pip install neural-ssm)
@@ -46,7 +45,7 @@ class TutorialConfig:
     d_model: int = 2
     d_state: int = 600
     n_layers: int = 1
-    param: str = "lru"  # "lru" | "l2n" | "tv" | ...
+    param: str = "lru"  # Current cells: "lru", "l2n", "defect", "tv", "tvc".
     ff: str = "MLP"  # "GLU" | "MLP" | "LMLP" | "LGLU" | "TLIP"
     gamma: float | None = 18.1  # set to None if you want gamma to be trainable
     max_phase_b: float = 2 * np.pi

@@ -50,13 +50,13 @@ from __future__ import annotations
 import torch
 
 try:  # runnable whether the package is installed or used from a source checkout
-    from neural_ssm.ssm import ContextualDeepSSM
+    from neural_ssm import ContextualDeepSSM
 except ImportError:
     import os
     import sys
 
     sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-    from src.neural_ssm.ssm import ContextualDeepSSM
+    from src.neural_ssm import ContextualDeepSSM
 
 
 def banner(title: str) -> None:
@@ -80,7 +80,7 @@ def main() -> None:
     quiet = slice(40, 100)                        # NO disturbance here, but two switches
 
     # Shared certified L2 core: prescribed gain cap (gamma) + certified
-    # parametrization (l2n / tv / tvc) and a Lipschitz feed-forward.
+    # parametrization (defect / l2n / tv / tvc) and a Lipschitz feed-forward.
     core = dict(param="l2n", ff="MBLIP", gamma=1.0, d_model=24, d_state=24, n_layers=2)
 
     # =======================================================================

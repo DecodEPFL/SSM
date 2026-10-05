@@ -20,8 +20,8 @@ import unittest
 import torch
 
 from neural_ssm.ssm.contextual import ContextualDeepSSM
-from neural_ssm.ssm.layers import DeepSSM
-from neural_ssm.ssm.selective_cells import RobustMambaDiagLTI
+from neural_ssm import DeepSSM
+from neural_ssm.ssm.cells.selective import RobustMambaDiagLTI
 
 
 def build(**overrides):

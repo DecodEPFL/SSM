@@ -2,10 +2,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ..utils.runtime import EvalCacheMixin
+
 
 
 # Robust REN implementation in the acyclic version
-class REN(nn.Module):
+class REN(EvalCacheMixin, nn.Module):
     # ## Implementation of REN model, modified from "Recurrent Equilibrium Networks: Flexible Dynamic Models with
     # Guaranteed Stability and Robustness" by Max Revay et al.
     def __init__(self, dim_in: int, dim_out: int, dim_internal: int,
@@ -88,6 +90,20 @@ class REN(nn.Module):
     def set_param(self, gamman=None):
         if gamman is not None:
             self.gamma = gamman
+        # The standard gain certificate depends only on registered tensors.
+        # Custom IQC modes also use external Q/R/S, so keep those computations live.
+        if self.mode == "l2stable":
+            matrices = self._eval_cached("ren", self._compute_params)
+        else:
+            matrices = self._compute_params()
+        for name, matrix in matrices.items():
+            setattr(self, name, matrix)
+
+    def _param_version(self):
+        version = super()._param_version()
+        return None if version is None else (version, self.mode, self.epsilon)
+
+    def _compute_params(self):
         gamma = torch.abs(self.gamma)
         dim_internal, dim_nl, dim_in, dim_out = self.dim_internal, self.dim_nl, self.dim_in, self.dim_out
 
@@ -146,6 +162,10 @@ class REN(nn.Module):
         self.A_eff  = E_inv @ self.F    # E^{-1} F
         self.B1_eff = E_inv @ self.B1   # E^{-1} B1
         self.B2_eff = E_inv @ self.B2   # E^{-1} B2
+        return {name: getattr(self, name) for name in (
+            "Q", "R", "S", "D22", "P_cal", "F", "B1", "E", "Lambda",
+            "D11", "C1", "A_eff", "B1_eff", "B2_eff",
+        )}
 
     @torch.compiler.disable
     def forward(self, u):
@@ -154,7 +174,7 @@ class REN(nn.Module):
         # would unroll one graph node per (t, i) pair: enormous graphs and
         # compile times for zero win. Keeping it eager lets whole-model
         # torch.compile pipelines pass through REN safely.
-        # u: (B, T, n_u) — rebuild constrained matrices once, then loop over T.
+        # u: (B, T, n_u) — construct (or reuse) constrained matrices, then loop over T.
         # The state is reset to the (batch-expanded) initial condition on every
         # call, so the module is a stateless map u -> y (one independent trajectory
         # per sequence), coherent with the SSM models' reset_state=True semantics.

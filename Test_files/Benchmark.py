@@ -14,8 +14,7 @@ import math
 import nonlinear_benchmarks
 from nonlinear_benchmarks.error_metrics import RMSE, NRMSE, R_squared, MAE, fit_index
 import json
-from src.neural_ssm.experimental import MultiHeadRavenRSM
-from src.neural_ssm.ssm import DeepSSM, SSMConfig, SimpleRNN
+from src.neural_ssm import DeepSSM, SSMConfig, SimpleRNN
 from src.neural_ssm.rens.ren import REN
 
 try:
@@ -127,80 +126,23 @@ class LSTMWrapper(nn.Module):
         return y, None
 
 
-class RavenRSMWrapper(nn.Module):
-    """System-ID wrapper around the experimental MultiHeadRavenRSM layer."""
-
-    def __init__(
-            self,
-            dim_in: int,
-            dim_out: int,
-            *,
-            d_model: int,
-            num_heads: int,
-            num_slots: int,
-            d_k: Optional[int] = None,
-            d_v: Optional[int] = None,
-            top_k: int = 2,
-            routing_alpha: float = 1.0,
-            residual: bool = True,
-            norm: bool = True,
-    ):
-        super().__init__()
-        self.encoder = nn.Linear(dim_in, d_model, bias=False)
-        self.memory = MultiHeadRavenRSM(
-            d_model=d_model,
-            num_heads=num_heads,
-            num_slots=num_slots,
-            d_k=d_k,
-            d_v=d_v,
-            top_k=top_k,
-            routing_alpha=routing_alpha,
-            residual=residual,
-            norm=norm,
-        )
-        self.decoder = nn.Linear(d_model, dim_out, bias=False)
-
-    def forward(
-            self,
-            u: torch.Tensor,
-            state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-            *,
-            reset_state: bool = True,
-            detach_state: bool = True,
-    ):
-        if u.dim() == 2:
-            u = u.unsqueeze(0)
-        if u.dim() != 3:
-            raise ValueError(f"Expected input shape (T,D) or (B,T,D), got {tuple(u.shape)}.")
-        z = self.encoder(u)
-        h, state = self.memory(
-            z,
-            state=state,
-            return_state=True,
-            reset_state=reset_state,
-            detach_state=detach_state,
-        )
-        return self.decoder(h), state
-
-    def reset(self):
-        self.memory.state = None
 
 
 @dataclass
 class ModelConfig:
     """Configuration for model architecture."""
-    model_type: str = "deepssm"  # deepssm | raven
+    model_type: str = "deepssm"  # this harness builds DeepSSM configurations
     n_u: int = 1
     n_y: int = 1
     d_model: int = 16
-    d_state: int = 11
+    d_state: int = 16
     n_layers: int = 1
     ff: str = "LGLU2"  # Use GLU/MLP only when gamma=None.
     max_phase: float = math.pi / 60
     r_min: float = 0.7
     r_max: float = 0.98
     d_amp: int = 8
-    param: str = 'l2ru'
+    param: str = 'defect'  # current construction; legacy keys remain accepted
     d_hidden: int = 8
     nl_layers: int = 3
     scale: float = 1.0
@@ -215,18 +157,6 @@ class ModelConfig:
     learn_x0: bool = False
     ssm_residual_init: float = -1.0
     ff_residual_init: float = -1.0
-    raven_heads: int = 4
-    raven_slots: int = 8
-    raven_top_k: int = 2
-    raven_d_k: Optional[int] = None
-    raven_d_v: Optional[int] = None
-    raven_routing_alpha: float = 1.0
-    raven_residual: bool = True  # only used by the experimental model_type="raven" wrapper
-    raven_norm: bool = True      # only used by the experimental model_type="raven" wrapper
-    # Extra knobs for the certified L2SelectiveRavenCell core (param="raven").
-    raven_rho_max: float = 0.999  # hard cap on slot decay rho in (0, rho_max)
-    raven_gamma_skip: float = 0.0  # gain budget reserved for the optional direct skip D
-    raven_use_skip: bool = False  # include the spectrally-capped direct term D z_t
 
     def to_ssm_config(self) -> SSMConfig:
         """Convert to SSMConfig object."""
@@ -254,22 +184,6 @@ class ModelConfig:
             learn_x0=self.learn_x0,
             ssm_residual_init=self.ssm_residual_init,
             ff_residual_init=self.ff_residual_init,
-            # Forwarded for param="raven" (ignored by the other parametrizations).
-            raven_heads=self.raven_heads,
-            raven_slots=self.raven_slots,
-            raven_top_k=self.raven_top_k,
-            raven_key_dim=(
-                self.raven_d_k if self.raven_d_k is not None
-                else max(1, self.d_model // self.raven_heads)
-            ),
-            raven_value_dim=(
-                self.raven_d_v if self.raven_d_v is not None
-                else max(1, self.d_model // self.raven_heads)
-            ),
-            raven_alpha=self.raven_routing_alpha,
-            raven_rho_max=self.raven_rho_max,
-            raven_gamma_skip=self.raven_gamma_skip,
-            raven_use_skip=self.raven_use_skip,
         )
 
 
@@ -281,20 +195,6 @@ def build_model_from_config(model_config: ModelConfig) -> nn.Module:
             d_input=model_config.n_u,
             d_output=model_config.n_y,
             config=model_config.to_ssm_config(),
-        )
-    if model_type == "raven":
-        return RavenRSMWrapper(
-            dim_in=model_config.n_u,
-            dim_out=model_config.n_y,
-            d_model=model_config.d_model,
-            num_heads=model_config.raven_heads,
-            num_slots=model_config.raven_slots,
-            d_k=model_config.raven_d_k,
-            d_v=model_config.raven_d_v,
-            top_k=model_config.raven_top_k,
-            routing_alpha=model_config.raven_routing_alpha,
-            residual=model_config.raven_residual,
-            norm=model_config.raven_norm,
         )
     raise ValueError(f"Unknown model_type={model_config.model_type!r}.")
 
@@ -1647,12 +1547,6 @@ def main():
     model_config = ModelConfig(n_u=u_train.shape[1], n_y=y_train.shape[1], param='tv', d_model=18, d_state=18,
                                gamma= None, ff='GLU', init='eye', max_phase=0.4,
                                n_layers=5, d_amp=3, rho=0.99, phase_center=0.0, max_phase_b=.04, d_hidden=12, nl_layers=3, learn_x0=False,
-                               # ---- Raven knobs (optional; these now feed the cell) ----
-                               raven_heads=4, raven_slots=8, raven_top_k=2,
-                               raven_d_k=None, raven_d_v=None,  # None -> d_model // heads
-                               raven_routing_alpha=1.0,
-                               raven_rho_max=0.999,
-                               raven_use_skip=False, raven_gamma_skip=0.0,
                                )
     train_config = TrainingConfig(
         num_epochs=2000,

@@ -107,21 +107,24 @@ multiple calls (cross-call BPTT).
 | `param` | Core | Certificate | Best execution mode |
 | --- | --- | --- | --- |
 | `lru` | complex diagonal stable LTI recurrence | stable, but no global DeepSSM bound | `scan` or `conv` |
-| `l2ru` | free L2-bounded LTI recurrence | yes | `scan` or `loop` |
-| `zak` | constrained L2-bounded LTI recurrence | yes | `scan` or `loop` |
+| `defect` | defect completion with general real blocks | yes | `scan` or `loop` |
 | `l2n` | 2×2-block L2-bounded LTI recurrence | yes | `scan` or `conv` |
-| `l2nt` | dense L2-bounded LTI recurrence | yes | `scan` or `loop` |
 | `tv` | selective diagonal SSM | yes | `scan` |
-| `tvc` | selective LTI SSM | yes | `scan` |
+| `tvc` | selective diagonal SSM with direct term | yes | `scan` |
+| `l2ru` (legacy) | free L2-bounded LTI recurrence | yes | `scan` or `loop` |
+| `zak` (legacy) | constrained complex LTI recurrence (`lruz`) | yes | `scan` or `loop` |
+| `l2nt` (legacy) | dense L2-bounded LTI recurrence | yes | `loop` |
 
 `l2n` uses 2×2 state blocks, so `d_state` must be even. The benchmark harness
 selects the fastest supported mode by default: convolution for `lru`/`l2n` and
-parallel scan for the other SSMs.
+parallel scan for the other current SSMs. Legacy `l2ru`, `zak`, and `l2nt` remain
+wired for existing experiments and checkpoints; their implementations live in
+`ssm/cells/legacy/`. The UI and command-line listing mark them as legacy.
 
 ### Certificates in practice
 
 Set `gamma` to request a global certificate. This requires a certified
-recurrent core (`l2ru`, `zak`, `l2n`, `l2nt`, `tv`, or `tvc`) and a
+recurrent core (`defect`, `l2n`, `tv`, or `tvc`; the legacy certified cells also work) and a
 feed-forward layer with a declared global bound: `LGLU2`, `BLGLU2`, `MBLIP`, or
 `TLIP`. Keep `learn_x0=False`: a learned nonzero initial state needs a separate
 storage-energy term and is not covered by the pure induced-gain statement.
@@ -170,12 +173,38 @@ The four ports are complementary:
 See [the contextual tutorial](Test_files/Tutorial_ContextualSSM.py) for the
 filter choices and the corresponding gain diagnostics.
 
+## Defect-completion LTI cells
+
+Choose `param="defect"` for the new structured contraction parametrization:
+
+```python
+model = DeepSSM(3, 2, d_model=16, d_state=64, param="defect", gamma=1.0)
+y, states = model(u, mode="scan")
+```
+
+It uses learned thin orthogonal factors, stable scalar defect formulas, and a
+real block scan without normalizing the assembled system matrix. The default
+blocks are general 2-by-2 matrices. Set `SSMConfig.defect_block_size=4` (or the
+full state dimension) to trade computation for more within-block interactions.
+The existing `l2n` option is retained for comparison. Only `loop` and `scan`
+execution are supported for the new cell.
+
+See [the construction, configuration, and tests](docs/defect_parametrization.md).
+Run `python scripts/compare_defect_vs_normalization.py` for a reproducible
+timing, memory-storage, and synthetic-learning comparison.
+
 ## Additional recurrent model
 
 `REN` is a robust acyclic recurrent-equilibrium network for system
 identification. Public entry points include `DeepSSM`, `SSMConfig`,
 `ContextualDeepSSM`, `REN`, `LRU`, `L2RU`, `lruz`, and the
 `neural_ssm.ssm` / `neural_ssm.layers` namespaces.
+
+Derived certified matrices and spectral caps are reused during gradient-free
+evaluation. Use `model.eval()` together with `torch.no_grad()` or
+`torch.inference_mode()`. Training and grad-enabled evaluation rebuild them.
+See [the parameter-cache audit](docs/parameter_cache.md) for model coverage,
+invalidation rules, and remaining optimization opportunities.
 
 ## Speed on CUDA
 
@@ -230,7 +259,7 @@ python Test_files/run_benchmarks.py \
 python Test_files/benchmark_ui.py
 ```
 
-For a focused L2RU-versus-ZAK study with published-style figures:
+For a focused comparison of the legacy L2RU and ZAK constructions:
 
 ```bash
 python scripts/compare_l2ru_vs_zak.py --datasets Cascaded_Tanks --epochs 8
@@ -240,14 +269,29 @@ python scripts/compare_l2ru_vs_zak.py --datasets Cascaded_Tanks --epochs 8
 
 ```text
 src/neural_ssm/
-├── ssm/             DeepSSM, recurrent cells, scan utilities, and context models
-├── static_layers/   bounded and conventional feed-forward layers
-└── rens/            robust acyclic REN
+├── ssm/
+│   ├── config.py, registry.py       settings and model construction
+│   ├── layers.py                   DeepSSM, residual blocks, gain diagnostics
+│   ├── cells/
+│   │   ├── lti/                    lru.py, l2n.py, defect.py
+│   │   ├── selective/              tv.py, tvc.py
+│   │   └── legacy/                 l2ru.py, lruz.py, l2nt.py
+│   └── contextual.py               context wrapper, filters, gates, mixing
+├── static_layers/
+│   ├── generic_layers.py           ordinary GLU/MLP and LayerConfig
+│   └── lipschitz_mlps.py            bounded feedforward networks and primitives
+├── rens/ren.py                     robust acyclic REN
+└── utils/                          scan.py kernels; runtime.py state/caches
 tests/               certificate, context, and torch.compile regression tests
 Test_files/          tutorials, benchmark runner, visual UI, and research scripts
 scripts/             focused reproducible experiment drivers
 docs/                figures and deployment notes
 ```
+
+Use `from neural_ssm import DeepSSM, SSMConfig, ContextualDeepSSM` for ordinary
+work. Earlier module paths remain aliases for retained components.
+See [the package guide](docs/package_structure.md) for canonical imports,
+the context design, compatibility, and where to add a new cell.
 
 ## Citation
 

@@ -71,7 +71,7 @@ from nonlinear_benchmarks.not_splitted_benchmarks import (
     WienerHammerstein_Process_Noise,
 )
 
-from src.neural_ssm.ssm import DeepSSM, SSMConfig
+from src.neural_ssm import DeepSSM, SSMConfig
 from src.neural_ssm.rens.ren import REN
 
 
@@ -359,22 +359,31 @@ class RENSim(nn.Module):
 # name -> spec. `kind` selects the builder; remaining keys are builder kwargs.
 MODEL_ZOO: Dict[str, dict] = {
     "lru":   dict(kind="deepssm", param="lru",   gamma=None, ff="GLU"),     # uncertified baseline
-    "l2ru":  dict(kind="deepssm", param="l2ru",  gamma=5.0,  ff="LGLU2"),   # certified LTI
     "l2n":   dict(kind="deepssm", param="l2n",   gamma=5.0,  ff="LGLU2"),   # certified 2x2 dense LTI (needs even d_state)
+    "defect": dict(kind="deepssm", param="defect", gamma=5.0, ff="LGLU2"),
     "tv":    dict(kind="deepssm", param="tv",    gamma=5.0,  ff="MBLIP"),   # certified selective
-    "tvc":   dict(kind="deepssm", param="tvc",   gamma=5.0,  ff="MBLIP"),   # certified selective LTI
+    "tvc":   dict(kind="deepssm", param="tvc",   gamma=5.0,  ff="MBLIP"),   # certified selective with direct term
     "lstm":  dict(kind="lstm",    hidden=64, layers=2),
     "gru":   dict(kind="gru",     hidden=64, layers=2),
     "ren":   dict(kind="ren",     gamma=5.0),                            # robust acyclic REN (l2-stable by construction)
 }
 
+# Operational legacy comparisons, kept separate from current model choices.
+LEGACY_MODEL_ZOO: Dict[str, dict] = {
+    name: dict(kind="deepssm", param=name, gamma=5.0, ff="LGLU2")
+    for name in ("l2ru", "zak", "l2nt")
+}
+MODEL_ZOO.update(LEGACY_MODEL_ZOO)
+
 # Fastest equivalent execution mode per SSM parametrization (used when
 # --mode auto). lru/l2n are LTI diagonal-complex systems -> FFT convolution;
-# the rest only have the parallel scan. LSTM/GRU/REN do not use `mode`.
+# Other supported cells use scan; the legacy dense l2nt path is sequential.
+# LSTM/GRU/REN do not use `mode`.
 CONV_CAPABLE = {"lru", "l2n"}
 BEST_MODE: Dict[str, str] = {
     "lru": "conv", "l2n": "conv",
-    "l2ru": "scan", "tv": "scan", "tvc": "scan",
+    "l2ru": "scan", "zak": "scan", "l2nt": "loop",
+    "defect": "scan", "tv": "scan", "tvc": "scan",
 }
 
 
@@ -416,6 +425,7 @@ def _make_ssm_config(spec: dict, gconf: "GlobalModelConfig") -> SSMConfig:
         gamma = None if ov in ("none", "") else float(gconf.gamma_override)
     ffo = gconf.ff_override
     ff = spec.get("ff", "LGLU2") if (not ffo or str(ffo).lower() == "auto") else ffo
+    is_defect = spec["param"] == "defect"
     return SSMConfig(
         d_model=gconf.d_model, d_state=gconf.d_state, n_layers=gconf.n_layers,
         d_hidden=gconf.d_hidden, nl_layers=gconf.nl_layers, scale=gconf.scale,
@@ -423,9 +433,14 @@ def _make_ssm_config(spec: dict, gconf: "GlobalModelConfig") -> SSMConfig:
         train_gamma=True, learn_x0=False, use_cuda_graph=gconf.use_cuda_graph,
         rmin=gconf.lru_rmin, rmax=gconf.lru_rmax, max_phase=gconf.lru_max_phase,
         l2ru_eye_scale=gconf.l2ru_eye_scale, l2ru_rand_scale=gconf.l2ru_rand_scale,
-        rho=gconf.l2n_rho, max_phase_b=gconf.l2n_max_phase,
-        phase_center=gconf.l2n_phase_center, random_phase=gconf.l2n_random_phase,
-        offdiag_scale=gconf.l2n_offdiag_scale,
+        rho=gconf.defect_rho if is_defect else gconf.l2n_rho,
+        max_phase_b=gconf.defect_max_phase if is_defect else gconf.l2n_max_phase,
+        phase_center=gconf.defect_phase_center if is_defect else gconf.l2n_phase_center,
+        random_phase=gconf.defect_random_phase if is_defect else gconf.l2n_random_phase,
+        offdiag_scale=gconf.defect_init_scale if is_defect else gconf.l2n_offdiag_scale,
+        defect_block_size=gconf.defect_block_size,
+        defect_max_radius=gconf.defect_max_radius,
+        defect_factor_margin=gconf.defect_factor_margin,
         tv_init_rho=gconf.tv_init_rho, tv_init_delta0=gconf.tv_init_delta0,
         tv_init_param_scale=gconf.tv_init_param_scale,
         tvc_init_rho=gconf.tvc_init_rho, tvc_init_delta0=gconf.tvc_init_delta0,
@@ -585,6 +600,14 @@ class GlobalModelConfig:
     l2n_phase_center: float = 0.0
     l2n_random_phase: bool = True
     l2n_offdiag_scale: float = 0.05
+    defect_block_size: int = 2
+    defect_rho: float = 0.9
+    defect_max_radius: float = 0.999
+    defect_factor_margin: float = 1e-3
+    defect_init_scale: float = 0.05
+    defect_max_phase: float = 0.04
+    defect_phase_center: float = 0.0
+    defect_random_phase: bool = True
     tv_init_rho: float = 0.99
     tv_init_delta0: float = 1.0
     tv_init_param_scale: float = 0.02
@@ -638,6 +661,20 @@ def _validate_initialization(models: Sequence[str], cfg: GlobalModelConfig) -> N
         if cfg.l2n_max_phase < 0.0 or cfg.l2n_offdiag_scale < 0.0:
             raise ValueError("L2N phase width and off-diagonal scale must be non-negative.")
 
+    if "defect" in selected:
+        finite(defect_rho=cfg.defect_rho, defect_max_radius=cfg.defect_max_radius,
+               defect_factor_margin=cfg.defect_factor_margin,
+               defect_init_scale=cfg.defect_init_scale,
+               defect_max_phase=cfg.defect_max_phase, defect_phase_center=cfg.defect_phase_center)
+        if cfg.defect_block_size <= 0 or cfg.d_state <= 0 or cfg.d_state % cfg.defect_block_size:
+            raise ValueError("--defect-block-size must be positive and divide --d-state.")
+        if not 0 <= cfg.defect_rho < cfg.defect_max_radius < 1:
+            raise ValueError("Defect requires 0 <= --defect-rho < --defect-max-radius < 1.")
+        if not 0 < cfg.defect_factor_margin < 1:
+            raise ValueError("--defect-factor-margin must be in (0, 1).")
+        if cfg.defect_init_scale < 0 or cfg.defect_max_phase < 0:
+            raise ValueError("Defect factor scale and phase width must be non-negative.")
+
     if "tv" in selected:
         finite(tv_init_rho=cfg.tv_init_rho, tv_init_delta0=cfg.tv_init_delta0,
                tv_init_param_scale=cfg.tv_init_param_scale)
@@ -671,6 +708,12 @@ def _initialization_metadata(cfg: GlobalModelConfig) -> dict:
                 "phase_center": cfg.l2n_phase_center,
                 "random_phase": cfg.l2n_random_phase,
                 "offdiag_scale": cfg.l2n_offdiag_scale},
+        "defect": {"block_size": cfg.defect_block_size, "rho": cfg.defect_rho,
+                   "max_radius": cfg.defect_max_radius,
+                   "factor_margin": cfg.defect_factor_margin,
+                   "init_scale": cfg.defect_init_scale, "max_phase": cfg.defect_max_phase,
+                   "phase_center": cfg.defect_phase_center,
+                   "random_phase": cfg.defect_random_phase},
         "tv": {"rho": cfg.tv_init_rho, "delta0": cfg.tv_init_delta0,
                "param_scale": cfg.tv_init_param_scale},
         "tvc": {"rho": cfg.tvc_init_rho, "delta0": cfg.tvc_init_delta0,
@@ -1467,6 +1510,12 @@ def run(args) -> None:
         l2n_phase_center=args.l2n_phase_center,
         l2n_random_phase=args.l2n_random_phase,
         l2n_offdiag_scale=args.l2n_offdiag_scale,
+        defect_block_size=args.defect_block_size, defect_rho=args.defect_rho,
+        defect_max_radius=args.defect_max_radius,
+        defect_factor_margin=args.defect_factor_margin,
+        defect_init_scale=args.defect_init_scale, defect_max_phase=args.defect_max_phase,
+        defect_phase_center=args.defect_phase_center,
+        defect_random_phase=args.defect_random_phase,
         tv_init_rho=args.tv_init_rho,
         tv_init_delta0=args.tv_init_delta0,
         tv_init_param_scale=args.tv_init_param_scale,
@@ -1716,6 +1765,22 @@ def build_parser() -> argparse.ArgumentParser:
                    help="sample L2N phases in the configured window; disable to use the center")
     p.add_argument("--l2n-offdiag-scale", type=float, default=0.05,
                    help="initial standard deviation of L2N K12/K21/K22")
+    p.add_argument("--defect-block-size", type=int, default=2,
+                   help="Defect state block size; must divide d-state")
+    p.add_argument("--defect-rho", type=float, default=0.9,
+                   help="Defect initial state singular value")
+    p.add_argument("--defect-max-radius", type=float, default=0.999,
+                   help="Defect state contraction limit, strictly below one")
+    p.add_argument("--defect-factor-margin", type=float, default=1e-3,
+                   help="Margin below one for the X,Y,Z singular values")
+    p.add_argument("--defect-init-scale", type=float, default=0.05,
+                   help="Defect raw singular-value initialization standard deviation")
+    p.add_argument("--defect-max-phase", type=float, default=0.04,
+                   help="Defect initial phase half-width (2x2 blocks only)")
+    p.add_argument("--defect-phase-center", type=float, default=0.0,
+                   help="Defect initial phase center (2x2 blocks only)")
+    p.add_argument("--defect-random-phase", action=argparse.BooleanOptionalAction, default=True,
+                   help="Randomize initial phases (2x2 blocks only)")
     p.add_argument("--tv-init-rho", type=float, default=0.99,
                    help="TV initial diagonal-state decay")
     p.add_argument("--tv-init-delta0", type=float, default=1.0,
@@ -1783,7 +1848,8 @@ def main():
             tag = " (MIMO)" if n == "Industrial_robot" else ""
             print(f"  {n}{tag}")
         print("Groups:", {g: v for g, v in _GROUPS.items()})
-        print("Models:", list(MODEL_ZOO))
+        print("Current models:", [n for n in MODEL_ZOO if n not in LEGACY_MODEL_ZOO])
+        print("Legacy models:", list(LEGACY_MODEL_ZOO))
         return
     set_seed(args.seed)
     run(args)

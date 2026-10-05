@@ -1,13 +1,30 @@
+"""Bounded feedforward constructions and the primitives used to build them.
+
+Reading order: capped linear maps, Sandwich primitives, bounded MLPs, bounded
+gates, then the four-branch mixer. Ordinary GLU/MLP live in generic_layers.py.
+
+DeepSSM certifies LGLU2, BLGLU2/BudgetedLGLU2, MBLIP, and TLIP. LGLU and LMLP
+are retained constructions whose assumptions differ; they are not accepted as
+globally certified feedforward branches by the stack.
+
+Exact matrix caps use EvalCacheMixin: training keeps the full differentiable
+computation; gradient-free evaluation reuses unchanged derived matrices.
+"""
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.utils.parametrizations as param
 from deel import torchlip
-from ..static_layers.generic_layers import LayerConfig
+
+from .generic_layers import LayerConfig
+from ..utils.runtime import EvalCacheMixin
 
 
+# Capped linear maps
 
-class L2BoundedLinearExact(nn.Module):
+class L2BoundedLinearExact(EvalCacheMixin, nn.Module):
     """
     Linear map y = x @ W^T with ||W||_2 <= bound.
 
@@ -41,10 +58,6 @@ class L2BoundedLinearExact(nn.Module):
         if not self.exact_norm:
             self.register_buffer("_u", F.normalize(torch.randn(self.d_out), dim=0))
 
-        # Eval-only cache of the spectrally-rescaled weight (the SVD is expensive,
-        # especially on GPU). Cleared whenever train()/eval() is toggled.
-        self._w_eff_cache = None
-
     def _sigma_exact(self, W: torch.Tensor) -> torch.Tensor:
         # SVD is more version-compatible than matrix_norm(ord=2)
         try:
@@ -54,7 +67,9 @@ class L2BoundedLinearExact(nn.Module):
             return torch.svd(W).S[0].clamp_min(self.eps)
 
     def _sigma_power_iter(self, W: torch.Tensor) -> torch.Tensor:
-        u = self._u
+        # copy_ below updates the buffer. Autograd must retain an independent
+        # starting vector, including when the norm is computed in float32.
+        u = self._u.to(dtype=W.dtype).clone()
         for _ in range(self.power_iters):
             v = F.normalize(W.T @ u, dim=0, eps=self.eps)
             u = F.normalize(W @ v, dim=0, eps=self.eps)
@@ -75,28 +90,93 @@ class L2BoundedLinearExact(nn.Module):
         return W / scale
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # In eval the weights are fixed, so the (expensive) spectral-norm rescaling
-        # is computed once and reused; training always recomputes. The cached value
-        # is exactly the recomputed one — no change to the math — and any
-        # train()/eval() toggle clears it.
-        if self.training:
-            self._w_eff_cache = None
-            W_eff = self._effective_weight()
-        else:
-            if self._w_eff_cache is None:
-                self._w_eff_cache = self._effective_weight().detach()
-            W_eff = self._w_eff_cache
+        W_eff = self._eval_cached("weight", self._effective_weight)
         return F.linear(x, W_eff, bias=None)
 
-    def train(self, mode: bool = True):
-        self._w_eff_cache = None
-        return super().train(mode)
+    def _param_version(self):
+        version = super()._param_version()
+        return None if version is None else (
+            version, self.bound, self.exact_norm, self.power_iters, self.eps
+        )
+
+# Sandwich primitives
+
+def cayley(W):
+    if len(W.shape) == 2:
+        return cayley(W[None])[0]
+    _, cout, cin = W.shape
+    if cin > cout:
+        return cayley(W.transpose(1, 2)).transpose(1, 2)
+    U, V = W[:, :cin], W[:, cin:]
+    I = torch.eye(cin, dtype=W.dtype, device=W.device)[None, :, :]
+    A = U - U.conj().transpose(1, 2) + V.conj().transpose(1, 2) @ V
+    iIpA = torch.inverse(I + A)
+    return torch.cat((iIpA @ (I - A), -2 * V @ iIpA), axis=1)
 
 
+class FirstChannel(nn.Module):
+    def __init__(self, cout, scale=1.0):
+        super().__init__()
+        self.cout = cout
+        self.scale = scale
 
+    def forward(self, x):
+        xdim = len(x.shape)
+        if xdim == 4:
+            return self.scale * x[:, :self.cout, :, :]
+        elif xdim == 2:
+            return self.scale * x[:, :self.cout]
+        elif xdim == 3:
+            return self.scale * x[:, :, :]
+
+
+class SandwichLin(EvalCacheMixin, nn.Linear):
+    def __init__(self, in_features, out_features, bias=True, scale=1.0, AB=False):
+        super().__init__(in_features + out_features, out_features, bias)
+        self.alpha = nn.Parameter(torch.ones(1, dtype=torch.float32, requires_grad=True))
+        self.alpha.data = self.weight.norm()
+        self.scale = scale
+        self.AB = AB
+        self.Q = None
+
+    def forward(self, x):
+        fout, _ = self.weight.shape
+        Q = self._eval_cached("Q", lambda: cayley(self.alpha * self.weight / self.weight.norm()))
+        self.Q = Q
+        x = F.linear(self.scale * x, Q[:, fout:])  # B @ x
+        if self.AB:
+            x = 2 * F.linear(x, Q[:, :fout].T)  # 2 A.T @ B @ x
+        if self.bias is not None:
+            x += self.bias
+        return x
+
+
+class SandwichFc(EvalCacheMixin, nn.Linear):
+    def __init__(self, in_features, out_features, bias=True, scale=1.0):
+        super().__init__(in_features + out_features, out_features, bias)
+        self.alpha = nn.Parameter(torch.ones(1, dtype=torch.float32, requires_grad=True))
+        self.alpha.data = self.weight.norm()
+        self.scale = scale
+        self.psi = nn.Parameter(torch.zeros(out_features, dtype=torch.float32, requires_grad=True))
+        self.Q = None
+
+    def forward(self, x):
+        fout, _ = self.weight.shape
+        Q = self._eval_cached("Q", lambda: cayley(self.alpha * self.weight / self.weight.norm()))
+        self.Q = Q
+        x = F.linear(self.scale * x, Q[:, fout:])  # B*h
+        if self.psi is not None:
+            x = x * torch.exp(-self.psi) * (2 ** 0.5)  # sqrt(2) \Psi^{-1} B * h
+        if self.bias is not None:
+            x += self.bias
+        x = F.relu(x) * torch.exp(self.psi)  # \Psi z
+        x = 2 ** 0.5 * F.linear(x, Q[:, :fout].T)  # sqrt(2) A^top \Psi z
+        return x
+
+# Bounded multilayer perceptrons
 
 class TLIP(nn.Module):
-    """ Standard MLP with Lipschitz-bounded static_layers """
+    """Spectral/GroupSort MLP with a fixed overall scale config.lip."""
 
     def __init__(self, config: LayerConfig):
         super().__init__()
@@ -104,7 +184,6 @@ class TLIP(nn.Module):
         lip0 = max(float(config.lip), self.eps)
         self.register_buffer("lip_const", torch.tensor(lip0))
 
-        # Pre-compute hidden dimension for efficiency
         self.hidden_dim = config.d_hidden
         if self.hidden_dim % 2 != 0:
             raise ValueError(
@@ -153,94 +232,17 @@ class TLIP(nn.Module):
         return (self.lip * x).reshape(*leading_shape, x.shape[-1])
 
 
-# Manchester lipschitz bounded MLPs
-
-
-def cayley(W):
-    if len(W.shape) == 2:
-        return cayley(W[None])[0]
-    _, cout, cin = W.shape
-    if cin > cout:
-        return cayley(W.transpose(1, 2)).transpose(1, 2)
-    U, V = W[:, :cin], W[:, cin:]
-    I = torch.eye(cin, dtype=W.dtype, device=W.device)[None, :, :]
-    A = U - U.conj().transpose(1, 2) + V.conj().transpose(1, 2) @ V
-    iIpA = torch.inverse(I + A)
-    return torch.cat((iIpA @ (I - A), -2 * V @ iIpA), axis=1)
-
-
-class FirstChannel(nn.Module):
-    def __init__(self, cout, scale=1.0):
-        super().__init__()
-        self.cout = cout
-        self.scale = scale
-
-    def forward(self, x):
-        xdim = len(x.shape)
-        if xdim == 4:
-            return self.scale * x[:, :self.cout, :, :]
-        elif xdim == 2:
-            return self.scale * x[:, :self.cout]
-        elif xdim == 3:
-            return self.scale * x[:, :, :]
-
-
-class SandwichLin(nn.Linear):
-    def __init__(self, in_features, out_features, bias=True, scale=1.0, AB=False):
-        super().__init__(in_features + out_features, out_features, bias)
-        self.alpha = nn.Parameter(torch.ones(1, dtype=torch.float32, requires_grad=True))
-        self.alpha.data = self.weight.norm()
-        self.scale = scale
-        self.AB = AB
-        self.Q = None
-
-    def forward(self, x):
-        fout, _ = self.weight.shape
-        if self.training or self.Q is None:
-            self.Q = cayley(self.alpha * self.weight / self.weight.norm())
-        Q = self.Q if self.training else self.Q.detach()
-        x = F.linear(self.scale * x, Q[:, fout:])  # B @ x
-        if self.AB:
-            x = 2 * F.linear(x, Q[:, :fout].T)  # 2 A.T @ B @ x
-        if self.bias is not None:
-            x += self.bias
-        return x
-
-
-class SandwichFc(nn.Linear):
-    def __init__(self, in_features, out_features, bias=True, scale=1.0):
-        super().__init__(in_features + out_features, out_features, bias)
-        self.alpha = nn.Parameter(torch.ones(1, dtype=torch.float32, requires_grad=True))
-        self.alpha.data = self.weight.norm()
-        self.scale = scale
-        self.psi = nn.Parameter(torch.zeros(out_features, dtype=torch.float32, requires_grad=True))
-        self.Q = None
-
-    def forward(self, x):
-        fout, _ = self.weight.shape
-        if self.training or self.Q is None:
-            self.Q = cayley(self.alpha * self.weight / self.weight.norm())
-        Q = self.Q if self.training else self.Q.detach()
-        x = F.linear(self.scale * x, Q[:, fout:])  # B*h
-        if self.psi is not None:
-            x = x * torch.exp(-self.psi) * (2 ** 0.5)  # sqrt(2) \Psi^{-1} B * h
-        if self.bias is not None:
-            x += self.bias
-        x = F.relu(x) * torch.exp(self.psi)  # \Psi z
-        x = 2 ** 0.5 * F.linear(x, Q[:, :fout].T)  # sqrt(2) A^top \Psi z
-        return x
-
-
 class LMLP(nn.Module):
-    """ Implements a Lipschitz.-bounded MLP with sandwich static_layers. The square root
-    # of the Lipschitz bound is given by the scale parameter, by default, set to 1. """
+    """Historical Sandwich MLP with config.lip applied to each layer.
+
+    That per-layer scale is not a single total-network Lipschitz budget.
+    DeepSSM therefore does not accept LMLP as a certified feedforward branch.
+    """
 
     def __init__(self, config: LayerConfig):
         super().__init__()
-        # Pre-compute hidden dimension for efficiency
         hidden_dim = config.d_hidden
 
-        # Layer construction using list comprehension
         layers = nn.ModuleList()
         layers.append(FirstChannel(config.d_input, scale=config.lip))
         layers.append(SandwichFc(config.d_input, hidden_dim, bias=False, scale=config.lip))
@@ -257,22 +259,17 @@ class LMLP(nn.Module):
     def forward(self, input):
         return self.model(input)
 
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.nn.utils.parametrizations as param
-
+# Bounded gated branches
 
 class L2BoundedGLU(nn.Module):
     """
     GLU block with an L2-bounded linear map:
       - value branch:  a  (unconstrained; spectral norm on W ensures ||a||_2 <= ||x||_2)
       - gate branch:   sigmoid(b)
-      - per-channel trainable Lipschitz scaling via diag(lip_vec)
+      - per-channel positive output scaling via diag(lip_vec)
 
-    The global Euclidean Lipschitz constant is <= max(lip_vec),
-    which is exposed as the scalar property `lip` for certification.
+    This older unsaturated gate is not a globally certified Lipschitz branch.
+    Use L2BoundedGLUv2 (LGLU2) for the certificate used by DeepSSM.
     """
     def __init__(self, config: LayerConfig):
         super().__init__()
@@ -304,11 +301,7 @@ class L2BoundedGLU(nn.Module):
 
     @property
     def lip(self) -> torch.Tensor:
-        """
-        Scalar global l2-Lipschitz bound of the whole block.
-        Since forward applies diag(lip_vec), the exact Euclidean operator norm
-        of that diagonal scaling is max(lip_vec).
-        """
+        """Largest output scale; not an incremental Lipschitz certificate."""
         return self.lip_vec.max()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -452,17 +445,8 @@ class BudgetedL2BoundedGLUv2(nn.Module):
         y = a * b
         return self.W0(y)
 
+# Bounded branch mixing
 
-
-import math
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-
-# ---------------------------------------------------------------------
-# 1-Lipschitz GroupSort activation
-# ---------------------------------------------------------------------
 class GroupSort(nn.Module):
     """
     GroupSort with group size 2.
@@ -483,9 +467,6 @@ class GroupSort(nn.Module):
         return xs.view(*x.shape)
 
 
-# ---------------------------------------------------------------------
-# 1-Lipschitz GroupSort MLP branch
-# ---------------------------------------------------------------------
 class LipGroupSortBranch(nn.Module):
     """
     A 1-Lipschitz branch:
@@ -507,12 +488,9 @@ class LipGroupSortBranch(nn.Module):
         return x
 
 
-# ---------------------------------------------------------------------
-# Certified multi-branch FF block
-# ---------------------------------------------------------------------
 class MultiBranchLipMixer(nn.Module):
     """
-    Maximally expressive certified FF block.
+    Certified concatenation of four nonlinear branches.
 
     Branches:
       h1 = GroupSortMLP(x)                          (1-Lipschitz)
@@ -542,7 +520,6 @@ class MultiBranchLipMixer(nn.Module):
     so the whole block satisfies:
         Lip(block) <= lip
 
-    This is much more expressive than a single GLU while keeping a clean bound.
     """
 
     def __init__(self, config):
@@ -551,8 +528,8 @@ class MultiBranchLipMixer(nn.Module):
 
         d_input = int(config.d_input)
 
-        # For maximal expressivity, interpret d_hidden as a width multiplier if small,
-        # otherwise as an absolute width if already large.
+        # Preserve the historical width rule: values <= 16 are multipliers;
+        # larger values are absolute widths.
         raw_hidden = int(config.d_hidden)
         if raw_hidden <= 16:
             width = max(2 * d_input, raw_hidden * d_input)
@@ -635,3 +612,9 @@ class MultiBranchLipMixer(nn.Module):
 
         # Final learnable global Lipschitz level
         return self.lip * z
+
+__all__ = [
+    "L2BoundedLinearExact", "TLIP", "LMLP", "L2BoundedGLU", "L2BoundedGLUv2",
+    "BudgetedL2BoundedGLUv2", "GroupSort", "LipGroupSortBranch", "MultiBranchLipMixer",
+    "cayley", "FirstChannel", "SandwichLin", "SandwichFc",
+]

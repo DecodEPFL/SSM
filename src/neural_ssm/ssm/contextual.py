@@ -1,3 +1,11 @@
+"""ContextualDeepSSM and its input filters, residual gates, and output mixer.
+
+The core remains a DeepSSM. Context can augment inputs, attenuate residuals,
+mix output features, or condition a selective cell. These operations share one
+wrapper and are kept together so their different gain assumptions are visible.
+
+Reading order: input filtering, gates/mixing, then the public wrapper.
+"""
 from __future__ import annotations
 
 import math
@@ -7,58 +15,12 @@ from typing import Any, Callable, Optional, Sequence, Union
 import torch
 import torch.nn as nn
 
-from .layers import DeepSSM, SSMConfig
-from .lti_cells import _normalize_to_3d
+from .layers import DeepSSM
+from .config import SSMConfig
+from ..utils.runtime import normalize_to_3d as _normalize_to_3d
 
 
-_VALID_CONTEXT_MODES = frozenset({"input", "gate", "mixer", "select"})
-
-
-def timewise_matrix_vector_product(matrices: torch.Tensor, vectors: torch.Tensor) -> torch.Tensor:
-    """Apply ``A_t e_t`` at every batch/time index."""
-    if matrices.shape[:-2] != vectors.shape[:-1] or matrices.shape[-1] != vectors.shape[-1]:
-        raise ValueError(
-            "Expected matrices (..., d_output, d_features) and vectors "
-            f"(..., d_features), got {tuple(matrices.shape)} and {tuple(vectors.shape)}."
-        )
-    return torch.matmul(matrices, vectors.unsqueeze(-1)).squeeze(-1)
-
-
-def _as_tuple(modes: Optional[Union[str, Sequence[str]]]) -> tuple[str, ...]:
-    if modes is None:
-        return ()
-    if isinstance(modes, str):
-        modes = (modes,)
-    result = tuple(dict.fromkeys(str(mode).lower() for mode in modes))
-    unknown = set(result) - set(_VALID_CONTEXT_MODES)
-    if unknown:
-        raise ValueError(
-            f"Unknown context mode(s) {sorted(unknown)}. "
-            f"Available modes are {sorted(_VALID_CONTEXT_MODES)}."
-        )
-    return result
-
-
-def _make_mlp(
-    d_input: int,
-    d_output: int,
-    *,
-    hidden_dim: int,
-    n_layers: int,
-    activation: Callable[[], nn.Module],
-    bias: bool = True,
-) -> nn.Sequential:
-    if n_layers < 0:
-        raise ValueError("n_layers must be non-negative.")
-    if n_layers == 0:
-        return nn.Sequential(nn.Linear(d_input, d_output, bias=bias))
-
-    layers: list[nn.Module] = [nn.Linear(d_input, hidden_dim, bias=bias), activation()]
-    for _ in range(n_layers - 1):
-        layers.extend((nn.Linear(hidden_dim, hidden_dim, bias=bias), activation()))
-    layers.append(nn.Linear(hidden_dim, d_output, bias=bias))
-    return nn.Sequential(*layers)
-
+# Input filters and their energy bounds
 
 class _ContextFilter(nn.Module):
     """L2-admissible projection for the input-augmentation (additive) context path.
@@ -263,6 +225,38 @@ class _ContextFilter(nn.Module):
         total_bound = base ** (-exponent) + base ** (1.0 - exponent) / (exponent - 1.0)
         return scale * math.sqrt(total_bound)
 
+# Context gates and bounded output mixing
+
+def timewise_matrix_vector_product(matrices: torch.Tensor, vectors: torch.Tensor) -> torch.Tensor:
+    """Apply ``A_t e_t`` at every batch/time index."""
+    if matrices.shape[:-2] != vectors.shape[:-1] or matrices.shape[-1] != vectors.shape[-1]:
+        raise ValueError(
+            "Expected matrices (..., d_output, d_features) and vectors "
+            f"(..., d_features), got {tuple(matrices.shape)} and {tuple(vectors.shape)}."
+        )
+    return torch.matmul(matrices, vectors.unsqueeze(-1)).squeeze(-1)
+
+
+def _make_mlp(
+    d_input: int,
+    d_output: int,
+    *,
+    hidden_dim: int,
+    n_layers: int,
+    activation: Callable[[], nn.Module],
+    bias: bool = True,
+) -> nn.Sequential:
+    if n_layers < 0:
+        raise ValueError("n_layers must be non-negative.")
+    if n_layers == 0:
+        return nn.Sequential(nn.Linear(d_input, d_output, bias=bias))
+
+    layers: list[nn.Module] = [nn.Linear(d_input, hidden_dim, bias=bias), activation()]
+    for _ in range(n_layers - 1):
+        layers.extend((nn.Linear(hidden_dim, hidden_dim, bias=bias), activation()))
+    layers.append(nn.Linear(hidden_dim, d_output, bias=bias))
+    return nn.Sequential(*layers)
+
 
 class _BoundedMixer(nn.Module):
     def __init__(
@@ -371,6 +365,25 @@ class _ContextGate(nn.Module):
             {"ssm": gates[:, :, i, 0], "ff": gates[:, :, i, 1]}
             for i in range(self.n_layers_core)
         ]
+
+# Public context wrapper
+
+_VALID_CONTEXT_MODES = frozenset({"input", "gate", "mixer", "select"})
+
+
+def _as_tuple(modes: Optional[Union[str, Sequence[str]]]) -> tuple[str, ...]:
+    if modes is None:
+        return ()
+    if isinstance(modes, str):
+        modes = (modes,)
+    result = tuple(dict.fromkeys(str(mode).lower() for mode in modes))
+    unknown = set(result) - set(_VALID_CONTEXT_MODES)
+    if unknown:
+        raise ValueError(
+            f"Unknown context mode(s) {sorted(unknown)}. "
+            f"Available modes are {sorted(_VALID_CONTEXT_MODES)}."
+        )
+    return result
 
 
 class ContextualDeepSSM(nn.Module):
@@ -753,3 +766,5 @@ class ContextualDeepSSM(nn.Module):
 
     def reset(self):
         self.core.reset()
+
+__all__ = ["ContextualDeepSSM", "timewise_matrix_vector_product"]

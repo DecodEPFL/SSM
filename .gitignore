@@ -4,3 +4,7 @@ build/
 *.egg-info/
 .idea/
 .DS_Store
+
+# Generated Python bytecode is not package source.
+__pycache__/
+*.py[cod]
