@@ -1,7 +1,7 @@
 import torch
 from typing import Tuple, Dict, Optional, Callable, Union
-from src.neural_ssm.ssm import DeepSSM, SSMConfig, PureLRUR
-from src.neural_ssm.ssm.lti_cells import lruz
+from src.neural_ssm import DeepSSM, SSMConfig, PureLRUR
+from src.neural_ssm.ssm.cells.legacy import lruz
 import math
 from argparse import Namespace
 import torch.nn as nn

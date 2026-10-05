@@ -21,7 +21,7 @@ try:
     from neural_ssm.ssm import Block2x2DenseL2SSM
 except ImportError:
     # Fallback for running directly from this repository without installing
-    from src.neural_ssm.ssm import Block2x2DenseL2SSM
+    from src.neural_ssm import Block2x2DenseL2SSM
 
 
 @dataclass

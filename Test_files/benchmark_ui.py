@@ -35,7 +35,8 @@ BENCHMARKS = [
     "EMPS", "CED", "Cascaded_Tanks", "Silverbox", "WienerHammerBenchMark",
     "ParWH", "F16", "Industrial_robot", "WienerHammerstein_Process_Noise",
 ]
-MODELS = ["lru", "l2ru", "l2n", "tv", "tvc", "ren", "lstm", "gru"]
+MODELS = ["lru", "l2n", "defect", "tv", "tvc", "ren", "lstm", "gru", "l2ru", "zak", "l2nt"]
+LEGACY_MODELS = {"l2ru", "zak", "l2nt"}
 INITS = ["eye", "rand"]
 FFS = ["auto", "GLU", "MLP", "LGLU2", "MBLIP", "BLGLU2", "BudgetedLGLU2", "TLIP", "LMLP"]
 DEVICES = ["auto", "cpu", "cuda", "mps"]
@@ -70,9 +71,9 @@ class BenchmarkUI:
 
         mf = ttk.LabelFrame(top, text="Models  (Cmd/Ctrl-click for several)", padding=6)
         mf.pack(side="left", fill="both", expand=True, padx=(5, 0))
-        self.model_list = tk.Listbox(mf, selectmode="extended", height=8, exportselection=False)
+        self.model_list = tk.Listbox(mf, selectmode="extended", height=len(MODELS), exportselection=False)
         for m in MODELS:
-            self.model_list.insert("end", m)
+            self.model_list.insert("end", f"{m} (legacy)" if m in LEGACY_MODELS else m)
         self.model_list.selection_set(MODELS.index("tv"))
         self.model_list.pack(fill="both", expand=True)
 
@@ -149,7 +150,7 @@ class BenchmarkUI:
         panel_entry(lru_panel, 1, "lru_rmax", "maximum radius", "0.95")
         panel_entry(lru_panel, 2, "lru_max_phase", "maximum phase", str(2 * math.pi))
 
-        l2ru_panel = model_panel("l2ru", "L2RU initialization")
+        l2ru_panel = model_panel("l2ru", "Legacy L2RU initialization")
         ttk.Label(l2ru_panel, text="mode").grid(row=0, column=0, sticky="e", padx=(8, 2), pady=3)
         self.vars["init"] = tk.StringVar(value="eye")
         ttk.Combobox(
@@ -158,6 +159,13 @@ class BenchmarkUI:
         ).grid(row=0, column=1, sticky="w", padx=(0, 14), pady=3)
         panel_entry(l2ru_panel, 1, "l2ru_eye_scale", "eye scale", "0.01")
         panel_entry(l2ru_panel, 2, "l2ru_rand_scale", "random scale", "1.0")
+
+        zak_panel = model_panel("zak", "Legacy ZAK initialization")
+        ttk.Label(zak_panel, text="mode").grid(row=0, column=0, sticky="e", padx=(8, 2), pady=3)
+        ttk.Combobox(
+            zak_panel, textvariable=self.vars["init"], values=INITS,
+            width=9, state="readonly",
+        ).grid(row=0, column=1, sticky="w", padx=(0, 14), pady=3)
 
         l2n_panel = model_panel("l2n", "L2N initialization")
         panel_entry(l2n_panel, 0, "l2n_rho", "target pole radius", "0.9")
@@ -170,6 +178,20 @@ class BenchmarkUI:
             text="random phases (otherwise all use the phase center)",
             variable=self.l2n_random_phase_var,
         ).grid(row=1, column=0, columnspan=8, sticky="w", padx=8, pady=(3, 0))
+
+        defect_panel = model_panel("defect", "Defect completion")
+        panel_entry(defect_panel, 0, "defect_block_size", "block size", "2")
+        panel_entry(defect_panel, 1, "defect_rho", "initial radius", "0.9")
+        panel_entry(defect_panel, 2, "defect_max_radius", "contraction limit", "0.999")
+        panel_entry(defect_panel, 3, "defect_factor_margin", "factor margin", "0.001")
+        panel_entry(defect_panel, 4, "defect_init_scale", "initial factor scale", "0.05")
+        panel_entry(defect_panel, 5, "defect_max_phase", "phase half-width (2x2)", "0.04")
+        panel_entry(defect_panel, 6, "defect_phase_center", "phase center (2x2)", "0.0")
+        self.defect_random_phase_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            defect_panel, text="random phases (2x2 blocks)",
+            variable=self.defect_random_phase_var,
+        ).grid(row=2, column=0, columnspan=8, sticky="w", padx=8, pady=(3, 0))
 
         tv_panel = model_panel("tv", "TV initialization")
         panel_entry(tv_panel, 0, "tv_init_rho", "state decay", "0.99")
@@ -316,9 +338,10 @@ class BenchmarkUI:
                 "--lru-rmax", g("lru_rmax"),
                 "--lru-max-phase", g("lru_max_phase"),
             ]
+        if "l2ru" in models or "zak" in models:
+            cmd += ["--init", g("init")]
         if "l2ru" in models:
             cmd += [
-                "--init", g("init"),
                 "--l2ru-eye-scale", g("l2ru_eye_scale"),
                 "--l2ru-rand-scale", g("l2ru_rand_scale"),
             ]
@@ -331,6 +354,15 @@ class BenchmarkUI:
                 ("--l2n-random-phase" if self.l2n_random_phase_var.get()
                  else "--no-l2n-random-phase"),
             ]
+        if "defect" in models:
+            for key in (
+                "defect_block_size", "defect_rho", "defect_max_radius",
+                "defect_factor_margin", "defect_init_scale", "defect_max_phase",
+                "defect_phase_center",
+            ):
+                cmd += ["--" + key.replace("_", "-"), g(key)]
+            cmd += ["--defect-random-phase" if self.defect_random_phase_var.get()
+                    else "--no-defect-random-phase"]
         if "tv" in models:
             cmd += [
                 "--tv-init-rho", g("tv_init_rho"),

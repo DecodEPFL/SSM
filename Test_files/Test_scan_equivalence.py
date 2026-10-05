@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import torch
 
-from src.neural_ssm.ssm.scan_utils import (
+from src.neural_ssm.utils.scan import (
     compute_linear_recurrence_parallel_block2x2,
     compute_linear_recurrence_parallel_block2x2_complex,
     compute_linear_recurrence_sequential,

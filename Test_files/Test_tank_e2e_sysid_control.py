@@ -34,7 +34,7 @@ try:
 except ImportError:
     nonlinear_benchmarks = None
 
-from src.neural_ssm.ssm import DeepSSM, SSMConfig
+from src.neural_ssm import DeepSSM, SSMConfig
 
 
 TensorState = Optional[Sequence[Optional[torch.Tensor]]]

@@ -5,7 +5,7 @@ import math
 # Optional hook: if you already have a parallel scan kernel, plug it here.
 _HAS_SCAN = False
 try:
-    from src.neural_ssm.ssm.scan_utils import compute_linear_recurrence_parallel, compute_linear_recurrence_parallel_block2x2
+    from src.neural_ssm.utils.scan import compute_linear_recurrence_parallel, compute_linear_recurrence_parallel_block2x2
     _HAS_SCAN = True
 except Exception:
     _HAS_SCAN = False

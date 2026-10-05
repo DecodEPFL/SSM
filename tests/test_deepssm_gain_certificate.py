@@ -3,10 +3,10 @@ import unittest
 
 import torch
 
-from src.neural_ssm.ssm import DeepSSM, SSMConfig
-from src.neural_ssm.ssm.layers import _CERTIFIED_PARAMETRIZATIONS, _SSM_PARAMETRIZATIONS
-from src.neural_ssm.static_layers.generic_layers import LayerConfig
-from src.neural_ssm.static_layers.lipschitz_mlps import TLIP
+from src.neural_ssm import DeepSSM, SSMConfig
+from src.neural_ssm.ssm.registry import _CERTIFIED_PARAMETRIZATIONS, _SSM_PARAMETRIZATIONS
+from src.neural_ssm.static_layers import LayerConfig
+from src.neural_ssm.static_layers import TLIP
 
 
 def _certified_model(gamma: float = 1.5) -> DeepSSM:

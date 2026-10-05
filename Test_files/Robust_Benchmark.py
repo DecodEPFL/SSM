@@ -14,10 +14,10 @@ instantiated as:
 
 Valid param values:
   'lru'   — standard LRU (no L2 gain constraint)
-  'zak'   — lruz variant
-  'l2ru'  — L2-bounded LRU (uses d_model as state dim)
+  'zak'   — legacy lruz variant
+  'l2ru'  — legacy L2-bounded LRU (uses d_model as state dim)
   'l2n'   — Block2x2 dense L2 SSM (needs even d_state)
-  'l2nt'  — L2-bounded LTI cell
+  'l2nt'  — legacy L2-bounded LTI cell
   'tv'    — RobustMambaDiagSSM (time-varying)
   'tvc'   — RobustMambaDiagLTI (time-varying / LTI-coupled)
 
@@ -54,7 +54,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from src.neural_ssm.ssm import DeepSSM
+from src.neural_ssm import DeepSSM
 
 import matplotlib
 matplotlib.use("Agg")

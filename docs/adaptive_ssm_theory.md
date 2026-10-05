@@ -23,7 +23,7 @@ planning will use the same interface before we consider new action pathways.
 The current code already provides:
 
 - Selective diagonal recurrences with a per-step norm constraint in
-  `src/neural_ssm/ssm/selective_cells.py`.
+  `src/neural_ssm/ssm/cells/selective/`.
 - Deep residual composition and an explicit global decoder attenuation in
   `src/neural_ssm/ssm/layers.py`.
 - Context-conditioned `select`, `gate`, and `mixer` ports in

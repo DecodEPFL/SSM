@@ -1,40 +1,33 @@
-# python
-# file: src/neural_ssm/ssm/layers.py
-"""High-level deep state-space models and lightweight recurrent baselines.
+"""The SSM stack in one place: residual block, DeepSSM, and simple baselines.
 
-The main :class:`DeepSSM` stack uses two residual updates per block:
+Forward path: encoder -> SSL blocks -> decoder. Each SSL applies its recurrent
+cell followed by its instantaneous feedforward branch, with separate residual
+gates. Cell factories live in registry.py; settings live in config.py.
 
-    x <- x + alpha_ssm * SSM(x)
-    x <- x + alpha_ff  * FF(x)
-
-Keeping the temporal and channel-mixing branches separate improves gradient
-flow and lets each branch learn its own contribution. When ``gamma`` is set,
-the implementation certifies the zero-state induced L2 gain using the block
-bound
-
-    (1 + alpha_ssm * gamma_ssm) * (1 + alpha_ff * lip_ff),
-
-with the appropriate dropout factors during training.
+Reading order below: certificate helpers, feedforward construction, SSL,
+DeepSSM, then PureLRUR/SimpleRNN. Context handling lives in contextual.py.
 """
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, fields
-from typing import Any, Callable, List, Optional, Sequence, Tuple, TypedDict, Union
+from typing import Any, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .lti_cells import (
-    Block2x2DenseL2SSM,
-    L2BoundedLTICell,
-    L2RU,
-    LRU,
-    _normalize_to_3d,
-    lruz,
+from .config import SSMConfig, SSMConfigDict
+from .registry import (
+    SSMParametrization,
+    _build_ssm_cell,
+    _initial_block_gamma,
+    _get_ssm_parametrization,
+    _CERTIFIED_PARAMETRIZATIONS,
+    _SSM_PARAMETRIZATIONS,
 )
-from .selective_cells import L2SelectiveRavenCell, RobustMambaDiagSSM, RobustMambaDiagLTI
+from .cells.lti import LRU, Block2x2DenseL2SSM, DefectL2SSM
+from .cells.selective import RobustMambaDiagSSM, RobustMambaDiagLTI
+from .cells.legacy import L2RU, lruz, L2BoundedLTICell
 from ..static_layers.generic_layers import GLU, MLP, LayerConfig
 from ..static_layers.lipschitz_mlps import (
     BudgetedL2BoundedGLUv2,
@@ -42,355 +35,12 @@ from ..static_layers.lipschitz_mlps import (
     L2BoundedGLUv2,
     LMLP,
     MultiBranchLipMixer,
+    TLIP,
 )
-
-try:
-    from ..static_layers.lipschitz_mlps import TLIP
-except ImportError:
-    TLIP = None
+from ..utils.runtime import EvalCacheMixin, normalize_to_3d as _normalize_to_3d
 
 
-_CERTIFIED_FEEDFORWARDS = frozenset(
-    {"LGLU2", "BLGLU2", "BudgetedLGLU2", "MBLIP", "TLIP"}
-)
-
-
-@dataclass
-class SSMConfig:
-    d_model: int = 10  # input/output size of the LRU after the decoding phase (n_u = n_y)
-    d_state: int = 32  # state size of the LRU (n_x)
-    n_layers: int = 2  # number of SSMs blocks in cascade for deep structures
-    dropout: float = 0.0  # set it different from 0 if you want to introduce dropout regularization
-    bias: bool = False  # bias of MLP static_layers
-    rmin: float = .8  # min. magnitude of the eigenvalues at initialization in the complex parametrization
-    rmax: float = .95  # max. magnitude of the eigenvalues at initialization in the complex parametrization
-    max_phase: float = 2 * math.pi  # maximum phase of the eigenvalues at initialization in the complex parametrization
-    ff: str = "MLP"  # non-linear static block used in the scaffolding
-    scale: float = 1  # Lipschitz constant of the Lipschitz bounded MLP (LMLP)
-    dim_amp: int = 4  # controls the hidden layer's dimension of the MLP
-    d_hidden: int = 4  # controls the hidden layer's dimension of the non-linear layer
-    nl_layers: int = 2 # number of hidden layers of the non-linear layers (static nonlinearities)
-    param: Optional[str] = None  # pick the parametrization you want to use for the LRU. Default = LRU, other options are L2RU
-    # and ZAK
-    gamma: Optional[float] = None  # prescribed upper bound on the zero-state l2 gain. None disables the global cap.
-    train_gamma: bool = True # controls whether the per-block / per-LTI gamma parameters are trainable. This is distinct
-    # from the global target gamma above, which remains fixed whenever `gamma` is not None.
-    train_ff_lip: Optional[bool] = True  # if None, freeze FF Lipschitz scaling when using a fixed, non-trainable gamma
-    # and leave it trainable otherwise.
-    init: str = 'eye'  # controls the initialization of the parameters when the L2RU param is chosen.
-    l2ru_eye_scale: float = 0.01
-    l2ru_rand_scale: float = 1.0
-    # L2N initialization
-    rho: float = 0.9
-    max_phase_b: float = 0.04          # small spread
-    phase_center: float = 0        # center angle
-    random_phase: bool = True
-    offdiag_scale: float = 0.05  # init std for K12/K21/K22 in l2n (old default was 0.005)
-    # Selective TV initialization
-    tv_init_rho: float = 0.99
-    tv_init_delta0: float = 1.0
-    tv_init_param_scale: float = 0.02
-    # Selective LTI TVC initialization
-    tvc_init_rho: float = 0.9
-    tvc_init_delta0: float = 1.0
-    tvc_init_param_scale: float = 0.02
-    tvc_init_sign: float = 0.995
-    tvc_init_b: float = 0.10
-    tvc_init_c: float = 0.10
-    tvc_init_d: float = 0.10
-    bcd_nonlinearity: str = "identity"  # tvc only: 'tanh' bounds b,c,d before normalization
-    # (more stable training); 'identity' (legacy default) leaves them unbounded.
-    learn_x0: bool = False  # if True, the initial hidden state is a learnable parameter
-    select_context_dim: int = 0  # width of an optional context fed to selective cells'
-    # param_net (the "select" injection); 0 disables it. Only used by selective params.
-    # What the selective cells' param_net may see. 'both' is Mamba-style input
-    # selectivity and certifies a zero-state l2 bound only. 'context' makes the
-    # per-step matrices depend on the exogenous context alone, so the map is
-    # linear time-varying for a fixed context and the same bound becomes
-    # *incremental*. See DeepSSM.incremental_gain_bound.
-    select_input: str = "both"
-    use_cuda_graph: bool = False  # tv/tvc only: replay the diagonal scan from a captured CUDA
-    # graph instead of eager dispatch (same maths; removes launch overhead for fixed-shape runs)
-    zak_d_margin: float = 0.5  # ZAK-only: initialize the direct term strictly inside the feasible set
-    zak_x2_margin: float = 0.5  # ZAK-only: initialize the off-diagonal coupling strictly inside the feasible set
-    zak_x2_init_scale: float = 0.1  # ZAK-only: scale of the free real X2 initialization
-    cert_scale_temperature: float = 0.05  # smoothness of the fixed-gamma soft cap; smaller values approach
-    # the hard min without breaking the guarantee.
-    ssm_residual_init: float = -1.0  # logit of the SSM residual gate
-    ff_residual_init: float = -1.0  # logit of the FF residual gate
-    # Rescale the residual-gate logits at construction so the stack keeps
-    # `budget_init_utilization` of the achievable decoder scale min(1, gamma).
-    # The block product grows geometrically with depth at a fixed logit, so
-    # without this a deep certified stack starts almost entirely attenuated:
-    # 24 blocks at the default logit open with the decoder scaled to 0.3%.
-    auto_residual_init: bool = False
-    budget_init_utilization: float = 0.7  # in (0, 1)
-    per_channel_gates: bool = False  # if True, the residual gates are per-channel (d_model)
-    # vectors instead of scalars; the certificate uses the worst-channel gate (max).
-
-    # Internal Raven selective slot-memory prototype (param="raven"). It is
-    # retained for the experimental regression suite and is not part of the
-    # supported public DeepSSM surface.
-    raven_heads: int = 4  # number of attention heads (H)
-    raven_slots: int = 16  # number of key/value memory slots (M)
-    raven_key_dim: int = 16  # per-head key/query dimension (d_k)
-    raven_value_dim: int = 16  # per-head value dimension (d_v)
-    raven_top_k: int = 4  # router keeps the top-K slots per token (1 <= K <= M)
-    raven_alpha: float = 1.0  # router normalization; larger => smaller writes / gain budget
-    raven_rho_max: float = 0.999  # hard cap on the slot decay rho in (0, rho_max)
-    raven_gamma_skip: float = 0.0  # gain budget reserved for the optional direct skip D
-    raven_use_skip: bool = False  # include the spectrally-capped direct term D z_t
-
-    # Parallel scan must be selected in the forward call of the SSM.
-
-    # Generate TypedDict automatically
-
-
-SSMConfigDict = TypedDict('SSMConfigDict',
-                          {f.name: f.type for f in fields(SSMConfig)},
-                          total=False)
-
-"""SSM block construction and gain helpers."""
-
-
-def _sigmoid_scalar(value: float) -> float:
-    """Numerically stable scalar sigmoid used during module construction."""
-    value = float(value)
-    if value >= 0.0:
-        return 1.0 / (1.0 + math.exp(-value))
-    exp_value = math.exp(value)
-    return exp_value / (1.0 + exp_value)
-
-
-def _initial_block_gamma(config: SSMConfig) -> Optional[float]:
-    """Choose a useful recurrent-branch gain at initialization.
-
-    The global decoder cap is responsible for the hard end-to-end guarantee.
-    This initializer only tries to avoid starting with an unnecessarily large
-    decoder attenuation. It accounts for the initial FF residual factor.
-    """
-    if config.gamma is None or config.n_layers <= 0:
-        return None
-
-    alpha_ssm = _sigmoid_scalar(config.ssm_residual_init)
-    alpha_ff = _sigmoid_scalar(config.ff_residual_init)
-    per_block_target = math.exp(math.log(float(config.gamma)) / config.n_layers)
-    ff_factor = 1.0 + alpha_ff * float(config.scale)
-    recurrent_factor = per_block_target / ff_factor
-    gamma = (recurrent_factor - 1.0) / max(alpha_ssm, 1e-8)
-    return max(gamma, 1e-2)
-
-
-@torch.no_grad()
-def _set_cell_gamma(cell: nn.Module, target_gamma: float) -> None:
-    """Initialize the different positive-gamma parametrizations consistently."""
-    target = max(float(target_gamma), 1e-8)
-    gamma_raw = getattr(cell, "gamma_raw", None)
-    log_gamma = getattr(cell, "log_gamma", None)
-    gamma = getattr(cell, "gamma", None)
-
-    if isinstance(gamma_raw, nn.Parameter):
-        value = torch.as_tensor(target, device=gamma_raw.device, dtype=gamma_raw.dtype)
-        value = value.clamp_min(1e-6)
-        # Stable inverse softplus: x + log(1 - exp(-x)).
-        gamma_raw.copy_(value + torch.log(-torch.expm1(-value)))
-    elif isinstance(log_gamma, nn.Parameter):
-        log_gamma.fill_(math.log(target))
-    elif isinstance(gamma, nn.Parameter):
-        gamma.fill_(target)
-
-
-CellFactory = Callable[[SSMConfig, Optional[float]], nn.Module]
-
-
-@dataclass(frozen=True)
-class SSMParametrization:
-    """Construction metadata for one recurrent-cell parametrization.
-
-    ``certified`` means the produced cell exposes a finite zero-state L2-gain
-    bound through either ``gain_bound()`` or the legacy ``.gamma`` attribute.
-
-    ``selective`` means the cell builds its per-step transition from a
-    ``param_net``, so a context signal can shape the dynamics and the cell
-    accepts ``select_input``.
-    """
-
-    name: str
-    factory: CellFactory
-    certified: bool
-    selective: bool = False
-
-
-def _fixed_gamma(config: SSMConfig, block_gamma: Optional[float]) -> Optional[float]:
-    """Return the fixed per-cell gamma used by legacy fixed-gamma cells."""
-    return None if config.train_gamma else block_gamma
-
-
-def _gamma_init(block_gamma: Optional[float]) -> float:
-    """Default positive gamma for cells that own their trainability flag."""
-    return 1.0 if block_gamma is None else float(block_gamma)
-
-
-def _build_lru_cell(config: SSMConfig, block_gamma: Optional[float]) -> nn.Module:
-    return LRU(
-        in_features=config.d_model,
-        out_features=config.d_model,
-        state_features=config.d_state,
-        rmin=config.rmin,
-        rmax=config.rmax,
-        max_phase=config.max_phase,
-        learn_x0=config.learn_x0,
-    )
-
-
-def _build_l2ru_cell(config: SSMConfig, block_gamma: Optional[float]) -> nn.Module:
-    return L2RU(
-        state_features=config.d_model,
-        gamma=_fixed_gamma(config, block_gamma),
-        init=config.init,
-        eye_scale=config.l2ru_eye_scale,
-        rand_scale=config.l2ru_rand_scale,
-        learn_x0=config.learn_x0,
-    )
-
-
-def _build_zak_cell(config: SSMConfig, block_gamma: Optional[float]) -> nn.Module:
-    return lruz(
-        input_features=config.d_model,
-        output_features=config.d_model,
-        state_features=config.d_state,
-        rmin=config.rmin,
-        rmax=config.rmax,
-        max_phase=config.max_phase,
-        gamma=_fixed_gamma(config, block_gamma),
-        d_margin=config.zak_d_margin,
-        x2_margin=config.zak_x2_margin,
-        x2_init_scale=config.zak_x2_init_scale,
-        init=config.init,
-        learn_x0=config.learn_x0,
-    )
-
-
-def _build_l2n_cell(config: SSMConfig, block_gamma: Optional[float]) -> nn.Module:
-    cell = Block2x2DenseL2SSM(
-        d_state=config.d_state,
-        d_input=config.d_model,
-        d_output=config.d_model,
-        gamma=_gamma_init(block_gamma),
-        train_gamma=config.train_gamma,
-        learn_x0=config.learn_x0,
-    )
-    cell.init_on_circle(
-        rho=config.rho,
-        max_phase=config.max_phase_b,
-        phase_center=config.phase_center,
-        random_phase=config.random_phase,
-        offdiag_scale=config.offdiag_scale,
-    )
-    return cell
-
-
-def _build_l2nt_cell(config: SSMConfig, block_gamma: Optional[float]) -> nn.Module:
-    return L2BoundedLTICell(
-        d_state=config.d_state,
-        d_input=config.d_model,
-        d_output=config.d_model,
-        gamma=_gamma_init(block_gamma),
-        train_gamma=config.train_gamma,
-        learn_x0=config.learn_x0,
-    )
-
-
-def _build_tv_cell(config: SSMConfig, block_gamma: Optional[float]) -> nn.Module:
-    return RobustMambaDiagSSM(
-        d_state=config.d_state,
-        d_model=config.d_model,
-        d_out=config.d_model,
-        gamma=_gamma_init(block_gamma),
-        train_gamma=config.train_gamma,
-        init_rho=config.tv_init_rho,
-        init_delta0=config.tv_init_delta0,
-        init_param_scale=config.tv_init_param_scale,
-        learn_x0=config.learn_x0,
-        use_cuda_graph=config.use_cuda_graph,
-        context_dim=config.select_context_dim,
-        select_input=config.select_input,
-    )
-
-
-def _build_tvc_cell(config: SSMConfig, block_gamma: Optional[float]) -> nn.Module:
-    return RobustMambaDiagLTI(
-        d_state=config.d_state,
-        d_model=config.d_model,
-        d_out=config.d_model,
-        gamma=_gamma_init(block_gamma),
-        train_gamma=config.train_gamma,
-        param_net="mlp",
-        hidden=max(64, 2 * config.d_model),
-        init_rho=config.tvc_init_rho,
-        init_delta0=config.tvc_init_delta0,
-        init_param_scale=config.tvc_init_param_scale,
-        init_sign=config.tvc_init_sign,
-        init_b=config.tvc_init_b,
-        init_c=config.tvc_init_c,
-        init_d=config.tvc_init_d,
-        bcd_nonlinearity=config.bcd_nonlinearity,
-        output_uses_post_state=False,
-        learn_x0=config.learn_x0,
-        use_cuda_graph=config.use_cuda_graph,
-        context_dim=config.select_context_dim,
-        select_input=config.select_input,
-    )
-
-
-def _build_raven_cell(config: SSMConfig, block_gamma: Optional[float]) -> nn.Module:
-    return L2SelectiveRavenCell(
-        d_model=config.d_model,
-        num_heads=config.raven_heads,
-        num_slots=config.raven_slots,
-        key_dim=config.raven_key_dim,
-        value_dim=config.raven_value_dim,
-        top_k=config.raven_top_k,
-        gamma=_gamma_init(block_gamma),
-        train_gamma=config.train_gamma,
-        gamma_skip=config.raven_gamma_skip,
-        alpha=config.raven_alpha,
-        rho_max=config.raven_rho_max,
-        use_skip=config.raven_use_skip,
-        learn_x0=config.learn_x0,
-    )
-
-
-_SSM_PARAMETRIZATIONS: dict[str, SSMParametrization] = {
-    "lru": SSMParametrization("lru", _build_lru_cell, certified=False),
-    "l2ru": SSMParametrization("l2ru", _build_l2ru_cell, certified=True),
-    "zak": SSMParametrization("zak", _build_zak_cell, certified=True),
-    "l2n": SSMParametrization("l2n", _build_l2n_cell, certified=True),
-    "l2nt": SSMParametrization("l2nt", _build_l2nt_cell, certified=True),
-    "tv": SSMParametrization("tv", _build_tv_cell, certified=True, selective=True),
-    "tvc": SSMParametrization("tvc", _build_tvc_cell, certified=True, selective=True),
-    # Internal prototype; exposed only through neural_ssm.experimental.
-    "raven": SSMParametrization("raven", _build_raven_cell, certified=True),
-}
-_CERTIFIED_PARAMETRIZATIONS = frozenset(
-    name for name, spec in _SSM_PARAMETRIZATIONS.items() if spec.certified
-)
-
-
-def _param_name(param: Optional[str]) -> str:
-    return "lru" if param is None else str(param)
-
-
-def _get_ssm_parametrization(param: Optional[str]) -> SSMParametrization:
-    name = _param_name(param)
-    try:
-        return _SSM_PARAMETRIZATIONS[name]
-    except KeyError as exc:
-        available = ", ".join(sorted(_SSM_PARAMETRIZATIONS))
-        raise ValueError(
-            f"Unknown SSM parametrization: {param!r}. Available: {{{available}}}."
-        ) from exc
-
+# Certificate helpers
 
 def _has_gain_contract(module: nn.Module) -> bool:
     return callable(getattr(module, "gain_bound", None)) or hasattr(module, "gamma")
@@ -463,14 +113,9 @@ def _state_energy(
         return torch.stack(parts).sum(dim=0)
     raise TypeError(f"Unsupported state type: {type(state).__name__}.")
 
+# Feedforward branch construction
 
-def _build_ssm_cell(config: SSMConfig, block_gamma: Optional[float]) -> nn.Module:
-    """Build one recurrent cell from the registry and initialize its gain."""
-    cell = _get_ssm_parametrization(config.param).factory(config, block_gamma)
-    if config.train_gamma and block_gamma is not None:
-        _set_cell_gamma(cell, block_gamma)
-    return cell
-
+_CERTIFIED_FEEDFORWARDS = frozenset({"LGLU2", "BLGLU2", "BudgetedLGLU2", "MBLIP", "TLIP"})
 
 def _build_feedforward(config: SSMConfig) -> nn.Module:
     """Build the instantaneous channel-mixing branch."""
@@ -495,14 +140,14 @@ def _build_feedforward(config: SSMConfig) -> nn.Module:
         "BudgetedLGLU2": BudgetedL2BoundedGLUv2,
         "LMLP": LMLP,
         "MBLIP": MultiBranchLipMixer,
+        "TLIP": TLIP,
     }
-    if TLIP is not None:
-        builders["TLIP"] = TLIP
     try:
         return builders[config.ff](layer_config)
     except KeyError as exc:
         raise ValueError(f"Unknown feedforward type: {config.ff!r}.") from exc
 
+# Residual state-space block
 
 class SSL(nn.Module):
     """State-space block with separate temporal and feedforward residuals.
@@ -701,8 +346,9 @@ class SSL(nn.Module):
             error_msgs,
         )
 
+# Deep state-space stack
 
-class DeepSSM(nn.Module):
+class DeepSSM(EvalCacheMixin, nn.Module):
     """
     Deep SSM with an optional certified zero-state l2-gain upper bound.
 
@@ -802,8 +448,6 @@ class DeepSSM(nn.Module):
             float(self.config.gamma) if self.config.gamma is not None else None
         )
         self.ff_has_lip = False
-        # Eval-only cache of the spectrally-capped (encoder, decoder) weights.
-        self._enc_dec_cache = None
 
         if self.use_cert_scaling:
             self.register_buffer("gamma_t", torch.tensor(float(self.config.gamma)))
@@ -1102,10 +746,7 @@ class DeepSSM(nn.Module):
 
         device = self.encoder_w.device
         dtype = self.encoder_w.dtype
-        encoder_eff = self._spectrally_capped_weight(self.encoder_w)
-        decoder_eff = self._spectrally_capped_weight(self.decoder_w)
-        encoder_norm = torch.linalg.matrix_norm(encoder_eff.float(), ord=2).to(dtype=dtype)
-        decoder_norm = torch.linalg.matrix_norm(decoder_eff.float(), ord=2).to(dtype=dtype)
+        encoder_norm, decoder_norm = self._encoder_decoder_norms()
 
         log_block_product = self._log_block_gain_product(device=device, dtype=dtype)
         gamma_cap = self._effective_gamma_cap(
@@ -1226,8 +867,7 @@ class DeepSSM(nn.Module):
         total = log_kappa.sum()
         suffix = total - torch.cumsum(log_kappa, dim=0)
 
-        decoder_eff = self._spectrally_capped_weight(self.decoder_w)
-        decoder_norm = torch.linalg.matrix_norm(decoder_eff.float(), ord=2).to(dtype=dtype)
+        _, decoder_norm = self._encoder_decoder_norms()
         log_scale = self._smooth_capped_log_scale_from_logs(
             gamma_t=self._effective_gamma_cap(gamma=gamma, device=device, dtype=dtype),
             log_gamma_prod=self._log_block_gain_product(device=device, dtype=dtype),
@@ -1359,14 +999,7 @@ class DeepSSM(nn.Module):
                     min=0.0,
                 )
             )
-            encoder_eff = self._spectrally_capped_weight(self.encoder_w)
-            decoder_eff = self._spectrally_capped_weight(self.decoder_w)
-            encoder_norm_t = torch.linalg.matrix_norm(
-                encoder_eff.float(), ord=2
-            ).to(dtype=dtype)
-            decoder_norm_t = torch.linalg.matrix_norm(
-                decoder_eff.float(), ord=2
-            ).to(dtype=dtype)
+            encoder_norm_t, decoder_norm_t = self._encoder_decoder_norms()
 
             global_gamma = float(gamma_cap.detach().cpu())
             smooth_scale = float(smooth.detach().cpu())
@@ -1629,36 +1262,25 @@ class DeepSSM(nn.Module):
         return torch.exp(log_scale)
 
     def _capped_encoder_decoder(self):
-        """Spectrally-capped (encoder, decoder) weights, cached in eval.
+        """Reuse spectral caps only in gradient-free eval, with fresh weights."""
+        return self._eval_cached("encoder_decoder", lambda: (
+            self._spectrally_capped_weight(self.encoder_w),
+            self._spectrally_capped_weight(self.decoder_w),
+        ))
 
-        The cap is an SVD-based spectral-norm clip; with fixed weights (eval) the
-        result is constant, so it is computed once and reused. Training always
-        recomputes (weights change), and ``train()``/``eval()`` clears the cache.
-        The cached tensors are exactly the recomputed ones — no math change.
-        """
-        if self.training:
-            self._enc_dec_cache = None
-            return (self._spectrally_capped_weight(self.encoder_w),
-                    self._spectrally_capped_weight(self.decoder_w))
-        if self._enc_dec_cache is None:
-            self._enc_dec_cache = (
-                self._spectrally_capped_weight(self.encoder_w).detach(),
-                self._spectrally_capped_weight(self.decoder_w).detach(),
-            )
-        return self._enc_dec_cache
-
-    def train(self, mode: bool = True):
-        self._enc_dec_cache = None
-        return super().train(mode)
+    def _encoder_decoder_norms(self):
+        """Reuse the same capped weights and their norms in gain diagnostics."""
+        def compute():
+            return tuple(torch.linalg.matrix_norm(w.float(), ord=2).to(dtype=w.dtype)
+                         for w in self._capped_encoder_decoder())
+        return self._eval_cached("encoder_decoder_norms", compute)
 
     def reset(self):
         for block in self.blocks:
             block.lru.reset()
 
+# Simple recurrent baselines
 
-# Pure LRU blocks -----------------------------------------------
-
-# python
 class PureLRUR(nn.Module):
     """Pure LRU block without scaffolding."""
 
@@ -1863,3 +1485,9 @@ class SimpleRNN(nn.Module):
     def reset(self):
         from .state_utils import reset_runtime_state as _reset_runtime_state
         self.state = _reset_runtime_state(self.state, x0=self.x0_param)
+
+__all__ = [
+    "SSMConfig", "SSMConfigDict", "SSMParametrization", "SSL", "DeepSSM",
+    "PureLRUR", "SimpleRNN", "LRU", "L2RU", "lruz", "L2BoundedLTICell",
+    "Block2x2DenseL2SSM", "DefectL2SSM", "RobustMambaDiagSSM", "RobustMambaDiagLTI",
+]
