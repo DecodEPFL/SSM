@@ -35,7 +35,7 @@ BENCHMARKS = [
     "EMPS", "CED", "Cascaded_Tanks", "Silverbox", "WienerHammerBenchMark",
     "ParWH", "F16", "Industrial_robot", "WienerHammerstein_Process_Noise",
 ]
-MODELS = ["lru", "l2n", "defect", "tv", "tvc", "ren", "lstm", "gru", "l2ru", "zak", "l2nt"]
+MODELS = ["lru", "l2n", "defect", "metric_defect", "metric_l2n", "tv", "tvc", "ren", "lstm", "gru", "l2ru", "zak", "l2nt"]
 LEGACY_MODELS = {"l2ru", "zak", "l2nt"}
 INITS = ["eye", "rand"]
 FFS = ["auto", "GLU", "MLP", "LGLU2", "MBLIP", "BLGLU2", "BudgetedLGLU2", "TLIP", "LMLP"]
@@ -193,6 +193,19 @@ class BenchmarkUI:
             variable=self.defect_random_phase_var,
         ).grid(row=2, column=0, columnspan=8, sticky="w", padx=8, pady=(3, 0))
 
+        metric_panel = model_panel("metric_ssm", "Metric-transfer stack")
+        for column, (key, label, choices, default) in enumerate((
+            ("metric_activation", "activation", ("tanh", "relu", "arctan", "identity"), "tanh"),
+            ("metric_ff", "feedforward", ("residual", "none"), "residual"),
+        )):
+            ttk.Label(metric_panel, text=label).grid(row=0, column=2*column, padx=(8, 2))
+            self.vars[key] = tk.StringVar(value=default)
+            ttk.Combobox(metric_panel, textvariable=self.vars[key], values=choices,
+                         width=10, state="readonly").grid(row=0, column=2*column+1, padx=(0, 14))
+        panel_entry(metric_panel, 2, "metric_init_feedthrough", "initial direct path", "0.95")
+        ttk.Label(metric_panel, text="Uses its own feedforward setting; gamma must be auto or positive.").grid(
+            row=1, column=0, columnspan=8, sticky="w", padx=8, pady=(5, 0))
+
         tv_panel = model_panel("tv", "TV initialization")
         panel_entry(tv_panel, 0, "tv_init_rho", "state decay", "0.99")
         panel_entry(tv_panel, 1, "tv_init_delta0", "step size", "1.0")
@@ -298,6 +311,9 @@ class BenchmarkUI:
 
     def _update_model_options(self, _event=None):
         selected = set(self._selected(self.model_list, MODELS))
+        for name, core in (("metric_defect", "defect"), ("metric_l2n", "l2n")):
+            if name in selected:
+                selected.update((core, "metric_ssm"))
         for model, frame in self.model_option_frames.items():
             if model in selected:
                 if not frame.winfo_manager():
@@ -345,7 +361,7 @@ class BenchmarkUI:
                 "--l2ru-eye-scale", g("l2ru_eye_scale"),
                 "--l2ru-rand-scale", g("l2ru_rand_scale"),
             ]
-        if "l2n" in models:
+        if "l2n" in models or "metric_l2n" in models:
             cmd += [
                 "--l2n-rho", g("l2n_rho"),
                 "--l2n-max-phase", g("l2n_max_phase"),
@@ -354,7 +370,7 @@ class BenchmarkUI:
                 ("--l2n-random-phase" if self.l2n_random_phase_var.get()
                  else "--no-l2n-random-phase"),
             ]
-        if "defect" in models:
+        if "defect" in models or "metric_defect" in models:
             for key in (
                 "defect_block_size", "defect_rho", "defect_max_radius",
                 "defect_factor_margin", "defect_init_scale", "defect_max_phase",
@@ -363,6 +379,9 @@ class BenchmarkUI:
                 cmd += ["--" + key.replace("_", "-"), g(key)]
             cmd += ["--defect-random-phase" if self.defect_random_phase_var.get()
                     else "--no-defect-random-phase"]
+        if "metric_defect" in models or "metric_l2n" in models:
+            for key in ("metric_activation", "metric_ff", "metric_init_feedthrough"):
+                cmd += ["--" + key.replace("_", "-"), g(key)]
         if "tv" in models:
             cmd += [
                 "--tv-init-rho", g("tv_init_rho"),

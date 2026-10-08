@@ -71,7 +71,7 @@ from nonlinear_benchmarks.not_splitted_benchmarks import (
     WienerHammerstein_Process_Noise,
 )
 
-from src.neural_ssm import DeepSSM, SSMConfig
+from src.neural_ssm import DeepSSM, SSMConfig, MetricDeepSSM, MetricSSMConfig
 from src.neural_ssm.rens.ren import REN
 
 
@@ -272,6 +272,22 @@ class DeepSSMSim(nn.Module):
         return self.core.gain_diagnostics() if self.core.use_cert_scaling else None
 
 
+class MetricSSMSim(nn.Module):
+    """Metric-transfer stack with the benchmark's output-only interface."""
+
+    def __init__(self, n_u: int, n_y: int, cfg: MetricSSMConfig, mode="scan"):
+        super().__init__()
+        self.core = MetricDeepSSM(n_u, n_y, config=cfg)
+        self.mode = mode
+
+    def forward(self, u):
+        return self.core(u, mode=self.mode, reset_state=True, return_state=False)
+
+    @torch.no_grad()
+    def diagnostics(self):
+        return self.core.gain_diagnostics()
+
+
 class RNNSim(nn.Module):
     """LSTM/GRU baseline with the same uniform interface."""
 
@@ -361,6 +377,8 @@ MODEL_ZOO: Dict[str, dict] = {
     "lru":   dict(kind="deepssm", param="lru",   gamma=None, ff="GLU"),     # uncertified baseline
     "l2n":   dict(kind="deepssm", param="l2n",   gamma=5.0,  ff="LGLU2"),   # certified 2x2 dense LTI (needs even d_state)
     "defect": dict(kind="deepssm", param="defect", gamma=5.0, ff="LGLU2"),
+    "metric_defect": dict(kind="metric_ssm", param="defect", gamma=5.0),
+    "metric_l2n": dict(kind="metric_ssm", param="l2n", gamma=5.0),
     "tv":    dict(kind="deepssm", param="tv",    gamma=5.0,  ff="MBLIP"),   # certified selective
     "tvc":   dict(kind="deepssm", param="tvc",   gamma=5.0,  ff="MBLIP"),   # certified selective with direct term
     "lstm":  dict(kind="lstm",    hidden=64, layers=2),
@@ -384,6 +402,7 @@ BEST_MODE: Dict[str, str] = {
     "lru": "conv", "l2n": "conv",
     "l2ru": "scan", "zak": "scan", "l2nt": "loop",
     "defect": "scan", "tv": "scan", "tvc": "scan",
+    "metric_defect": "scan", "metric_l2n": "scan",
 }
 
 
@@ -452,6 +471,27 @@ def _make_ssm_config(spec: dict, gconf: "GlobalModelConfig") -> SSMConfig:
     )
 
 
+def _make_metric_config(spec: dict, gconf: "GlobalModelConfig") -> MetricSSMConfig:
+    override = str(gconf.gamma_override).lower()
+    if override in ("none", ""):
+        raise ValueError("MetricDeepSSM requires --gamma auto or a positive number.")
+    gamma = spec["gamma"] if override == "auto" else float(gconf.gamma_override)
+    defect = spec["param"] == "defect"
+    return MetricSSMConfig(
+        d_model=gconf.d_model, d_state=gconf.d_state, n_layers=gconf.n_layers,
+        d_hidden=gconf.d_hidden, param=spec["param"], gamma=gamma,
+        activation=gconf.metric_activation, ff=gconf.metric_ff,
+        init_feedthrough=gconf.metric_init_feedthrough,
+        block_size=gconf.defect_block_size, max_radius=gconf.defect_max_radius,
+        factor_margin=gconf.defect_factor_margin,
+        rho=gconf.defect_rho if defect else gconf.l2n_rho,
+        max_phase=gconf.defect_max_phase if defect else gconf.l2n_max_phase,
+        phase_center=gconf.defect_phase_center if defect else gconf.l2n_phase_center,
+        random_phase=gconf.defect_random_phase if defect else gconf.l2n_random_phase,
+        init_scale=gconf.defect_init_scale if defect else gconf.l2n_offdiag_scale,
+    )
+
+
 def _closest_width(count_fn, target: int, lo: int = 2, cap: int = 4096) -> int:
     """Width whose model param count is closest to ``target``.
 
@@ -498,6 +538,19 @@ def build_model(name: str, n_u: int, n_y: int, gconf: "GlobalModelConfig",
     hidden size for the RNN baselines); other hyperparameters are left as set."""
     spec = dict(MODEL_ZOO[name])
     kind = spec.pop("kind")
+
+    if kind == "metric_ssm":
+        if param_budget and param_budget > 0:
+            with torch.random.fork_rng(devices=[]):
+                best = _closest_width(
+                    lambda w: _count_params(MetricSSMSim(
+                        n_u, n_y, _make_metric_config(spec, replace(gconf, d_model=w)))),
+                    param_budget, lo=2,
+                )
+            gconf = replace(gconf, d_model=best)
+        mode = _resolve_mode(name, gconf.mode_override)
+        print(f"  [{name}] exec mode: {mode}")
+        return MetricSSMSim(n_u, n_y, _make_metric_config(spec, gconf), mode=mode)
 
     if kind == "deepssm":
         if param_budget and param_budget > 0:
@@ -587,6 +640,9 @@ class GlobalModelConfig:
     d_hidden: int = 16
     nl_layers: int = 3
     scale: float = 1.0
+    metric_activation: str = "tanh"
+    metric_ff: str = "residual"            # weighted residual, independent of --ff
+    metric_init_feedthrough: float = 0.95
     ren_dim_internal: int = 16             # REN internal state dim (n); param-budget width knob
     ren_dim_nl: int = 16                   # REN nonlinearity dim (l)
     per_channel_gates: bool = False
@@ -630,6 +686,10 @@ class GlobalModelConfig:
 def _validate_initialization(models: Sequence[str], cfg: GlobalModelConfig) -> None:
     """Validate only the initialization settings used by selected models."""
     selected = set(models)
+    if "metric_defect" in selected:
+        selected.add("defect")
+    if "metric_l2n" in selected:
+        selected.add("l2n")
 
     def finite(**values):
         for option, value in values.items():
@@ -699,7 +759,7 @@ def _validate_initialization(models: Sequence[str], cfg: GlobalModelConfig) -> N
 
 
 def _initialization_metadata(cfg: GlobalModelConfig) -> dict:
-    return {
+    settings = {
         "lru": {"rmin": cfg.lru_rmin, "rmax": cfg.lru_rmax,
                 "max_phase": cfg.lru_max_phase},
         "l2ru": {"mode": cfg.init, "eye_scale": cfg.l2ru_eye_scale,
@@ -722,6 +782,11 @@ def _initialization_metadata(cfg: GlobalModelConfig) -> dict:
                 "c": cfg.tvc_init_c, "d": cfg.tvc_init_d},
         "ren": {"dim_internal": cfg.ren_dim_internal, "dim_nl": cfg.ren_dim_nl},
     }
+    metric = {"activation": cfg.metric_activation, "ff": cfg.metric_ff,
+              "init_feedthrough": cfg.metric_init_feedthrough}
+    for core in ("defect", "l2n"):
+        settings["metric_" + core] = {**settings[core], **metric}
+    return settings
 
 
 # ============================================================================
@@ -1500,6 +1565,8 @@ def run(args) -> None:
     gconf = GlobalModelConfig(
         d_model=args.d_model, d_state=args.d_state, n_layers=args.n_layers,
         d_hidden=args.d_hidden, nl_layers=args.nl_layers,
+        metric_activation=args.metric_activation, metric_ff=args.metric_ff,
+        metric_init_feedthrough=args.metric_init_feedthrough,
         ren_dim_internal=args.ren_dim_internal, ren_dim_nl=args.ren_dim_nl,
         per_channel_gates=args.per_channel_gates,
         lru_rmin=args.lru_rmin, lru_rmax=args.lru_rmax,
@@ -1737,6 +1804,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--n-layers", type=int, default=2)
     p.add_argument("--d-hidden", type=int, default=16)
     p.add_argument("--nl-layers", type=int, default=3)
+    p.add_argument("--metric-activation", default="tanh",
+                   choices=["tanh", "relu", "arctan", "identity"],
+                   help="Activation for metric_defect/metric_l2n")
+    p.add_argument("--metric-ff", default="residual", choices=["residual", "none"],
+                   help="Certified weighted residual for metric stacks; independent of --ff")
+    p.add_argument("--metric-init-feedthrough", type=float, default=0.95,
+                   help="Initial direct-path contraction for metric stacks")
     p.add_argument("--ren-dim-internal", type=int, default=16,
                    help="REN internal state dimension (n); the param-budget width knob")
     p.add_argument("--ren-dim-nl", type=int, default=16,

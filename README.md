@@ -132,6 +132,29 @@ storage-energy term and is not covered by the pure induced-gain statement.
 The bound applies to zero-state sequence maps. It is a conservative guarantee,
 not a promise that every trained model will use the full gain budget.
 
+## Metric-transfer DeepSSM
+
+`MetricDeepSSM` learns feature energy metrics shared between adjacent layers.
+Their cancellation gives a prescribed incremental L2 bound for the whole stack,
+without multiplying independent scalar layer bounds. Both `defect` and exact
+`l2n` cores work; custom LTI cores need a bounded-real contraction certificate.
+
+```python
+from neural_ssm import MetricDeepSSM
+
+model = MetricDeepSSM(
+    3, 2, d_model=16, d_state=64, n_layers=4,
+    param="defect", gamma=1.0, activation="tanh", ff="residual",
+)
+y = model(u, return_state=False)
+```
+
+The new weighted residual feedforward is certified in each learned feature
+metric. Its equations, core interface, optimizations, and streaming API are in
+[the architecture guide](docs/metric_transfer_ssm.md). The benchmark runner and
+UI expose `metric_defect` and `metric_l2n`; `--metric-ff` chooses `residual` or
+`none`, independently of the original stack's `--ff` setting.
+
 ## Context-aware DeepSSMs
 
 `ContextualDeepSSM` wraps a normal `DeepSSM` and lets a second sequence shape
@@ -237,6 +260,7 @@ because their cuDNN/eager paths are the better default.
 
 ```bash
 python Test_files/Tutorial_DeepSSM.py
+python Test_files/Tutorial_MetricDeepSSM.py --core both
 python Test_files/Tutorial_ContextualSSM.py
 ```
 
@@ -272,6 +296,7 @@ src/neural_ssm/
 ├── ssm/
 │   ├── config.py, registry.py       settings and model construction
 │   ├── layers.py                   DeepSSM, residual blocks, gain diagnostics
+│   ├── metric_layers.py            MetricDeepSSM, feature metrics, weighted residual FF
 │   ├── cells/
 │   │   ├── lti/                    lru.py, l2n.py, defect.py
 │   │   ├── selective/              tv.py, tvc.py
