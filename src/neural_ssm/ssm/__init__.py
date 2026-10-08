@@ -4,6 +4,7 @@ import sys as _sys
 from .config import SSMConfig, SSMConfigDict
 from . import layers, contextual, cells
 from .layers import SSL, DeepSSM, PureLRUR, SimpleRNN
+from .metric_layers import MetricDeepSSM, MetricSSMConfig
 from .cells.lti import LRU, Block2x2DenseL2SSM, DefectL2SSM, defect as _defect
 from .cells.selective import RobustMambaDiagSSM, RobustMambaDiagLTI
 from .cells.legacy import L2RU, lruz, L2BoundedLTICell
@@ -12,7 +13,8 @@ from .cells import common as _common, selective as _selective
 from ..utils import runtime as _runtime, scan as _scan
 
 __all__ = [
-    "SSMConfig", "SSMConfigDict", "SSL", "DeepSSM", "PureLRUR", "SimpleRNN",
+    "SSMConfig", "SSMConfigDict", "SSL", "DeepSSM", "MetricDeepSSM", "MetricSSMConfig",
+    "PureLRUR", "SimpleRNN",
     "LRU", "Block2x2DenseL2SSM", "DefectL2SSM",
     "RobustMambaDiagSSM", "RobustMambaDiagLTI",
     "L2RU", "lruz", "L2BoundedLTICell",

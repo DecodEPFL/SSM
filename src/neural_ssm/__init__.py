@@ -5,6 +5,8 @@ from .ssm import (
     SSMConfigDict,
     SSL,
     DeepSSM,
+    MetricDeepSSM,
+    MetricSSMConfig,
     PureLRUR,
     SimpleRNN,
     LRU,
@@ -22,7 +24,8 @@ from .rens import REN
 from .static_layers import LayerConfig, GLU, MLP, LMLP, TLIP
 
 __all__ = [
-    "SSMConfig", "SSMConfigDict", "SSL", "DeepSSM", "PureLRUR", "SimpleRNN",
+    "SSMConfig", "SSMConfigDict", "SSL", "DeepSSM", "MetricDeepSSM", "MetricSSMConfig",
+    "PureLRUR", "SimpleRNN",
     "LRU", "Block2x2DenseL2SSM", "DefectL2SSM",
     "RobustMambaDiagSSM", "RobustMambaDiagLTI",
     "ContextualDeepSSM", "timewise_matrix_vector_product",
