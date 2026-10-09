@@ -3,19 +3,22 @@
 These classes are imported only when this experimental module is requested.
 The supported TV/TVC constructions live in cells/selective/.
 """
+
 from __future__ import annotations
 
 import math
-from typing import Literal, Optional, Tuple
+from typing import Literal
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ..utils.runtime import init_or_cast_state
 from ..utils.scan import compute_linear_recurrence_parallel_block2x2
-
+from .cells.common import rotation_block_diagonal
 
 # Dense time-varying expert mixture
+
 
 class ExpertSelectiveTimeVaryingSSM(nn.Module):
     r"""
@@ -95,7 +98,11 @@ class ExpertSelectiveTimeVaryingSSM(nn.Module):
             raise ValueError(f"Unknown S_init: {S_init}")
 
         # Store an unconstrained raw matrix, we will project to lower-triangular + positive diag
-        self.S_raw = nn.Parameter(S0.clone()) if S_trainable else nn.Parameter(S0.clone(), requires_grad=False)
+        self.S_raw = (
+            nn.Parameter(S0.clone())
+            if S_trainable
+            else nn.Parameter(S0.clone(), requires_grad=False)
+        )
 
         # Gate network (very simple)
         gate_in_dim = {
@@ -143,7 +150,7 @@ class ExpertSelectiveTimeVaryingSSM(nn.Module):
             # cols: [0:ds]=z_t,     [ds:ds+du]=gamma*u_t
             ds, du, dy = self.d_state, self.d_in, self.d_out
             K = K.clone()
-            K[:, ds:ds + dy, ds:ds + du] = 0.0  # K22 = 0  => D=0 in the induced A,B,C,D mapping
+            K[:, ds : ds + dy, ds : ds + du] = 0.0  # K22 = 0  => D=0 in the induced A,B,C,D mapping
 
         # Exact spectral norm per expert (SVD-based internally)
         norms = torch.linalg.matrix_norm(K, ord=2, dim=(-2, -1))  # (M,)
@@ -154,11 +161,11 @@ class ExpertSelectiveTimeVaryingSSM(nn.Module):
     def forward(
         self,
         u: torch.Tensor,
-        state: Optional[torch.Tensor] = None,
+        state: torch.Tensor | None = None,
         *,
-        time_first: bool = False,     # u is (T,B,du) if True else (B,T,du)
+        time_first: bool = False,  # u is (T,B,du) if True else (B,T,du)
         return_state: bool = True,
-        return_z: bool = False,       # if True and return_state, returns z_seq instead of x_seq
+        return_z: bool = False,  # if True and return_state, returns z_seq instead of x_seq
         mode: str = "scan",
     ):
         """
@@ -182,29 +189,18 @@ class ExpertSelectiveTimeVaryingSSM(nn.Module):
         ds, dy = self.d_state, self.d_out
         device, dtype = u_bt.device, u_bt.dtype
 
-        # Initial state x
-        if state is None:
-            x = torch.zeros(B, ds, device=device, dtype=dtype)
-        else:
-            if state.dim() == 1:
-                assert state.shape[0] == ds
-                x = state.unsqueeze(0).expand(B, -1).to(device=device, dtype=dtype).contiguous()
-            else:
-                assert state.shape == (B, ds)
-                x = state.to(device=device, dtype=dtype)
+        x = init_or_cast_state(state, B, ds, device, dtype)
 
         # Build S and experts
-        S = self._build_S().to(device=device, dtype=dtype)                  # (ds,ds), lower-triangular
+        S = self._build_S().to(device=device, dtype=dtype)  # (ds,ds), lower-triangular
         Kexp = self._contractive_experts_exact().to(device=device, dtype=dtype)  # (M, ds+dy, ds+du)
-        M = Kexp.shape[0]
 
         g = self.gamma.to(device=device, dtype=dtype)
 
         y_seq = torch.empty(B, T, dy, device=device, dtype=dtype)
         state_seq = torch.empty(B, T, ds, device=device, dtype=dtype) if return_state else None
 
-        # Precompute for triangular solves: we will compute x_{t+1} from z_{t+1} via S x = z
-        # torch.linalg.solve_triangular expects RHS shape (ds, B) or (B, ds) depending; we use transpose.
+        # Solve S x = z with transposed right-hand sides shaped (ds, batch).
 
         for t in range(T):
             u_t = u_bt[:, t, :]  # (B,du)
@@ -223,24 +219,24 @@ class ExpertSelectiveTimeVaryingSSM(nn.Module):
                 raise ValueError(f"Unknown gate_on: {self.gate_on}")
 
             logits = self.gate_net(xi) / self.gate_temperature  # (B,M)
-            pi = F.softmax(logits, dim=-1)                      # (B,M), convex weights
+            pi = F.softmax(logits, dim=-1)  # (B,M), convex weights
 
             # w_t = [z_t ; gamma u_t]
-            w = torch.cat([z, g * u_t], dim=-1)                 # (B, ds+du)
+            w = torch.cat([z, g * u_t], dim=-1)  # (B, ds+du)
 
             # Apply all experts: v_all[b,m,:] = Kexp[m] @ w[b]
             # Kexp: (M, mrows, ncols); w: (B, ncols) -> v_all: (B, M, mrows)
-            v_all = torch.einsum("bn,man->bma", w, Kexp)        # (B,M, ds+dy)
+            v_all = torch.einsum("bn,man->bma", w, Kexp)  # (B,M, ds+dy)
 
             # Mix: v = Σ_m pi_{b,m} v_all[b,m,:]
-            v = torch.einsum("bm,bma->ba", pi, v_all)           # (B, ds+dy)
+            v = torch.einsum("bm,bma->ba", pi, v_all)  # (B, ds+dy)
 
             z_next = v[:, :ds]
-            y_t = v[:, ds:ds + dy]
+            y_t = v[:, ds : ds + dy]
 
             y_seq[:, t, :] = y_t
             if return_state:
-                state_seq[:, t, :] = (z if return_z else x)
+                state_seq[:, t, :] = z if return_z else x
 
             # Recover x_{t+1} from z_{t+1}:  S x_{t+1} = z_{t+1}
             # Solve lower-triangular system for each batch: x = S^{-1} z
@@ -257,7 +253,9 @@ class ExpertSelectiveTimeVaryingSSM(nn.Module):
             return y_seq, state_seq
         return y_seq, x_last
 
+
 # Fixed block transition with selective B/C/D experts
+
 
 class Block2x2SelectiveBCDExpertsL2SSM(nn.Module):
     r"""
@@ -280,10 +278,10 @@ class Block2x2SelectiveBCDExpertsL2SSM(nn.Module):
     Because K11 is shared across experts and we use a *single global* scale, A_z=K11/scale
     remains constant across time and scan-friendly.
 
-    IMPORTANT for your scan:
-      Your scan function expects x_{t+1} = A x_t + B u_t with constant B.
+    IMPORTANT for the block scan:
+      The block scan function expects x_{t+1} = A x_t + B u_t with constant B.
       Here B is time-varying, but we can precompute v_t := B_t u_t ∈ R^{d_state}
-      and run scan on x_{t+1}=A x_t + v_t by calling your scan with:
+      and run scan on x_{t+1}=A x_t + v_t by calling the block scan with:
           B_eff = I_{d_state},   u_eff[t] = v_t
       (so the internal v = B_eff @ u_eff equals u_eff).
     """
@@ -307,7 +305,7 @@ class Block2x2SelectiveBCDExpertsL2SSM(nn.Module):
         gate_temperature: float = 1.0,
         # init A on circle
         init_rho: float = 0.99,
-        init_max_phase: Optional[float] = 0.2,  # radians; None => Uniform(-pi,pi)
+        init_max_phase: float | None = 0.2,  # radians; None => Uniform(-pi,pi)
         phase_center: float = 0.0,
         same_phase_across_blocks: bool = False,
         # init scale for offdiagonal blocks
@@ -335,9 +333,15 @@ class Block2x2SelectiveBCDExpertsL2SSM(nn.Module):
         self.theta = nn.Parameter(torch.zeros(n_pairs))
 
         # Expert raw blocks (only B,C,D parts => K12,K21,K22)
-        self.K12_raw = nn.Parameter(offdiag_scale * torch.randn(self.n_experts, self.d_state, self.d_input))
-        self.K21_raw = nn.Parameter(offdiag_scale * torch.randn(self.n_experts, self.d_output, self.d_state))
-        self.K22_raw = nn.Parameter(offdiag_scale * torch.randn(self.n_experts, self.d_output, self.d_input))
+        self.K12_raw = nn.Parameter(
+            offdiag_scale * torch.randn(self.n_experts, self.d_state, self.d_input)
+        )
+        self.K21_raw = nn.Parameter(
+            offdiag_scale * torch.randn(self.n_experts, self.d_output, self.d_state)
+        )
+        self.K22_raw = nn.Parameter(
+            offdiag_scale * torch.randn(self.n_experts, self.d_output, self.d_input)
+        )
 
         # gamma (>0)
         g0 = torch.tensor(float(gamma))
@@ -374,32 +378,15 @@ class Block2x2SelectiveBCDExpertsL2SSM(nn.Module):
     # A_z = K11: block diagonal 2x2 blocks
     # -------------------------
     def _K11_structured(self) -> torch.Tensor:
-        n_pairs = self.d_state // 2
-        rho = torch.sigmoid(self.rho_raw) * (1.0 - self.eps_radius)  # (n_pairs,)
-        th = self.theta
-        c, s = torch.cos(th), torch.sin(th)
-
-        K11 = torch.zeros(
-            self.d_state,
-            self.d_state,
-            device=rho.device,
-            dtype=rho.dtype,
-        )
-        for i in range(n_pairs):
-            r = rho[i]
-            K11[2 * i : 2 * i + 2, 2 * i : 2 * i + 2] = r * torch.stack(
-                [
-                    torch.stack([c[i], -s[i]]),
-                    torch.stack([s[i],  c[i]]),
-                ],
-                dim=0,
-            )
-        return K11
+        rho = torch.sigmoid(self.rho_raw) * (1.0 - self.eps_radius)
+        return rotation_block_diagonal(rho, self.theta)
 
     # -------------------------
     # Global exact normalization across experts
     # -------------------------
-    def _build_expert_blocks_normalized(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _build_expert_blocks_normalized(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Returns:
             A_z : (dx, dx)              constant (scan-friendly)
@@ -410,14 +397,14 @@ class Block2x2SelectiveBCDExpertsL2SSM(nn.Module):
         with a global scale ensuring ||K^(m)||_2 <= 1 for all experts m,
         and shared A_z across experts.
         """
-        dx, du, dy, M = self.d_state, self.d_input, self.d_output, self.n_experts
+        dx, M = self.d_state, self.n_experts
 
-        K11 = self._K11_structured()                                   # (dx,dx)
-        K11_exp = K11.unsqueeze(0).expand(M, -1, -1)                   # (M,dx,dx)
+        K11 = self._K11_structured()  # (dx,dx)
+        K11_exp = K11.unsqueeze(0).expand(M, -1, -1)  # (M,dx,dx)
 
-        top = torch.cat([K11_exp, self.K12_raw], dim=2)                # (M, dx, dx+du)
-        bot = torch.cat([self.K21_raw, self.K22_raw], dim=2)           # (M, dy, dx+du)
-        K_raw = torch.cat([top, bot], dim=1)                           # (M, dx+dy, dx+du)
+        top = torch.cat([K11_exp, self.K12_raw], dim=2)  # (M, dx, dx+du)
+        bot = torch.cat([self.K21_raw, self.K22_raw], dim=2)  # (M, dy, dx+du)
+        K_raw = torch.cat([top, bot], dim=1)  # (M, dx+dy, dx+du)
 
         if self.exact_norm:
             sigmas = torch.linalg.matrix_norm(K_raw, ord=2, dim=(-2, -1))  # (M,)
@@ -425,11 +412,11 @@ class Block2x2SelectiveBCDExpertsL2SSM(nn.Module):
             # Frobenius is an upper bound (guaranteed, cheaper, more conservative)
             sigmas = torch.linalg.matrix_norm(K_raw, ord="fro", dim=(-2, -1))
 
-        scale = torch.clamp(sigmas.max(), min=1.0)                     # scalar >= 1
+        scale = torch.clamp(sigmas.max(), min=1.0)  # scalar >= 1
 
         K = K_raw / scale
 
-        A_z = K[0, :dx, :dx]   # shared across experts due to shared K11_exp + single scale
+        A_z = K[0, :dx, :dx]  # shared across experts due to shared K11_exp + single scale
         K12 = K[:, :dx, dx:]
         K21 = K[:, dx:, :dx]
         K22 = K[:, dx:, dx:]
@@ -443,7 +430,7 @@ class Block2x2SelectiveBCDExpertsL2SSM(nn.Module):
         self,
         rho: float = 0.99,
         *,
-        max_phase: Optional[float] = 0.2,
+        max_phase: float | None = 0.2,
         phase_center: float = 0.0,
         same_phase_across_blocks: bool = False,
         random_phase: bool = True,
@@ -469,7 +456,7 @@ class Block2x2SelectiveBCDExpertsL2SSM(nn.Module):
 
         if max_phase is None:
             if same_phase_across_blocks:
-                phi = (2 * math.pi * torch.rand(1, device=device, dtype=dtype) - math.pi)
+                phi = 2 * math.pi * torch.rand(1, device=device, dtype=dtype) - math.pi
                 self.theta.copy_(phi.expand(n_pairs))
             else:
                 self.theta.uniform_(-math.pi, math.pi)
@@ -488,7 +475,7 @@ class Block2x2SelectiveBCDExpertsL2SSM(nn.Module):
     def forward(
         self,
         u: torch.Tensor,
-        state: Optional[torch.Tensor] = None,   # z0 in z-basis
+        state: torch.Tensor | None = None,  # z0 in z-basis
         *,
         time_first: bool = False,
         return_state: bool = False,
@@ -540,7 +527,7 @@ class Block2x2SelectiveBCDExpertsL2SSM(nn.Module):
         # Precompute v_t := B_t u_t = gamma * (sum_m pi_m K12_m) u_t
         # v_all: (B,T,M,dx)
         v_all = torch.einsum("btu,msu->btms", u_bt, (g * K12))  # (B,T,M,dx)
-        v_bt = torch.einsum("btm,btms->bts", pi, v_all)         # (B,T,dx)
+        v_bt = torch.einsum("btm,btms->bts", pi, v_all)  # (B,T,dx)
 
         if mode == "loop":
             y_bt = torch.empty(Bsz, T, dy, device=device, dtype=dtype)
@@ -548,19 +535,19 @@ class Block2x2SelectiveBCDExpertsL2SSM(nn.Module):
 
             z = z0
             for t in range(T):
-                u_t = u_bt[:, t, :]      # (B,du)
-                pi_t = pi[:, t, :]       # (B,M)
+                u_t = u_bt[:, t, :]  # (B,du)
+                pi_t = pi[:, t, :]  # (B,M)
 
                 if return_state:
                     z_bt[:, t, :] = z
 
                 # y_state: sum_m pi_m (K21_m z)
-                y_state_all = torch.einsum("bs,mys->bmy", z, K21)          # (B,M,dy)
-                y_state = torch.einsum("bm,bmy->by", pi_t, y_state_all)    # (B,dy)
+                y_state_all = torch.einsum("bs,mys->bmy", z, K21)  # (B,M,dy)
+                y_state = torch.einsum("bm,bmy->by", pi_t, y_state_all)  # (B,dy)
 
                 # y_in: sum_m pi_m (gamma*K22_m u)
-                y_in_all = torch.einsum("bu,myu->bmy", u_t, (g * K22))     # (B,M,dy)
-                y_in = torch.einsum("bm,bmy->by", pi_t, y_in_all)          # (B,dy)
+                y_in_all = torch.einsum("bu,myu->bmy", u_t, (g * K22))  # (B,M,dy)
+                y_in = torch.einsum("bm,bmy->by", pi_t, y_in_all)  # (B,dy)
 
                 y_bt[:, t, :] = y_state + y_in
 
@@ -571,22 +558,22 @@ class Block2x2SelectiveBCDExpertsL2SSM(nn.Module):
 
         else:
             # --- SCAN MODE ---
-            # Use your scan code with B_eff = I and u_eff = v (time-major):
+            # Use the block scan code with B_eff = I and u_eff = v (time-major):
             # x_{t+1} = A x_t + I @ v_t.
             v_tb = v_bt.transpose(0, 1).contiguous()  # (T,B,dx)
-            I = torch.eye(dx, device=device, dtype=dtype)
+            identity = torch.eye(dx, device=device, dtype=dtype)
 
-            states = compute_linear_recurrence_parallel_block2x2(A_z, I, v_tb, z0)  # (T+1,B,dx)
-            z_tb = states[:-1]                           # (T,B,dx) = z_0..z_{T-1}
-            z_last = states[-1]                          # (B,dx)
-            z_bt_seq = z_tb.transpose(0, 1).contiguous() # (B,T,dx)
+            states = compute_linear_recurrence_parallel_block2x2(A_z, identity, v_tb, z0)
+            z_tb = states[:-1]  # (T,B,dx) = z_0..z_{T-1}
+            z_last = states[-1]  # (B,dx)
+            z_bt_seq = z_tb.transpose(0, 1).contiguous()  # (B,T,dx)
 
             # y_t uses z_t and u_t with the same pi_t
-            y_state_all = torch.einsum("bts,mys->btmy", z_bt_seq, K21)      # (B,T,M,dy)
-            y_state = torch.einsum("btm,btmy->bty", pi, y_state_all)        # (B,T,dy)
+            y_state_all = torch.einsum("bts,mys->btmy", z_bt_seq, K21)  # (B,T,M,dy)
+            y_state = torch.einsum("btm,btmy->bty", pi, y_state_all)  # (B,T,dy)
 
-            y_in_all = torch.einsum("btu,myu->btmy", u_bt, (g * K22))       # (B,T,M,dy)
-            y_in = torch.einsum("btm,btmy->bty", pi, y_in_all)              # (B,T,dy)
+            y_in_all = torch.einsum("btu,myu->btmy", u_bt, (g * K22))  # (B,T,M,dy)
+            y_in = torch.einsum("btm,btmy->bty", pi, y_in_all)  # (B,T,dy)
 
             y_bt = y_state + y_in
 
@@ -606,5 +593,6 @@ class Block2x2SelectiveBCDExpertsL2SSM(nn.Module):
         if return_state:
             return y_out, z_last, z_out
         return y_out, z_last
+
 
 __all__ = ["ExpertSelectiveTimeVaryingSSM", "Block2x2SelectiveBCDExpertsL2SSM"]

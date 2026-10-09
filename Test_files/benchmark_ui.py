@@ -179,6 +179,13 @@ class BenchmarkUI:
             variable=self.l2n_random_phase_var,
         ).grid(row=1, column=0, columnspan=8, sticky="w", padx=8, pady=(3, 0))
 
+        self.vars["l2n_state_metric"] = tk.StringVar(value="identity")
+        ttk.Label(l2n_panel, text="state storage").grid(row=2, column=0, padx=8)
+        ttk.Combobox(
+            l2n_panel, textvariable=self.vars["l2n_state_metric"],
+            values=("identity", "full"), width=9, state="readonly",
+        ).grid(row=2, column=1, sticky="w", padx=8, pady=3)
+
         defect_panel = model_panel("defect", "Defect completion")
         panel_entry(defect_panel, 0, "defect_block_size", "block size", "2")
         panel_entry(defect_panel, 1, "defect_rho", "initial radius", "0.9")
@@ -192,6 +199,13 @@ class BenchmarkUI:
             defect_panel, text="random phases (2x2 blocks)",
             variable=self.defect_random_phase_var,
         ).grid(row=2, column=0, columnspan=8, sticky="w", padx=8, pady=(3, 0))
+
+        self.vars["defect_state_metric"] = tk.StringVar(value="identity")
+        ttk.Label(defect_panel, text="state storage").grid(row=3, column=0, padx=8)
+        ttk.Combobox(
+            defect_panel, textvariable=self.vars["defect_state_metric"],
+            values=("identity", "full"), state="readonly", width=12,
+        ).grid(row=3, column=1, padx=8, pady=(3, 0))
 
         metric_panel = model_panel("metric_ssm", "Metric-transfer stack")
         for column, (key, label, choices, default) in enumerate((
@@ -363,6 +377,7 @@ class BenchmarkUI:
             ]
         if "l2n" in models or "metric_l2n" in models:
             cmd += [
+                "--l2n-state-metric", g("l2n_state_metric"),
                 "--l2n-rho", g("l2n_rho"),
                 "--l2n-max-phase", g("l2n_max_phase"),
                 "--l2n-phase-center", g("l2n_phase_center"),
@@ -375,6 +390,7 @@ class BenchmarkUI:
                 "defect_block_size", "defect_rho", "defect_max_radius",
                 "defect_factor_margin", "defect_init_scale", "defect_max_phase",
                 "defect_phase_center",
+                "defect_state_metric",
             ):
                 cmd += ["--" + key.replace("_", "-"), g(key)]
             cmd += ["--defect-random-phase" if self.defect_random_phase_var.get()

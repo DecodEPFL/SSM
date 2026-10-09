@@ -1,275 +1,214 @@
-"""
-Tutorial: train DeepSSM on a nonlinear benchmark dataset.
+"""DeepSSM, step by step.
 
-This tutorial is intentionally simple and uses only the core DeepSSM API.
-What we do:
-1) load a nonlinear benchmark dataset
-2) build DeepSSM
-3) train with a small, standard PyTorch loop
-4) evaluate with full-sequence and chunked stateful inference
-
-The goal is to make each step easy to read and reuse in your own scripts.
+Read from top to bottom, or run the numbered cells individually in your editor.
+Start with steps 1–5; the remaining steps introduce optional model choices.
+Install once from the project root: python -m pip install -e .
+Run the whole tutorial: python Test_files/Tutorial_DeepSSM.py
 """
 
-from __future__ import annotations
+# %% 1. Create a model and pass a short sequence through it
+from dataclasses import replace
 
-from dataclasses import dataclass
-
-import matplotlib.pyplot as plt
-import nonlinear_benchmarks
-from nonlinear_benchmarks.error_metrics import RMSE
-import numpy as np
 import torch
-import torch.nn as nn
 
-try:
-    # Preferred package API (after pip install neural-ssm)
-    from neural_ssm import DeepSSM
-except ImportError:
-    # Fallback for running directly from this repository without installing
-    from src.neural_ssm import DeepSSM
+from neural_ssm import DeepSSM, SSMConfig
 
+# We have one sequence, eight time steps, and one input value at each step.
+torch.manual_seed(7)
+u = torch.randn(1, 8, 1)  # shape: (batch, time, input features)
 
-@dataclass
-class TutorialConfig:
-    # Reproducibility / runtime
-    seed: int = 9
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
-
-    # Training
-    epochs: int = 9000
-    learning_rate: float = 1.6568e-02
-    log_every: int = 50
-
-    # set up the DeepSSM architecture
-    d_model: int = 2
-    d_state: int = 600
-    n_layers: int = 1
-    param: str = "lru"  # Current cells: "lru", "l2n", "defect", "tv", "tvc".
-    ff: str = "MLP"  # "GLU" | "MLP" | "LMLP" | "LGLU" | "TLIP"
-    gamma: float | None = 18.1  # set to None if you want gamma to be trainable
-    max_phase_b: float = 2 * np.pi
-
-    # Forward execution mode
-    train_mode: str = "scan"  # "scan" or "loop"
-    eval_mode: str = "scan"
-
-    # Plotting
-    show_plots: bool = True
-
-    # Optional stateful inference demo
-    stream_chunk_len: int = 200
+# One input feature -> one output feature. LRU is a stable recurrent baseline.
+model = DeepSSM(d_input=1, d_output=1, param="lru")
+y, _ = model(u)  # The second return value is the recurrent state; we use it later.
+print("Output shape:", y.shape)  # (1, 8, 1): one prediction at each time step
 
 
-def set_seed(seed: int) -> None:
-    # Reproducibility helper: keeps runs comparable across executions.
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.backends.cudnn.deterministic = True
+# %% 2. Choose the feature width, memory size, and number of layers
+# d_model is the width between layers; d_state is the memory size of each layer.
+# Neither has to match the number of input or output features.
+model = DeepSSM(d_input=1, d_output=1, param="lru", d_model=4, d_state=8, n_layers=1)
+y, state = model(u)
+print("Number of layer states:", len(state))  # one state because n_layers=1
+print("State shape:", state[0].shape)  # (1, 8): batch and memory size
+# LRU states are complex tensors. Pass them back unchanged when continuing a stream.
 
 
-def to_bln(x: np.ndarray | torch.Tensor) -> torch.Tensor:
-    """
-    Convert tensors to the canonical DeepSSM shape (B, L, N):
-      B = batch size, L = sequence length, N = feature dimension.
-    """
-    x_t = torch.as_tensor(x, dtype=torch.float32)
-    if x_t.ndim == 1:  # (L,) -> (1, L, 1)
-        return x_t[None, :, None]
-    if x_t.ndim == 2:  # (L, N) -> (1, L, N)
-        return x_t[None, :, :]
-    if x_t.ndim == 3:  # already (B, L, N)
-        return x_t
-    raise ValueError(f"Unsupported tensor rank {x_t.ndim}; expected 1, 2 or 3.")
+# %% 3. Build a model with a prescribed gain bound
+# Use a certified cell and a bounded feedforward branch together.
+# gamma=1 means output energy <= input energy when starting from zero state.
+model = DeepSSM(
+    d_input=1, d_output=1, d_model=4, d_state=8, n_layers=1, param="defect", ff="LGLU2", gamma=1.0,
+    defect_state_metric="full", defect_max_radius=1.0, defect_factor_margin=0.0,
+)
+# Full state storage lets different memory blocks share the gain certificate.
+# The last two options allow the full open range of poles and contraction factors.
+# This adds dense setup work; the recurrence still uses the fast small-block scan.
+model.eval()  # Turn off dropout before checking the inference gain.
+with torch.no_grad():
+    y, _ = model(u)
+print("Certified gain:", model.certified_gain_bound().item())
+assert y.square().sum() <= u.square().sum() + 1e-5
+# LRU can be used with gamma=None; it has no prescribed whole-stack gain bound.
 
 
-@torch.no_grad()
-def predict_streaming(
-    model: DeepSSM,
-    u: torch.Tensor,
-    chunk_len: int,
-    mode: str = "scan",
-) -> torch.Tensor:
-    """
-    Run stateful inference by feeding chunks sequentially.
+# %% 4. Train on a simple input-to-output task
+# The desired output is 0.3 times the current input. A target in one line lets us
+# focus on the training steps; a task that needs memory comes in step 11.
+train_u = torch.randn(4, 32, 1)  # four independent training sequences
+train_y = 0.3 * train_u
 
-    We keep and pass `state` between chunks, which is how you do
-    streaming/online usage without resetting the recurrent memory.
-    """
-    model.eval()
-    outputs = []
-    state = None
-    for start in range(0, u.size(1), chunk_len):
-        u_chunk = u[:, start : start + chunk_len, :]
-        y_chunk, state = model(u_chunk, state=state, mode=mode)
-        outputs.append(y_chunk)
-    return torch.cat(outputs, dim=1)
+# One CPU thread is sufficient for these tiny examples; this setting is optional.
+torch.set_num_threads(1)
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-2)
+model.train()
+for step in range(40):
+    optimizer.zero_grad(set_to_none=True)  # Clear the previous gradients.
+    prediction, _ = model(train_u)  # No state passed: start a new trajectory.
+    loss = (prediction - train_y).square().mean()  # Mean squared prediction error.
+    loss.backward()  # Differentiate through the whole sequence.
+    optimizer.step()  # Update the trainable parameters.
+    if step in (0, 39):
+        print(f"Training step {step + 1}: MSE = {loss.item():.6f}")
 
 
-def main() -> None:
-    cfg = TutorialConfig()
-    set_seed(cfg.seed)
-    device = torch.device(cfg.device)
+# %% 5. Evaluate the trained model, then process the same sequence in two chunks
+model.eval()  # Disables training-time dropout.
+with torch.no_grad():  # No gradients are needed; inference matrices can be cached.
+    full, _ = model(u)
+    first, state = model(u[:, :4], detach_state=True)
+    second, state = model(u[:, 4:], state=state, detach_state=True)
 
-    # ------------------------------------------------------------------
-    # 1) Load benchmark dataset
-    # ------------------------------------------------------------------
-    # The Wiener-Hammerstein benchmark returns two splits:
-    # - training identification data
-    # - test data with a warm-up window definition
-    train_split, test_split = nonlinear_benchmarks.WienerHammerBenchMark()
-    u_train_np, y_train_np = train_split
-    u_test_np, y_test_np = test_split
-
-    # Number of initial points commonly ignored during evaluation.
-    # The model uses this prefix to initialize internal dynamics.
-    n_init = test_split.state_initialization_window_length
-
-    # Convert to canonical DeepSSM shape: (B, L, N).
-    u_train = to_bln(u_train_np).to(device)
-    y_train = to_bln(y_train_np).to(device)
-    u_test = to_bln(u_test_np).to(device)
-    y_test = to_bln(y_test_np).to(device)
-
-    # ------------------------------------------------------------------
-    # 2) Build DeepSSM (direct constructor style)
-    # ------------------------------------------------------------------
-    # This is the direct API. We do not use SSMConfig here on purpose.
-    # DeepSSM returns (y, state):
-    # - y: output sequence, shape (B, L, d_output)
-    # - state: list of states (one per SSL block)
-    model = DeepSSM(
-        d_input=u_train.size(-1),
-        d_output=y_train.size(-1),
-        d_model=cfg.d_model,
-        d_state=cfg.d_state,
-        n_layers=cfg.n_layers,
-        param=cfg.param,
-        ff=cfg.ff,
-        gamma=cfg.gamma,
-        max_phase_b=cfg.max_phase_b
-    ).to(device)
-
-    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.learning_rate)
-    criterion = nn.MSELoss()
-
-    print("Starting training...")
-    print(f"Device: {device}")
-    print(f"Train input shape: {tuple(u_train.shape)}")
-    print(f"Train output shape: {tuple(y_train.shape)}")
-    print(
-        "Model settings: "
-        f"param={cfg.param}, ff={cfg.ff}, d_model={cfg.d_model}, "
-        f"d_state={cfg.d_state}, n_layers={cfg.n_layers}, gamma={cfg.gamma}"
-    )
-
-    train_losses: list[float] = []
-    test_losses: list[float] = []
-    best_val_rmse = float("inf")
-
-    # ------------------------------------------------------------------
-    # 3) Simple training loop
-    # ------------------------------------------------------------------
-    for epoch in range(1, cfg.epochs + 1):
-        # ---- training pass ----
-        model.train()
-        optimizer.zero_grad()
-
-        # Forward pass with selected execution mode ("scan" or "loop").
-        # We do not pass a state here -> zero initialization at each call since we feed the whole input sequence at once.
-        y_train_pred, _ = model(u_train, mode=cfg.train_mode)
-        train_loss = criterion(y_train_pred, y_train)
-        train_loss.backward()
-        optimizer.step()
-
-        # ---- validation pass ----
-        model.eval()
-        with torch.no_grad():
-            y_test_pred, _ = model(u_test, mode=cfg.eval_mode)
-            # Ignore warm-up prefix for metric computation.
-            test_loss = criterion(y_test_pred[:, n_init:, :], y_test[:, n_init:, :])
-
-        train_losses.append(train_loss.item())
-        test_losses.append(test_loss.item())
-
-        if epoch % cfg.log_every == 0 or epoch == 1 or epoch == cfg.epochs:
-            test_rmse = 1000*RMSE(
-                y_test[0, n_init:, 0].detach().cpu().numpy(),
-                y_test_pred[0, n_init:, 0].detach().cpu().numpy(),
-            )
-            print(
-                f"Epoch {epoch:4d}/{cfg.epochs} | "
-                f"train_loss={train_loss.item():.4e} | "
-                f"test_loss={test_loss.item():.4e} | "
-                f"test_rmse={test_rmse:.4e}"
-            )
-        best_val_rmse = min(
-            best_val_rmse,
-            1000*RMSE(
-                y_test[0, n_init:, 0].detach().cpu().numpy(),
-                y_test_pred[0, n_init:, 0].detach().cpu().numpy(),
-            ),
-        )
-
-    # ------------------------------------------------------------------
-    # 4) Full vs stateful inference (same model, chunked evaluation)
-    # ------------------------------------------------------------------
-    with torch.no_grad():
-        # Standard full-sequence inference.
-        y_full, _ = model(u_test, state=None, mode=cfg.eval_mode)
-        # Chunked inference where the state is passed from one chunk to the next.
-        y_stream = predict_streaming(
-            model,
-            u_test,
-            chunk_len=cfg.stream_chunk_len,
-            mode=cfg.eval_mode,
-        )
-    max_diff = (y_full - y_stream).abs().max().item()
-    final_rmse = 1000*RMSE(
-        y_test[0, n_init:, 0].detach().cpu().numpy(),
-        y_full[0, n_init:, 0].detach().cpu().numpy(),
-    )
-
-    print("\nTraining complete.")
-    print(f"Final test RMSE (after warm-up): {final_rmse:.6e}")
-    print(f"Best validation RMSE (after warm-up): {best_val_rmse:.6e}")
-    print(f"Max |full - streaming| difference: {max_diff:.6e}")
-
-    # ------------------------------------------------------------------
-    # 5) Plot results at the end
-    # ------------------------------------------------------------------
-    if cfg.show_plots:
-        y_true_np = y_test[0, :, 0].detach().cpu().numpy()
-        y_pred_np = y_full[0, :, 0].detach().cpu().numpy()
-
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(9, 6))
-
-        # Prediction plot
-        ax1.plot(y_true_np, label="True", linewidth=1.2)
-        ax1.plot(y_pred_np, label="DeepSSM", linewidth=1.2, linestyle="--")
-        ax1.axvline(n_init, color="gray", linestyle=":", linewidth=1, label="Warm-up end")
-        ax1.set_xlabel("Time step")
-        ax1.set_ylabel("Output")
-        ax1.set_title("DeepSSM Tutorial - Prediction")
-        ax1.legend()
-        ax1.grid(alpha=0.25)
-
-        # Log-loss plot
-        epochs = np.arange(1, len(train_losses) + 1)
-        ax2.plot(epochs, train_losses, label="Train loss", linewidth=1.2)
-        ax2.plot(epochs, test_losses, label="Test loss", linewidth=1.2)
-        ax2.set_yscale("log")
-        ax2.set_xlabel("Epoch")
-        ax2.set_ylabel("MSE loss (log scale)")
-        ax2.set_title("Training curves")
-        ax2.legend()
-        ax2.grid(alpha=0.25)
-
-        plt.tight_layout()
-        plt.show()
+# The second chunk starts where the first ended. An explicit state overrides reset.
+streamed = torch.cat((first, second), dim=1)
+torch.testing.assert_close(streamed, full, rtol=2e-4, atol=2e-5)
+print("Two chunks give the same predictions as the full sequence.")
+# detach_state=True discards the gradient history at the chunk boundary.
 
 
-if __name__ == "__main__":
-    main()
+# %% 6. Collect repeated settings in a configuration
+# Direct constructor arguments are enough for a single model, as above.
+# A configuration is useful when comparing models that share the same dimensions.
+config = SSMConfig(
+    d_model=4, d_state=8, n_layers=1, param="defect", ff="LGLU2", gamma=1.0,
+    defect_state_metric="full", defect_max_radius=1.0, defect_factor_margin=0.0,
+)
+configured_model = DeepSSM(1, 1, config=config)
+configured_y, _ = configured_model(u)
+# replace() makes a NEW configuration: the original config remains available.
+
+# To recover the cheaper original model, change only the storage choice.
+# Identity storage with small blocks is more restrictive at a prescribed gain.
+identity_model = DeepSSM(1, 1, config=replace(config, defect_state_metric="identity"))
+identity_y, _ = identity_model(u)
+
+# Full storage also supports odd memory sizes: the last mode is a real scalar.
+odd_model = DeepSSM(1, 1, config=replace(config, d_state=9))
+odd_y, _ = odd_model(u, mode="scan")
+
+# Returned states stay in the scan coordinates. Ask the core for their energy
+# instead of assuming it is the squared Euclidean norm.
+core = configured_model.blocks[0].lru
+P = core.storage_matrix()  # shape: (8, 8); useful for inspecting the certificate
+_, final_states = configured_model(u)
+stored_energy = core.state_energy(final_states[0])  # x.T @ P @ x, one value per batch
+
+
+# %% 7. Try the other current parametrizations, changing one choice at a time
+# First try the original L2N: rotation blocks, identity scan storage, even state size.
+# Those rotations also support FFT convolution through mode="conv".
+l2n = DeepSSM(1, 1, config=replace(config, param="l2n"))
+l2n_y, _ = l2n(u, mode="conv")
+print("L2N output shape:", l2n_y.shape)
+
+# Now let the blocks share a dense state metric inside the normalization.
+# The new mode learns general real blocks; use their fast real scan.
+full_l2n = DeepSSM(1, 1, config=replace(config, param="l2n", l2n_state_metric="full"))
+full_l2n_y, _ = full_l2n(u, mode="scan")
+print("Full-metric L2N output shape:", full_l2n_y.shape)
+
+# TV selects its dynamics from the input at each time step.
+tv = DeepSSM(1, 1, config=replace(config, param="tv"))
+tv_y, _ = tv(u, mode="scan")
+print("TV output shape:", tv_y.shape)
+
+# TVC also has a direct input-to-output term. tanh bounds the raw selector outputs.
+tvc = DeepSSM(1, 1, config=replace(config, param="tvc", bcd_nonlinearity="tanh"))
+tvc_y, _ = tvc(u, mode="scan")
+print("TVC output shape:", tvc_y.shape)
+
+# Defect blocks can be larger to allow more interactions within the state.
+# The block size must divide d_state. Here eight states form two blocks of four.
+larger_blocks = DeepSSM(1, 1, config=replace(config, defect_block_size=4))
+block_y, _ = larger_blocks(u)
+print("Larger defect blocks:", block_y.shape)
+
+
+# %% 8. Change the feedforward branch while keeping the recurrent cell fixed
+# LGLU2 was used above. These three alternatives also support a prescribed gamma.
+# BLGLU2 shares a Lipschitz budget; BudgetedLGLU2 is another name for this choice.
+budgeted = DeepSSM(1, 1, config=replace(config, ff="BLGLU2"))
+budgeted_y, _ = budgeted(u)
+
+# MBLIP mixes bounded branches; TLIP uses a bounded Sandwich network.
+mixed = DeepSSM(1, 1, config=replace(config, ff="MBLIP"))
+mixed_y, _ = mixed(u)
+sandwich = DeepSSM(1, 1, config=replace(config, ff="TLIP"))
+sandwich_y, _ = sandwich(u)
+print("Alternative feedforward output shapes:", budgeted_y.shape, mixed_y.shape, sandwich_y.shape)
+
+# Ordinary MLP/GLU branches use gamma=None. LGLU/LMLP are historical uncapped choices.
+ordinary = DeepSSM(1, 1, config=replace(config, param="lru", ff="GLU", gamma=None))
+ordinary_y, _ = ordinary(u)
+print("Ordinary GLU output shape:", ordinary_y.shape)
+
+
+# %% 9. Reproduce an experiment with a legacy parametrization
+# These older constructions keep their original configuration keys and checkpoints.
+# Prefer the current cells in step 7 when starting a new comparison.
+l2ru = DeepSSM(1, 1, config=replace(config, param="l2ru", init="eye"))
+l2ru_y, _ = l2ru(u, mode="scan")
+zak = DeepSSM(1, 1, config=replace(config, param="zak", init="eye"))
+zak_y, _ = zak(u, mode="scan")
+l2nt = DeepSSM(1, 1, config=replace(config, param="l2nt"))
+l2nt_y, _ = l2nt(u, mode="loop")  # This dense legacy cell uses the sequential loop.
+print("Legacy output shapes:", l2ru_y.shape, zak_y.shape, l2nt_y.shape)
+
+
+# %% 10. Adjust gain budgets and residual gates for a deeper model
+# gamma remains the prescribed whole-stack target. train_gamma controls CELL gains.
+# train_ff_lip controls the feedforward budgets; False fixes the internal budgets.
+# Per-channel gates give each feature its own residual weight. Automatic initialization
+# balances the initial gates against the gain budget in a deeper stack.
+deep_config = replace(
+    config,
+    n_layers=4,
+    train_gamma=False,
+    train_ff_lip=False,
+    per_channel_gates=True,
+    auto_residual_init=True,
+)
+deep = DeepSSM(1, 1, config=deep_config)
+deep_y, _ = deep(u)
+print("Deeper model output shape:", deep_y.shape)
+
+
+# %% 11. Advanced: learn a delay and keep gradients across a chunk boundary
+# Now the target requires memory: y[t] = 0.3*u[t-1], with the first output zero.
+delay_target = torch.zeros_like(train_u)
+delay_target[:, 1:] = 0.3 * train_u[:, :-1]
+
+# Reuse the trained model from steps 3–5. detach_state=False connects the chunks
+# so the second chunk can backpropagate through the first. Use True for truncated BPTT.
+model.train()
+optimizer.zero_grad(set_to_none=True)
+first, state = model(train_u[:, :16], detach_state=False)
+second, _ = model(train_u[:, 16:], state=state, detach_state=False)
+loss = (torch.cat((first, second), dim=1) - delay_target).square().mean()
+loss.backward()
+optimizer.step()
+print("One training update across two connected chunks:", loss.item())
+
+# To continue a stream through the model's INTERNAL state instead, call model.reset()
+# once, then use reset_state=False on each chunk. Explicit states are easier to manage
+# when one model serves several independent streams.
+# Next: Tutorial_ContextualSSM.py introduces a second sequence for context.

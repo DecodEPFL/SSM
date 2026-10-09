@@ -6,21 +6,23 @@ wrapper and are kept together so their different gain assumptions are visible.
 
 Reading order: input filtering, gates/mixing, then the public wrapper.
 """
+
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from dataclasses import replace
-from typing import Any, Callable, Optional, Sequence, Union
+from typing import Any, Callable
 
 import torch
 import torch.nn as nn
 
-from .layers import DeepSSM
-from .config import SSMConfig
 from ..utils.runtime import normalize_to_3d as _normalize_to_3d
-
+from .config import SSMConfig
+from .layers import DeepSSM
 
 # Input filters and their energy bounds
+
 
 class _ContextFilter(nn.Module):
     """L2-admissible projection for the input-augmentation (additive) context path.
@@ -46,24 +48,20 @@ class _ContextFilter(nn.Module):
 
     def __init__(
         self,
-        mode: Optional[Union[str, nn.Module, Callable[..., torch.Tensor]]],
+        mode: str | nn.Module | Callable[..., torch.Tensor] | None,
         *,
-        horizon: Optional[int],
+        horizon: int | None,
         decay: float,
         power: float,
         scale: float,
         trainable: bool,
         rho_max: float,
-        ramp: Optional[int] = None,
+        ramp: int | None = None,
     ):
         super().__init__()
         self.custom = mode if callable(mode) and not isinstance(mode, str) else None
         self.mode = (
-            "none"
-            if mode is None
-            else str(mode).lower()
-            if self.custom is None
-            else "custom"
+            "none" if mode is None else str(mode).lower() if self.custom is None else "custom"
         )
         self.horizon = horizon
         self.ramp = None if ramp is None else int(ramp)
@@ -74,8 +72,13 @@ class _ContextFilter(nn.Module):
         if self.mode == "auto":
             self.mode = "finite_horizon" if horizon is not None else "exponential"
         if self.mode not in {
-            "none", "custom", "finite_horizon", "taper",
-            "exponential", "polynomial", "difference",
+            "none",
+            "custom",
+            "finite_horizon",
+            "taper",
+            "exponential",
+            "polynomial",
+            "difference",
         }:
             raise ValueError(
                 "context_filter must be one of None, 'auto', 'finite_horizon', 'taper', "
@@ -113,7 +116,7 @@ class _ContextFilter(nn.Module):
                 self.register_buffer("fixed_power", torch.tensor(float(power)))
 
     @property
-    def decay(self) -> Optional[torch.Tensor]:
+    def decay(self) -> torch.Tensor | None:
         if self.mode != "exponential":
             return None
         if hasattr(self, "raw_decay"):
@@ -121,7 +124,7 @@ class _ContextFilter(nn.Module):
         return self.fixed_decay
 
     @property
-    def power(self) -> Optional[torch.Tensor]:
+    def power(self) -> torch.Tensor | None:
         if self.mode != "polynomial":
             return None
         if hasattr(self, "raw_power"):
@@ -151,21 +154,25 @@ class _ContextFilter(nn.Module):
             return self.scale * torch.pow(self.decay.to(device=device, dtype=dtype), steps)
         if self.mode == "polynomial":
             return self.scale * torch.pow(steps + 1.0, -self.power.to(device=device, dtype=dtype))
-        raise RuntimeError(f"context_filter mode {self.mode!r} does not expose deterministic weights.")
+        raise RuntimeError(
+            f"context_filter mode {self.mode!r} does not expose deterministic weights."
+        )
 
     def forward(
         self,
         context: torch.Tensor,
         *,
         time_offset: int = 0,
-        prev: Optional[torch.Tensor] = None,
+        prev: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.custom is not None:
             try:
                 return self.custom(context, time_offset=time_offset)
             except TypeError:
                 if time_offset != 0:
-                    raise TypeError("Custom context_filter must accept time_offset for streaming.")
+                    raise TypeError(
+                        "Custom context_filter must accept time_offset for streaming."
+                    ) from None
                 return self.custom(context)
 
         z = _normalize_to_3d(context)
@@ -185,7 +192,7 @@ class _ContextFilter(nn.Module):
         )
         return z * window.reshape(1, -1, 1)
 
-    def weight_l2_norm(self, length: Optional[int] = None, *, time_offset: int = 0) -> float:
+    def weight_l2_norm(self, length: int | None = None, *, time_offset: int = 0) -> float:
         """``||window||_2`` over ``[time_offset, ...)`` (or a finite upper bound).
 
         Returns ``inf`` for modes that are not fixed l2 windows (``none``,
@@ -202,7 +209,9 @@ class _ContextFilter(nn.Module):
                 span = min(span, max(int(length), 0))
             if span == 0:
                 return 0.0
-            w = self.weights(span, device=torch.device("cpu"), dtype=torch.float32, time_offset=start)
+            w = self.weights(
+                span, device=torch.device("cpu"), dtype=torch.float32, time_offset=start
+            )
             return float(torch.linalg.vector_norm(w).item())
         if self.mode == "exponential":
             decay = float(self.decay)
@@ -210,11 +219,11 @@ class _ContextFilter(nn.Module):
                 return scale if (start == 0 and (length is None or length > 0)) else 0.0
             first = decay ** (2 * start)
             if length is None:
-                return scale * math.sqrt(first / (1.0 - decay ** 2))
+                return scale * math.sqrt(first / (1.0 - decay**2))
             length = max(int(length), 0)
             if length == 0:
                 return 0.0
-            total = first * (1.0 - decay ** (2 * length)) / (1.0 - decay ** 2)
+            total = first * (1.0 - decay ** (2 * length)) / (1.0 - decay**2)
             return scale * math.sqrt(max(total, 0.0))
         exponent = 2.0 * float(self.power)
         if length is not None:
@@ -225,7 +234,9 @@ class _ContextFilter(nn.Module):
         total_bound = base ** (-exponent) + base ** (1.0 - exponent) / (exponent - 1.0)
         return scale * math.sqrt(total_bound)
 
+
 # Context gates and bounded output mixing
+
 
 def timewise_matrix_vector_product(matrices: torch.Tensor, vectors: torch.Tensor) -> torch.Tensor:
     """Apply ``A_t e_t`` at every batch/time index."""
@@ -256,6 +267,15 @@ def _make_mlp(
         layers.extend((nn.Linear(hidden_dim, hidden_dim, bias=bias), activation()))
     layers.append(nn.Linear(hidden_dim, d_output, bias=bias))
     return nn.Sequential(*layers)
+
+
+def _conditioning_input(disturbance, context, *, include_disturbance, context_dim):
+    """Share gate/mixer conditioning; a single channel needs no concatenation."""
+    if context_dim > 0:
+        if context is None:
+            raise ValueError("context is required for context-conditioned gates and mixing.")
+        return torch.cat((disturbance, context), dim=-1) if include_disturbance else context
+    return disturbance
 
 
 class _BoundedMixer(nn.Module):
@@ -295,15 +315,13 @@ class _BoundedMixer(nn.Module):
     def matrix_norm_bound(self) -> float:
         return self.matrix_bound
 
-    def forward(self, disturbance: torch.Tensor, context: Optional[torch.Tensor]) -> torch.Tensor:
-        inputs = []
-        if self.include_disturbance:
-            inputs.append(disturbance)
-        if self.d_context > 0:
-            if context is None:
-                raise ValueError("context is required for mixer mode.")
-            inputs.append(context)
-        x = torch.cat(inputs, dim=-1)
+    def forward(self, disturbance: torch.Tensor, context: torch.Tensor | None) -> torch.Tensor:
+        x = _conditioning_input(
+            disturbance,
+            context,
+            include_disturbance=self.include_disturbance,
+            context_dim=self.d_context,
+        )
         matrices = self.net(x).reshape(*x.shape[:2], self.d_output, self.d_features)
         norm = torch.linalg.vector_norm(matrices, ord=2, dim=(-2, -1), keepdim=True)
         scale = torch.clamp(norm / self.matrix_bound, min=1.0)
@@ -347,31 +365,29 @@ class _ContextGate(nn.Module):
     def forward(
         self,
         disturbance: torch.Tensor,
-        context: Optional[torch.Tensor],
+        context: torch.Tensor | None,
     ) -> list[dict[str, torch.Tensor]]:
         if self.net is None:
             return []
-        inputs = []
-        if self.include_disturbance:
-            inputs.append(disturbance)
-        if self.d_context > 0:
-            if context is None:
-                raise ValueError("context is required for gate mode.")
-            inputs.append(context)
-        x = torch.cat(inputs, dim=-1)
+        x = _conditioning_input(
+            disturbance,
+            context,
+            include_disturbance=self.include_disturbance,
+            context_dim=self.d_context,
+        )
         gates = torch.sigmoid(self.net(x))
         gates = gates.reshape(*x.shape[:2], self.n_layers_core, 2, self.gate_dim)
         return [
-            {"ssm": gates[:, :, i, 0], "ff": gates[:, :, i, 1]}
-            for i in range(self.n_layers_core)
+            {"ssm": gates[:, :, i, 0], "ff": gates[:, :, i, 1]} for i in range(self.n_layers_core)
         ]
+
 
 # Public context wrapper
 
 _VALID_CONTEXT_MODES = frozenset({"input", "gate", "mixer", "select"})
 
 
-def _as_tuple(modes: Optional[Union[str, Sequence[str]]]) -> tuple[str, ...]:
+def _as_tuple(modes: str | Sequence[str] | None) -> tuple[str, ...]:
     if modes is None:
         return ()
     if isinstance(modes, str):
@@ -387,7 +403,7 @@ def _as_tuple(modes: Optional[Union[str, Sequence[str]]]) -> tuple[str, ...]:
 
 
 class ContextualDeepSSM(nn.Module):
-    """Context-enriched DeepSSM with input, gate, and mixer injection modes.
+    """DeepSSM with additive input, residual gate, output mixer, and selector ports.
 
     ``context_modes`` can contain any combination of:
 
@@ -409,14 +425,14 @@ class ContextualDeepSSM(nn.Module):
         d_context: int,
         d_output: int,
         *,
-        context_modes: Optional[Union[str, Sequence[str]]] = ("mixer",),
-        d_features: Optional[int] = None,
-        context_filter: Optional[Union[str, nn.Module, Callable[..., torch.Tensor]]] = "auto",
+        context_modes: str | Sequence[str] | None = ("mixer",),
+        d_features: int | None = None,
+        context_filter: str | nn.Module | Callable[..., torch.Tensor] | None = "auto",
         context_filter_decay: float = 0.98,
         context_filter_power: float = 1.0,
         context_filter_scale: float = 1.0,
-        horizon: Optional[int] = None,
-        context_filter_ramp: Optional[int] = None,
+        horizon: int | None = None,
+        context_filter_ramp: int | None = None,
         trainable_context_filter: bool = False,
         trainable_filter_rho_max: float = 0.999,
         mixer_bound: float = 1.0,
@@ -427,9 +443,9 @@ class ContextualDeepSSM(nn.Module):
         gate_layers: int = 2,
         gate_per_channel: bool = False,
         gate_include_disturbance: bool = False,
-        context_encoder: Optional[nn.Module] = None,
-        ssm_config: Optional[SSMConfig] = None,
-        ssm_kwargs: Optional[dict[str, Any]] = None,
+        context_encoder: nn.Module | None = None,
+        ssm_config: SSMConfig | None = None,
+        ssm_kwargs: dict[str, Any] | None = None,
         **deep_ssm_kwargs: Any,
     ):
         super().__init__()
@@ -470,8 +486,8 @@ class ContextualDeepSSM(nn.Module):
         )
 
         self.d_features = int(d_features or d_output)
-        self.core_input_dim = (
-            self.d_input + (self.d_context if "input" in self.context_modes else 0)
+        self.core_input_dim = self.d_input + (
+            self.d_context if "input" in self.context_modes else 0
         )
         self.core_output_dim = self.d_features if "mixer" in self.context_modes else self.d_output
         if "select" in self.context_modes:
@@ -535,7 +551,7 @@ class ContextualDeepSSM(nn.Module):
                 include_disturbance=mixer_include_disturbance,
             )
 
-    def _encode_context(self, context: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    def _encode_context(self, context: torch.Tensor | None) -> torch.Tensor | None:
         if context is None:
             return None
         z = self.context_encoder(context) if self.context_encoder is not None else context
@@ -547,10 +563,11 @@ class ContextualDeepSSM(nn.Module):
     def _prepare_inputs(
         self,
         disturbance: torch.Tensor,
-        context: Optional[torch.Tensor],
+        context: torch.Tensor | None,
         *,
         time_offset: int,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, Optional[torch.Tensor]]:
+        previous_context: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor | None]:
         w = _normalize_to_3d(disturbance)
         if w.shape[-1] != self.d_input:
             raise ValueError(
@@ -569,7 +586,15 @@ class ContextualDeepSSM(nn.Module):
 
         filtered_context = None
         if "input" in self.context_modes:
-            filtered_context = self.context_filter(z, time_offset=time_offset)
+            # Differencing needs the last sample of the previous chunk; time
+            # offsets alone only suffice for deterministic context windows.
+            previous = None
+            if previous_context is not None and self.context_filter.mode == "difference":
+                previous = self._encode_context(previous_context)
+                if previous.shape[0] != w.shape[0] or previous.shape[1] != 1:
+                    raise ValueError("previous_context must contain one sample per batch element.")
+                previous = previous.to(device=z.device, dtype=z.dtype)
+            filtered_context = self.context_filter(z, time_offset=time_offset, prev=previous)
             core_input = torch.cat((w, filtered_context), dim=-1)
         else:
             core_input = w
@@ -578,19 +603,28 @@ class ContextualDeepSSM(nn.Module):
     def forward(
         self,
         disturbance: torch.Tensor,
-        context: Optional[torch.Tensor] = None,
-        state: Optional[Union[torch.Tensor, Sequence[Optional[torch.Tensor]]]] = None,
+        context: torch.Tensor | None = None,
+        state: torch.Tensor | Sequence[torch.Tensor | None] | None = None,
         gamma=None,
         mode: str = "scan",
         reset_state: bool = True,
         detach_state: bool = False,
         time_offset: int = 0,
         return_aux: bool = False,
+        previous_context: torch.Tensor | None = None,
     ):
+        """Evaluate the core with context, returning outputs and layer states.
+
+        For chunks, pass the returned ``state`` and the absolute ``time_offset``.
+        With a difference filter, also pass the previous raw context sample as
+        ``previous_context`` with shape (batch, 1, raw context features). It is encoded by
+        the same context encoder as the current chunk before differencing.
+        """
         w, z, core_input, filtered_context = self._prepare_inputs(
             disturbance,
             context,
             time_offset=time_offset,
+            previous_context=previous_context,
         )
         context_gates = self.gate(w, z) if self.gate is not None else None
         select_context = z if "select" in self.context_modes else None
@@ -614,13 +648,17 @@ class ContextualDeepSSM(nn.Module):
 
         if not return_aux:
             return outputs, next_state
-        return outputs, next_state, {
-            "core_input": core_input,
-            "filtered_context": filtered_context,
-            "context_gates": context_gates,
-            "features": features,
-            "mixer": mixer_matrices,
-        }
+        return (
+            outputs,
+            next_state,
+            {
+                "core_input": core_input,
+                "filtered_context": filtered_context,
+                "context_gates": context_gates,
+                "features": features,
+                "mixer": mixer_matrices,
+            },
+        )
 
     @property
     def matrix_norm_bound(self) -> float:
@@ -715,7 +753,7 @@ class ContextualDeepSSM(nn.Module):
     def context_offset_bound(
         self,
         context_amplitude_bound: float,
-        length: Optional[int] = None,
+        length: int | None = None,
         *,
         time_offset: int = 0,
         gamma=None,
@@ -766,5 +804,6 @@ class ContextualDeepSSM(nn.Module):
 
     def reset(self):
         self.core.reset()
+
 
 __all__ = ["ContextualDeepSSM", "timewise_matrix_vector_product"]

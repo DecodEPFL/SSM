@@ -406,14 +406,14 @@ BEST_MODE: Dict[str, str] = {
 }
 
 
-def _resolve_mode(param: Optional[str], override: str) -> str:
+def _resolve_mode(param: Optional[str], override: str, *, state_metric="identity") -> str:
     """Pick the SSM execution mode for ``param`` given the global override.
 
     ``override="auto"`` -> the best mode for that parametrization; otherwise the
     explicit override, with ``"conv"`` clamped to ``"scan"`` for models that do
     not implement it (only lru/l2n do)."""
     mode = BEST_MODE.get(param, "scan") if (not override or override == "auto") else override
-    if mode == "conv" and param not in CONV_CAPABLE:
+    if mode == "conv" and (param not in CONV_CAPABLE or (param == "l2n" and state_metric == "full")):
         print(f"[run_benchmarks] mode='conv' is unsupported for param='{param}'; using 'scan'.")
         mode = "scan"
     return mode
@@ -460,6 +460,8 @@ def _make_ssm_config(spec: dict, gconf: "GlobalModelConfig") -> SSMConfig:
         defect_block_size=gconf.defect_block_size,
         defect_max_radius=gconf.defect_max_radius,
         defect_factor_margin=gconf.defect_factor_margin,
+        defect_state_metric=gconf.defect_state_metric,
+        l2n_state_metric=gconf.l2n_state_metric,
         tv_init_rho=gconf.tv_init_rho, tv_init_delta0=gconf.tv_init_delta0,
         tv_init_param_scale=gconf.tv_init_param_scale,
         tvc_init_rho=gconf.tvc_init_rho, tvc_init_delta0=gconf.tvc_init_delta0,
@@ -484,6 +486,7 @@ def _make_metric_config(spec: dict, gconf: "GlobalModelConfig") -> MetricSSMConf
         init_feedthrough=gconf.metric_init_feedthrough,
         block_size=gconf.defect_block_size, max_radius=gconf.defect_max_radius,
         factor_margin=gconf.defect_factor_margin,
+        state_metric=gconf.defect_state_metric if defect else gconf.l2n_state_metric,
         rho=gconf.defect_rho if defect else gconf.l2n_rho,
         max_phase=gconf.defect_max_phase if defect else gconf.l2n_max_phase,
         phase_center=gconf.defect_phase_center if defect else gconf.l2n_phase_center,
@@ -563,12 +566,14 @@ def build_model(name: str, n_u: int, n_y: int, gconf: "GlobalModelConfig",
                     param_budget, lo=2,
                 )
             gconf = replace(gconf, d_model=best)
-        if spec.get("param") == "l2n" and gconf.d_state % 2 != 0:
+        if (spec.get("param") == "l2n" and gconf.l2n_state_metric == "identity"
+                and gconf.d_state % 2 != 0):
             raise ValueError(
                 f"param='l2n' (Block2x2DenseL2SSM) needs an even d_state (2x2 blocks); "
                 f"got {gconf.d_state}. Pass an even --d-state (e.g. {gconf.d_state + 1})."
             )
-        mode = _resolve_mode(spec.get("param"), gconf.mode_override)
+        mode = _resolve_mode(spec.get("param"), gconf.mode_override,
+                             state_metric=gconf.l2n_state_metric)
         print(f"  [{name}] exec mode: {mode}"
               + (" (+cuda-graph)" if gconf.use_cuda_graph and spec.get("param") in ("tv", "tvc") else ""))
         return DeepSSMSim(n_u, n_y, _make_ssm_config(spec, gconf), mode=mode)
@@ -660,6 +665,7 @@ class GlobalModelConfig:
     defect_rho: float = 0.9
     defect_max_radius: float = 0.999
     defect_factor_margin: float = 1e-3
+    defect_state_metric: str = "identity"
     defect_init_scale: float = 0.05
     defect_max_phase: float = 0.04
     defect_phase_center: float = 0.0
@@ -681,6 +687,7 @@ class GlobalModelConfig:
     # "loop" | "scan" | "conv". "conv" only applies to lru/l2n; falls back to "scan" elsewhere.
     use_cuda_graph: bool = True            # tv/tvc: replay the diagonal scan from a captured
     # CUDA graph (same maths; removes launch overhead). No-op for other models / on CPU.
+    l2n_state_metric: str = "identity"
 
 
 def _validate_initialization(models: Sequence[str], cfg: GlobalModelConfig) -> None:
@@ -713,6 +720,10 @@ def _validate_initialization(models: Sequence[str], cfg: GlobalModelConfig) -> N
             raise ValueError("L2RU initialization scales must be non-negative.")
 
     if "l2n" in selected:
+        if cfg.l2n_state_metric not in ("identity", "full"):
+            raise ValueError("--l2n-state-metric must be identity or full.")
+        if cfg.l2n_state_metric == "identity" and cfg.d_state % 2:
+            raise ValueError("Identity L2N requires an even --d-state.")
         finite(l2n_rho=cfg.l2n_rho, l2n_max_phase=cfg.l2n_max_phase,
                l2n_phase_center=cfg.l2n_phase_center,
                l2n_offdiag_scale=cfg.l2n_offdiag_scale)
@@ -726,12 +737,18 @@ def _validate_initialization(models: Sequence[str], cfg: GlobalModelConfig) -> N
                defect_factor_margin=cfg.defect_factor_margin,
                defect_init_scale=cfg.defect_init_scale,
                defect_max_phase=cfg.defect_max_phase, defect_phase_center=cfg.defect_phase_center)
-        if cfg.defect_block_size <= 0 or cfg.d_state <= 0 or cfg.d_state % cfg.defect_block_size:
+        if cfg.defect_state_metric not in ("identity", "full"):
+            raise ValueError("--defect-state-metric must be identity or full.")
+        partial = cfg.defect_state_metric == "full" and cfg.defect_block_size == 2
+        if (cfg.defect_block_size <= 0 or cfg.d_state <= 0
+                or (cfg.d_state % cfg.defect_block_size and not partial)):
             raise ValueError("--defect-block-size must be positive and divide --d-state.")
-        if not 0 <= cfg.defect_rho < cfg.defect_max_radius < 1:
-            raise ValueError("Defect requires 0 <= --defect-rho < --defect-max-radius < 1.")
-        if not 0 < cfg.defect_factor_margin < 1:
-            raise ValueError("--defect-factor-margin must be in (0, 1).")
+        if cfg.defect_state_metric == "full" and cfg.defect_block_size > 4:
+            raise ValueError("Full state metrics require --defect-block-size <= 4.")
+        if not 0 <= cfg.defect_rho < cfg.defect_max_radius <= 1:
+            raise ValueError("Defect requires 0 <= --defect-rho < --defect-max-radius <= 1.")
+        if not 0 <= cfg.defect_factor_margin < 1:
+            raise ValueError("--defect-factor-margin must be in [0, 1).")
         if cfg.defect_init_scale < 0 or cfg.defect_max_phase < 0:
             raise ValueError("Defect factor scale and phase width must be non-negative.")
 
@@ -765,10 +782,12 @@ def _initialization_metadata(cfg: GlobalModelConfig) -> dict:
         "l2ru": {"mode": cfg.init, "eye_scale": cfg.l2ru_eye_scale,
                  "rand_scale": cfg.l2ru_rand_scale},
         "l2n": {"rho": cfg.l2n_rho, "max_phase": cfg.l2n_max_phase,
+                "state_metric": cfg.l2n_state_metric,
                 "phase_center": cfg.l2n_phase_center,
                 "random_phase": cfg.l2n_random_phase,
                 "offdiag_scale": cfg.l2n_offdiag_scale},
         "defect": {"block_size": cfg.defect_block_size, "rho": cfg.defect_rho,
+                   "state_metric": cfg.defect_state_metric,
                    "max_radius": cfg.defect_max_radius,
                    "factor_margin": cfg.defect_factor_margin,
                    "init_scale": cfg.defect_init_scale, "max_phase": cfg.defect_max_phase,
@@ -1577,9 +1596,11 @@ def run(args) -> None:
         l2n_phase_center=args.l2n_phase_center,
         l2n_random_phase=args.l2n_random_phase,
         l2n_offdiag_scale=args.l2n_offdiag_scale,
+        l2n_state_metric=args.l2n_state_metric,
         defect_block_size=args.defect_block_size, defect_rho=args.defect_rho,
         defect_max_radius=args.defect_max_radius,
         defect_factor_margin=args.defect_factor_margin,
+        defect_state_metric=args.defect_state_metric,
         defect_init_scale=args.defect_init_scale, defect_max_phase=args.defect_max_phase,
         defect_phase_center=args.defect_phase_center,
         defect_random_phase=args.defect_random_phase,
@@ -1829,6 +1850,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="L2RU triangular-factor scale for eye initialization")
     p.add_argument("--l2ru-rand-scale", type=float, default=1.0,
                    help="L2RU free-matrix standard deviation for random initialization")
+    p.add_argument("--l2n-state-metric", choices=("identity", "full"), default="identity",
+                   help="Full storage uses a dense metric inside normalization and a real block scan.")
     p.add_argument("--l2n-rho", type=float, default=0.9,
                    help="L2N target initial recurrent pole radius before contraction normalization")
     p.add_argument("--l2n-max-phase", type=float, default=0.04,
@@ -1839,12 +1862,14 @@ def build_parser() -> argparse.ArgumentParser:
                    help="sample L2N phases in the configured window; disable to use the center")
     p.add_argument("--l2n-offdiag-scale", type=float, default=0.05,
                    help="initial standard deviation of L2N K12/K21/K22")
+    p.add_argument("--defect-state-metric", choices=("identity", "full"), default="identity",
+                   help="Full state storage couples defect blocks; identity keeps cheaper setup.")
     p.add_argument("--defect-block-size", type=int, default=2,
-                   help="Defect state block size; must divide d-state")
+                   help="State block size; full storage with size 2 also permits odd d-state")
     p.add_argument("--defect-rho", type=float, default=0.9,
                    help="Defect initial state singular value")
     p.add_argument("--defect-max-radius", type=float, default=0.999,
-                   help="Defect state contraction limit, strictly below one")
+                   help="State contraction limit in (0,1]; 1 allows the full open pole range")
     p.add_argument("--defect-factor-margin", type=float, default=1e-3,
                    help="Margin below one for the X,Y,Z singular values")
     p.add_argument("--defect-init-scale", type=float, default=0.05,

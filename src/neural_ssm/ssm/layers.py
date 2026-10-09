@@ -4,150 +4,54 @@ Forward path: encoder -> SSL blocks -> decoder. Each SSL applies its recurrent
 cell followed by its instantaneous feedforward branch, with separate residual
 gates. Cell factories live in registry.py; settings live in config.py.
 
-Reading order below: certificate helpers, feedforward construction, SSL,
-DeepSSM, then PureLRUR/SimpleRNN. Context handling lives in contextual.py.
+Reading order: SSL and DeepSSM construction/forward, then their certificates
+and diagnostics, then the baselines. Shared algebra lives in common.py;
+context handling lives in contextual.py.
 """
+
 from __future__ import annotations
 
 import math
-from typing import Any, List, Optional, Sequence, Tuple, Union
+from collections.abc import Sequence
+from typing import Any
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .config import SSMConfig, SSMConfigDict
-from .registry import (
-    SSMParametrization,
-    _build_ssm_cell,
-    _initial_block_gamma,
-    _get_ssm_parametrization,
-    _CERTIFIED_PARAMETRIZATIONS,
-    _SSM_PARAMETRIZATIONS,
+from ..utils.runtime import (
+    EvalCacheMixin,
+    last_runtime_state,
+    normalize_to_3d as _normalize_to_3d,
+    reset_runtime_state,
 )
+from .cells.legacy import L2RU, L2BoundedLTICell, lruz
 from .cells.lti import LRU, Block2x2DenseL2SSM, DefectL2SSM
-from .cells.selective import RobustMambaDiagSSM, RobustMambaDiagLTI
-from .cells.legacy import L2RU, lruz, L2BoundedLTICell
-from ..static_layers.generic_layers import GLU, MLP, LayerConfig
-from ..static_layers.lipschitz_mlps import (
-    BudgetedL2BoundedGLUv2,
-    L2BoundedGLU,
-    L2BoundedGLUv2,
-    LMLP,
-    MultiBranchLipMixer,
-    TLIP,
+from .cells.selective import RobustMambaDiagLTI, RobustMambaDiagSSM
+from .common import (
+    has_gain_contract as _has_gain_contract,
+    module_gain_bound as _module_gain_bound,
+    module_lip_bound as _module_lip_bound,
+    smooth_capped_log_scale_from_logs,
+    smooth_capped_scale,
+    smooth_capped_scale_from_logs,
+    spectrally_capped_weight,
+    state_energy as _state_energy,
 )
-from ..utils.runtime import EvalCacheMixin, normalize_to_3d as _normalize_to_3d
-
-
-# Certificate helpers
-
-def _has_gain_contract(module: nn.Module) -> bool:
-    return callable(getattr(module, "gain_bound", None)) or hasattr(module, "gamma")
-
-
-def _module_gain_bound(
-    module: nn.Module,
-    *,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    """Read a module's scalar gain contract.
-
-    New cells can implement ``gain_bound()``. Existing cells continue to work
-    through their ``.gamma`` property/parameter.
-    """
-    if callable(getattr(module, "gain_bound", None)):
-        bound = module.gain_bound()
-    else:
-        bound = getattr(module, "gamma", None)
-    if bound is None:
-        return torch.full((), float("inf"), device=device, dtype=dtype)
-    return torch.as_tensor(bound, device=device, dtype=dtype).abs()
-
-
-def _module_lip_bound(
-    module: nn.Module,
-    *,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    """Read a static branch's Lipschitz contract.
-
-    ``lip_bound()`` is the preferred future hook; ``.lip`` keeps existing
-    feedforward modules compatible.
-    """
-    if callable(getattr(module, "lip_bound", None)):
-        bound = module.lip_bound()
-    else:
-        bound = getattr(module, "lip", None)
-    if bound is None:
-        return torch.full((), float("inf"), device=device, dtype=dtype)
-    return torch.as_tensor(bound, device=device, dtype=dtype).abs()
-
-
-def _state_energy(
-    state: Any,
-    *,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> Optional[torch.Tensor]:
-    """Return ``||s||^2`` per batch element, or ``None`` when there is no state.
-
-    Cells hold their state either as one ``(batch, n_state)`` tensor or as a
-    nested tuple of them. Complex states (the LRU family) contribute
-    ``sum_k |s_k|^2``, which is what ``vector_norm`` computes for complex input.
-    """
-    if state is None:
-        return None
-    if torch.is_tensor(state):
-        flat = state.reshape(state.shape[0], -1) if state.ndim > 1 else state.reshape(1, -1)
-        energy = torch.linalg.vector_norm(flat, dim=-1) ** 2
-        return energy.real.to(device=device, dtype=dtype) if energy.is_complex() \
-            else energy.to(device=device, dtype=dtype)
-    if isinstance(state, (tuple, list)):
-        parts = [_state_energy(item, device=device, dtype=dtype) for item in state]
-        parts = [p for p in parts if p is not None]
-        if not parts:
-            return None
-        return torch.stack(parts).sum(dim=0)
-    raise TypeError(f"Unsupported state type: {type(state).__name__}.")
-
-# Feedforward branch construction
-
-_CERTIFIED_FEEDFORWARDS = frozenset({"LGLU2", "BLGLU2", "BudgetedLGLU2", "MBLIP", "TLIP"})
-
-def _build_feedforward(config: SSMConfig) -> nn.Module:
-    """Build the instantaneous channel-mixing branch."""
-    layer_config = LayerConfig(
-        d_input=config.d_model,
-        d_output=config.d_model,
-        d_hidden=config.d_hidden,
-        n_layers=config.nl_layers,
-        lip=config.scale,
-        train_lip=(
-            not (config.gamma is not None and not config.train_gamma)
-            if config.train_ff_lip is None
-            else bool(config.train_ff_lip)
-        ),
-    )
-    builders = {
-        "GLU": GLU,
-        "MLP": MLP,
-        "LGLU": L2BoundedGLU,
-        "LGLU2": L2BoundedGLUv2,
-        "BLGLU2": BudgetedL2BoundedGLUv2,
-        "BudgetedLGLU2": BudgetedL2BoundedGLUv2,
-        "LMLP": LMLP,
-        "MBLIP": MultiBranchLipMixer,
-        "TLIP": TLIP,
-    }
-    try:
-        return builders[config.ff](layer_config)
-    except KeyError as exc:
-        raise ValueError(f"Unknown feedforward type: {config.ff!r}.") from exc
+from .config import SSMConfig, SSMConfigDict, validate_ssm_config
+from .registry import (
+    _CERTIFIED_FEEDFORWARDS as _CERTIFIED_FEEDFORWARDS,
+    _CERTIFIED_PARAMETRIZATIONS as _CERTIFIED_PARAMETRIZATIONS,
+    _SSM_PARAMETRIZATIONS as _SSM_PARAMETRIZATIONS,
+    SSMParametrization,
+    _build_feedforward,
+    _build_ssm_cell,
+    _get_ssm_parametrization,
+    _initial_block_gamma,
+)
 
 # Residual state-space block
+
 
 class SSL(nn.Module):
     """State-space block with separate temporal and feedforward residuals.
@@ -167,6 +71,7 @@ class SSL(nn.Module):
         super().__init__()
         block_gamma = _initial_block_gamma(config)
         self.lru = _build_ssm_cell(config, block_gamma)
+        self._supports_return_last = _get_ssm_parametrization(config.param).supports_return_last
         self.ff = _build_feedforward(config)
 
         self.ssm_dropout = nn.Dropout(config.dropout)
@@ -175,110 +80,36 @@ class SSL(nn.Module):
         # emphasize memory and others feedforward; scalars recover the old behavior.
         # The certificate uses the worst-channel gate, so it stays valid either way.
         self.per_channel_gates = bool(getattr(config, "per_channel_gates", False))
-        if self.per_channel_gates:
-            self.ssm_res_logit = nn.Parameter(
-                torch.full((config.d_model,), float(config.ssm_residual_init)))
-            self.ff_res_logit = nn.Parameter(
-                torch.full((config.d_model,), float(config.ff_residual_init)))
-        else:
-            self.ssm_res_logit = nn.Parameter(torch.tensor(float(config.ssm_residual_init)))
-            self.ff_res_logit = nn.Parameter(torch.tensor(float(config.ff_residual_init)))
-
-    @property
-    def ssm_scale(self) -> torch.Tensor:
-        return torch.sigmoid(self.ssm_res_logit)
-
-    @property
-    def ff_scale(self) -> torch.Tensor:
-        return torch.sigmoid(self.ff_res_logit)
-
-    @property
-    def res_scale(self) -> torch.Tensor:
-        """Compatibility alias for the former single residual gate."""
-        return self.ssm_scale
-
-    @property
-    def dropout(self) -> nn.Dropout:
-        """Compatibility alias used by older diagnostics."""
-        return self.ff_dropout
-
-    def gain_terms(
-        self,
-        *,
-        device: torch.device,
-        dtype: torch.dtype,
-        training: Optional[bool] = None,
-    ) -> dict[str, torch.Tensor]:
-        """Return the exact factors used by the block certificate."""
-        training = self.training if training is None else bool(training)
-        gamma = _module_gain_bound(self.lru, device=device, dtype=dtype)
-        ff_lip = _module_lip_bound(self.ff, device=device, dtype=dtype)
-
-        ssm_drop_factor = torch.as_tensor(
-            1.0 / max(1.0 - float(self.ssm_dropout.p), 1e-12) if training else 1.0,
-            device=device,
-            dtype=dtype,
-        )
-        ff_drop_factor = torch.as_tensor(
-            1.0 / max(1.0 - float(self.ff_dropout.p), 1e-12) if training else 1.0,
-            device=device,
-            dtype=dtype,
-        )
-        # The certificate uses the worst-channel gate: for a per-channel residual
-        # ||I + diag(alpha)*M|| <= 1 + max_c(alpha_c)*||M||. ``.max()`` is a no-op
-        # for the scalar-gate case, so this stays exact there too.
-        alpha_ssm = self.ssm_scale.to(device=device, dtype=dtype).max()
-        alpha_ff = self.ff_scale.to(device=device, dtype=dtype).max()
-        ssm_branch_gain = gamma * ssm_drop_factor
-        ff_branch_gain = ff_lip * ff_drop_factor
-        ssm_factor = 1.0 + alpha_ssm * ssm_branch_gain
-        ff_factor = 1.0 + alpha_ff * ff_branch_gain
-        # Effective residual weights after dropout inflation. Dropout scales the
-        # branch, which is equivalent to inflating the gate, so ssm_factor reads
-        # 1 + alpha_eff*gamma and ff_factor reads 1 + beta_eff*ff_lip.
-        alpha_eff = alpha_ssm * ssm_drop_factor
-        # Storage weight of the SSM residual, c = alpha_eff*(alpha_eff + 1/gamma)
-        # from the Young's-inequality split of the cross term in ||p + alpha*G*o||^2.
-        # A cell with no positive finite gain contract has no such storage.
-        c_ssm = torch.where(
-            (gamma > 0) & torch.isfinite(gamma),
-            alpha_eff * (alpha_eff + 1.0 / gamma.clamp_min(torch.finfo(dtype).tiny)),
-            torch.full_like(gamma, float("inf")),
-        )
-        return {
-            "gamma": gamma,
-            "ff_lip": ff_lip,
-            "ssm_drop_factor": ssm_drop_factor,
-            "ff_drop_factor": ff_drop_factor,
-            "alpha_ssm": alpha_ssm,
-            "alpha_ff": alpha_ff,
-            "alpha_eff": alpha_eff,
-            "ssm_branch_gain": ssm_branch_gain,
-            "ff_branch_gain": ff_branch_gain,
-            "ssm_factor": ssm_factor,
-            "ff_factor": ff_factor,
-            "block_factor": ssm_factor * ff_factor,
-            "c_ssm": c_ssm,
-        }
+        gate_shape = (config.d_model,) if self.per_channel_gates else ()
+        self.ssm_res_logit = nn.Parameter(torch.full(gate_shape, float(config.ssm_residual_init)))
+        self.ff_res_logit = nn.Parameter(torch.full(gate_shape, float(config.ff_residual_init)))
 
     def forward(
         self,
         x3d: torch.Tensor,
-        state: Optional[torch.Tensor] = None,
+        state: torch.Tensor | None = None,
         mode: str = "loop",
         reset_state: bool = True,
         detach_state: bool = False,
-        ssm_context_gate: Optional[torch.Tensor] = None,
-        ff_context_gate: Optional[torch.Tensor] = None,
-        select_context: Optional[torch.Tensor] = None,
+        ssm_context_gate: torch.Tensor | None = None,
+        ff_context_gate: torch.Tensor | None = None,
+        select_context: torch.Tensor | None = None,
+        return_state: bool = True,
     ):
+        """Apply both residual branches and return the cell's state trajectory.
+
+        With return_state=False, request only the final state when supported.
+        This avoids full-trajectory coordinate conversion in cells such as l2n.
+        """
         lru_kwargs = dict(
             state=state,
             mode=mode,
             reset_state=reset_state,
             detach_state=detach_state,
         )
-        # Only selective cells (tv/tvc/…) accept context in their param_net.
+        if not return_state and self._supports_return_last:
+            lru_kwargs.update(return_state=False, return_last=True)
+        # Only selective cells accept context in their param_net.
         if select_context is not None and getattr(self.lru, "supports_select_context", False):
             lru_kwargs["select_context"] = select_context
         ssm_out, state_trajectory = self.lru(x3d, **lru_kwargs)
@@ -304,7 +135,85 @@ class SSL(nn.Module):
             )
 
         x = x + self.ff_scale * ff_gate * self.ff_dropout(self.ff(x))
-        return x, state_trajectory
+        return x, state_trajectory if return_state else last_runtime_state(state_trajectory)
+
+    @property
+    def ssm_scale(self) -> torch.Tensor:
+        return torch.sigmoid(self.ssm_res_logit)
+
+    @property
+    def ff_scale(self) -> torch.Tensor:
+        return torch.sigmoid(self.ff_res_logit)
+
+    @property
+    def res_scale(self) -> torch.Tensor:
+        """Compatibility alias for the former single residual gate."""
+        return self.ssm_scale
+
+    @property
+    def dropout(self) -> nn.Dropout:
+        """Compatibility alias used by older diagnostics."""
+        return self.ff_dropout
+
+    def gain_terms(
+        self,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+        training: bool | None = None,
+        include_storage: bool = True,
+    ) -> dict[str, torch.Tensor]:
+        """Return the exact factors used by the block certificate.
+
+        Skip c_ssm with include_storage=False when only the output gain is needed.
+        """
+        training = self.training if training is None else bool(training)
+        gamma = _module_gain_bound(self.lru, device=device, dtype=dtype)
+        ff_lip = _module_lip_bound(self.ff, device=device, dtype=dtype)
+
+        ssm_drop_factor = torch.as_tensor(
+            1.0 / max(1.0 - float(self.ssm_dropout.p), 1e-12) if training else 1.0,
+            device=device,
+            dtype=dtype,
+        )
+        ff_drop_factor = torch.as_tensor(
+            1.0 / max(1.0 - float(self.ff_dropout.p), 1e-12) if training else 1.0,
+            device=device,
+            dtype=dtype,
+        )
+        # The certificate uses the worst-channel gate: for a per-channel residual
+        # ||I + diag(alpha)*M|| <= 1 + max_c(alpha_c)*||M||. ``.max()`` is a no-op
+        # for the scalar-gate case, so this stays exact there too.
+        alpha_ssm = self.ssm_scale.to(device=device, dtype=dtype).max()
+        alpha_ff = self.ff_scale.to(device=device, dtype=dtype).max()
+        ssm_branch_gain = gamma * ssm_drop_factor
+        ff_branch_gain = ff_lip * ff_drop_factor
+        ssm_factor = 1.0 + alpha_ssm * ssm_branch_gain
+        ff_factor = 1.0 + alpha_ff * ff_branch_gain
+        alpha_eff = alpha_ssm * ssm_drop_factor
+        terms = {
+            "gamma": gamma,
+            "ff_lip": ff_lip,
+            "ssm_drop_factor": ssm_drop_factor,
+            "ff_drop_factor": ff_drop_factor,
+            "alpha_ssm": alpha_ssm,
+            "alpha_ff": alpha_ff,
+            "alpha_eff": alpha_eff,
+            "ssm_branch_gain": ssm_branch_gain,
+            "ff_branch_gain": ff_branch_gain,
+            "ssm_factor": ssm_factor,
+            "ff_factor": ff_factor,
+            "block_factor": ssm_factor * ff_factor,
+        }
+        if include_storage:
+            # Young's inequality weights the recurrent storage by
+            # alpha_eff * (alpha_eff + 1/gamma). Invalid contracts have no storage.
+            terms["c_ssm"] = torch.where(
+                (gamma > 0) & torch.isfinite(gamma),
+                alpha_eff * (alpha_eff + 1.0 / gamma.clamp_min(torch.finfo(dtype).tiny)),
+                torch.full_like(gamma, float("inf")),
+            )
+        return terms
 
     def _load_from_state_dict(
         self,
@@ -346,7 +255,9 @@ class SSL(nn.Module):
             error_msgs,
         )
 
+
 # Deep state-space stack
+
 
 class DeepSSM(EvalCacheMixin, nn.Module):
     """
@@ -364,6 +275,7 @@ class DeepSSM(EvalCacheMixin, nn.Module):
     valid as part of that same trajectory, but a standalone nonzero initial
     state requires an additional storage-energy term.
     """
+
     def __init__(
         self,
         d_input: int,
@@ -374,18 +286,18 @@ class DeepSSM(EvalCacheMixin, nn.Module):
         n_layers: int = 2,
         dropout: float = 0.0,
         bias: bool = False,
-        rmin: float = .8,
-        rmax: float = .95,
+        rmin: float = 0.8,
+        rmax: float = 0.95,
         max_phase: float = 2 * math.pi,
         ff: str = "LGLU2",
         scale: float = 1,
         dim_amp: int = 4,
         d_hidden: int = 4,
         nl_layers: int = 3,
-        param: Optional[str] = "lru",
-        gamma: Optional[float] = None,
-        train_gamma: Optional[bool] = True,
-        train_ff_lip: Optional[bool] = None,
+        param: str | None = "lru",
+        gamma: float | None = None,
+        train_gamma: bool | None = True,
+        train_ff_lip: bool | None = None,
         init: str = "eye",
         rho: float = 0.9,
         max_phase_b: float = 0.5,
@@ -400,7 +312,12 @@ class DeepSSM(EvalCacheMixin, nn.Module):
         select_context_dim: int = 0,
         select_input: str = "both",
         bcd_nonlinearity: str = "identity",
-        config: Optional[SSMConfig] = None,
+        defect_state_metric: str = "identity",
+        defect_block_size: int = 2,
+        defect_max_radius: float = 0.999,
+        defect_factor_margin: float = 1e-3,
+        l2n_state_metric: str = "identity",
+        config: SSMConfig | None = None,
     ):
         super().__init__()
         if d_input <= 0 or d_output <= 0:
@@ -408,45 +325,52 @@ class DeepSSM(EvalCacheMixin, nn.Module):
         self.d_input = d_input
         self.d_output = d_output
 
-        self.config = config if config is not None else SSMConfig(
-            d_model=d_model,
-            d_state=d_state,
-            n_layers=n_layers,
-            dropout=dropout,
-            bias=bias,
-            rmin=rmin,
-            rmax=rmax,
-            max_phase=max_phase,
-            ff=ff,
-            scale=scale,
-            dim_amp=dim_amp,
-            d_hidden=d_hidden,
-            nl_layers=nl_layers,
-            param=param,
-            gamma=gamma,
-            train_gamma=train_gamma,
-            train_ff_lip=train_ff_lip,
-            init=init,
-            rho=rho,
-            max_phase_b=max_phase_b,
-            phase_center=phase_center,
-            random_phase=random_phase,
-            learn_x0=learn_x0,
-            ssm_residual_init=ssm_residual_init,
-            ff_residual_init=ff_residual_init,
-            auto_residual_init=auto_residual_init,
-            budget_init_utilization=budget_init_utilization,
-            per_channel_gates=per_channel_gates,
-            select_context_dim=select_context_dim,
-            select_input=select_input,
-            bcd_nonlinearity=bcd_nonlinearity,
+        self.config = (
+            config
+            if config is not None
+            else SSMConfig(
+                d_model=d_model,
+                d_state=d_state,
+                n_layers=n_layers,
+                dropout=dropout,
+                bias=bias,
+                rmin=rmin,
+                rmax=rmax,
+                max_phase=max_phase,
+                ff=ff,
+                scale=scale,
+                dim_amp=dim_amp,
+                d_hidden=d_hidden,
+                nl_layers=nl_layers,
+                param=param,
+                gamma=gamma,
+                train_gamma=train_gamma,
+                train_ff_lip=train_ff_lip,
+                init=init,
+                rho=rho,
+                max_phase_b=max_phase_b,
+                phase_center=phase_center,
+                random_phase=random_phase,
+                learn_x0=learn_x0,
+                ssm_residual_init=ssm_residual_init,
+                ff_residual_init=ff_residual_init,
+                auto_residual_init=auto_residual_init,
+                budget_init_utilization=budget_init_utilization,
+                per_channel_gates=per_channel_gates,
+                select_context_dim=select_context_dim,
+                select_input=select_input,
+                bcd_nonlinearity=bcd_nonlinearity,
+                defect_state_metric=defect_state_metric,
+                defect_block_size=defect_block_size,
+                defect_max_radius=defect_max_radius,
+                defect_factor_margin=defect_factor_margin,
+                l2n_state_metric=l2n_state_metric,
+            )
         )
 
         self._validate_config(self.config)
         self.use_cert_scaling = self.config.gamma is not None
-        self._prescribed_gamma = (
-            float(self.config.gamma) if self.config.gamma is not None else None
-        )
+        self._prescribed_gamma = float(self.config.gamma) if self.config.gamma is not None else None
         self.ff_has_lip = False
 
         if self.use_cert_scaling:
@@ -486,54 +410,117 @@ class DeepSSM(EvalCacheMixin, nn.Module):
             if self.config.auto_residual_init:
                 self._rescale_residual_init()
 
+    def forward(
+        self,
+        u: torch.Tensor,
+        state: torch.Tensor | Sequence[torch.Tensor | None] | None = None,
+        gamma=None,
+        mode: str = "scan",
+        reset_state: bool = True,
+        detach_state: bool = False,
+        context_gates: Sequence[dict[str, torch.Tensor]] | None = None,
+        select_context: torch.Tensor | None = None,
+    ):
+        u3d = _normalize_to_3d(u)
+        if gamma is not None and not self.use_cert_scaling:
+            raise ValueError("gamma override requires a model constructed with gamma set.")
+        # Each cell resolves its own reset/explicit-state precedence.
+        n_blocks = len(self.blocks)
+        if state is None:
+            layer_states: list[torch.Tensor | None] = [None] * n_blocks
+        elif isinstance(state, (list, tuple)):
+            if len(state) != n_blocks:
+                raise ValueError(
+                    f"state must provide exactly one entry per SSL block: "
+                    f"expected {n_blocks}, got {len(state)}"
+                )
+            layer_states = list(state)
+        else:
+            # Convenience path: broadcast one state tensor to every block.
+            layer_states = [state] * n_blocks
+
+        if context_gates is not None and len(context_gates) != n_blocks:
+            raise ValueError(
+                f"context_gates must provide one entry per SSL block: "
+                f"expected {n_blocks}, got {len(context_gates)}"
+            )
+
+        # Encode
+        if self.use_cert_scaling:
+            encoder_eff, decoder_eff = self._capped_encoder_decoder()
+            x = F.linear(u3d, encoder_eff, bias=None)
+        else:
+            x = self.encoder(u3d)
+
+        # Blocks
+        for i, block in enumerate(self.blocks):
+            x, st = block(
+                x,
+                state=layer_states[i],
+                mode=mode,
+                reset_state=reset_state,
+                detach_state=detach_state,
+                ssm_context_gate=(None if context_gates is None else context_gates[i].get("ssm")),
+                ff_context_gate=(None if context_gates is None else context_gates[i].get("ff")),
+                select_context=select_context,
+                return_state=False,
+            )
+            layer_states[i] = st
+
+        # Decode
+        if self.use_cert_scaling:
+            gamma_t = self._effective_gamma_cap(
+                gamma=gamma,
+                device=x.device,
+                dtype=x.dtype,
+            )
+            log_gamma_prod = self._log_block_gain_product(
+                device=x.device,
+                dtype=x.dtype,
+            )
+            scale = self._smooth_capped_scale_from_logs(
+                gamma_t=gamma_t,
+                log_gamma_prod=log_gamma_prod,
+                temperature=self.config.cert_scale_temperature,
+            )
+            outputs = F.linear(x, decoder_eff * scale, bias=None)
+        else:
+            outputs = self.decoder(x)
+
+        return outputs, layer_states
+
+    def reset(self):
+        for block in self.blocks:
+            block.lru.reset()
+
     @torch.no_grad()
     def _rescale_residual_init(self) -> None:
         """Set the residual-gate logits so the initial block product fits the budget.
 
-        ``prod_i k_i`` grows geometrically in depth at a fixed gate logit, while
-        the decoder attenuation ``sigma`` shrinks to keep the composed bound at
-        ``gamma``. A 24-block certified stack therefore starts with its decoder
-        scaled to a fraction of a percent, which is a poor place to begin
-        training and has nothing to do with what the task needs.
-
-        ``budget_init_utilization`` is the fraction of the *achievable* decoder
-        scale to keep at initialization. The best any stack can do is
-        ``sigma = min(1, gamma)``, reached only by identity blocks, so targeting
-        ``sigma = u * min(1, gamma)`` means
-
-            prod_i k_i = max(gamma, 1) / u,
-
-        which is strictly above one for ``u < 1`` and therefore always reachable.
-        Targeting ``u * gamma`` directly would not be: the product cannot go below
-        one, so for ``gamma <= 1/u`` bisection would drive every gate to zero and
-        leave the blocks as the identity map.
-
-        Solves for one shared logit ``l`` with
-        ``prod_i (1 + s(l) gamma_i)(1 + s(l) L_i) = target`` by bisection. The
-        left side is continuous and strictly increasing in ``l``, from one at
-        ``l -> -inf``, so the root exists and is unique.
+        Fixed gates can make a deep stack start with a heavily attenuated
+        decoder. Bisection chooses one shared logit with block product
+        ``max(gamma, 1) / budget_init_utilization``. This retains the requested
+        fraction of the largest achievable decoder scale, ``min(1, gamma)``.
+        The target exceeds one, so it is reachable without zeroing the gates.
         """
         if not self.blocks:
             return
         utilization = float(self.config.budget_init_utilization)
         if not 0.0 < utilization < 1.0:
-            raise ValueError(
-                f"budget_init_utilization must be in (0, 1), got {utilization}."
-            )
+            raise ValueError(f"budget_init_utilization must be in (0, 1), got {utilization}.")
         target = max(float(self._prescribed_gamma), 1.0) / utilization
         device = self.encoder_w.device
         dtype = self.encoder_w.dtype
         terms = self._block_gain_terms(device=device, dtype=dtype, training=False)
         gammas = [float(t["gamma"]) for t in terms]
         lips = [float(t["ff_lip"]) for t in terms]
-        if not all(math.isfinite(g) and math.isfinite(l) for g, l in zip(gammas, lips)):
+        if not all(math.isfinite(g) and math.isfinite(lip) for g, lip in zip(gammas, lips)):
             return  # uncertified components: nothing meaningful to balance
 
         def log_product(logit: float) -> float:
             alpha = 1.0 / (1.0 + math.exp(-logit))
             return sum(
-                math.log1p(alpha * g) + math.log1p(alpha * l)
-                for g, l in zip(gammas, lips)
+                math.log1p(alpha * g) + math.log1p(alpha * lip) for g, lip in zip(gammas, lips)
             )
 
         log_target = math.log(target)
@@ -549,113 +536,22 @@ class DeepSSM(EvalCacheMixin, nn.Module):
             block.ssm_res_logit.fill_(logit)
             block.ff_res_logit.fill_(logit)
 
-    @staticmethod
-    def _validate_config(config: SSMConfig) -> None:
-        if config.d_model <= 0 or config.d_state <= 0:
-            raise ValueError("d_model and d_state must be positive.")
-        if config.n_layers < 0:
-            raise ValueError("n_layers must be non-negative.")
-        if not 0.0 <= float(config.dropout) < 1.0:
-            raise ValueError(f"dropout must be in [0, 1), got {config.dropout}.")
-        if float(config.scale) <= 0.0 or not math.isfinite(float(config.scale)):
-            raise ValueError(f"scale must be finite and positive, got {config.scale}.")
-        if (
-            float(config.cert_scale_temperature) <= 0.0
-            or not math.isfinite(float(config.cert_scale_temperature))
-        ):
-            raise ValueError(
-                "cert_scale_temperature must be finite and positive, got "
-                f"{config.cert_scale_temperature}."
-            )
-        if not math.isfinite(float(config.ssm_residual_init)):
-            raise ValueError(
-                "ssm_residual_init must be finite, got "
-                f"{config.ssm_residual_init}."
-            )
-        if not math.isfinite(float(config.ff_residual_init)):
-            raise ValueError(
-                "ff_residual_init must be finite, got "
-                f"{config.ff_residual_init}."
-            )
+    _validate_config = staticmethod(validate_ssm_config)
 
-        cell_spec = _get_ssm_parametrization(config.param)
-
-        if config.select_input not in ("both", "context"):
-            raise ValueError(
-                f"select_input must be 'both' or 'context', got {config.select_input!r}."
-            )
-        if config.select_input == "context":
-            if config.select_context_dim <= 0:
-                raise ValueError(
-                    "select_input='context' requires select_context_dim > 0: the "
-                    "selector would otherwise have no input at all."
-                )
-            if config.n_layers > 0 and not cell_spec.selective:
-                raise ValueError(
-                    f"select_input='context' requires a selective parametrization "
-                    f"whose per-step matrices the context can shape; got "
-                    f"param={config.param!r}. Use 'tv' or 'tvc'."
-                )
-
-        if config.gamma is None:
-            return
-
-        gamma = float(config.gamma)
-        if gamma <= 0.0 or not math.isfinite(gamma):
-            raise ValueError(f"gamma must be finite and positive, got {config.gamma}.")
-        if config.n_layers > 0 and not cell_spec.certified:
-            supported = ", ".join(sorted(_CERTIFIED_PARAMETRIZATIONS))
-            raise ValueError(
-                f"param={config.param!r} does not provide a certified l2-gain bound. "
-                f"Use one of {{{supported}}} or set gamma=None."
-            )
-        if config.n_layers > 0 and config.ff not in _CERTIFIED_FEEDFORWARDS:
-            supported = ", ".join(sorted(_CERTIFIED_FEEDFORWARDS))
-            hint = (
-                " `LGLU` is not globally Lipschitz; use `LGLU2` instead."
-                if config.ff == "LGLU"
-                else ""
-            )
-            raise ValueError(
-                f"ff={config.ff!r} cannot be used for a certified global gain bound."
-                f"{hint} Use one of {{{supported}}} or set gamma=None."
-            )
-        if config.n_layers > 0 and config.learn_x0:
-            raise ValueError(
-                "learn_x0=True is incompatible with a zero-state induced l2-gain "
-                "certificate because a learned initial condition can produce output "
-                "with zero input. Set learn_x0=False or gamma=None."
-            )
-
-    @staticmethod
-    def _spectrally_capped_weight(
-        weight: torch.Tensor,
-        *,
-        bound: float = 1.0,
-    ) -> torch.Tensor:
-        """Return a weight with spectral norm <= bound without scaling small weights up."""
-        if bound <= 0.0:
-            raise ValueError(f"bound must be positive, got {bound}.")
-
-        weight_for_norm = (
-            weight.float() if weight.dtype in (torch.float16, torch.bfloat16) else weight
-        )
-        sigma = torch.linalg.matrix_norm(weight_for_norm, ord=2).to(
-            device=weight.device,
-            dtype=weight.dtype,
-        )
-        divisor = torch.clamp(sigma / float(bound), min=1.0)
-        return weight / divisor
+    _spectrally_capped_weight = staticmethod(spectrally_capped_weight)
 
     def _block_gain_terms(
         self,
         *,
         device: torch.device,
         dtype: torch.dtype,
-        training: Optional[bool] = None,
-    ) -> List[dict[str, torch.Tensor]]:
+        training: bool | None = None,
+        include_storage: bool = True,
+    ) -> list[dict[str, torch.Tensor]]:
         return [
-            block.gain_terms(device=device, dtype=dtype, training=training)
+            block.gain_terms(
+                device=device, dtype=dtype, training=training, include_storage=include_storage
+            )
             for block in self.blocks
         ]
 
@@ -665,7 +561,7 @@ class DeepSSM(EvalCacheMixin, nn.Module):
         device: torch.device,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        terms = self._block_gain_terms(device=device, dtype=dtype)
+        terms = self._block_gain_terms(device=device, dtype=dtype, include_storage=False)
         if not terms:
             return torch.zeros((), device=device, dtype=dtype)
         factors = torch.stack([term["block_factor"] for term in terms])
@@ -706,8 +602,8 @@ class DeepSSM(EvalCacheMixin, nn.Module):
     def conservative_gamma_product(
         self,
         *,
-        device: Optional[torch.device] = None,
-        dtype: Optional[torch.dtype] = None,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
         """
         Conservative reporting-only bound:
@@ -727,15 +623,13 @@ class DeepSSM(EvalCacheMixin, nn.Module):
 
         terms = self._block_gain_terms(device=device, dtype=dtype)
         if any(
-            not bool(torch.isfinite(term["gamma"]))
-            or not bool(torch.isfinite(term["ff_lip"]))
+            not bool(torch.isfinite(term["gamma"])) or not bool(torch.isfinite(term["ff_lip"]))
             for term in terms
         ):
             return torch.full((), float("inf"), device=device, dtype=dtype)
-        factors = torch.stack([
-            (1.0 + term["ssm_branch_gain"]) * (1.0 + term["ff_branch_gain"])
-            for term in terms
-        ])
+        factors = torch.stack(
+            [(1.0 + term["ssm_branch_gain"]) * (1.0 + term["ff_branch_gain"]) for term in terms]
+        )
         return torch.exp(torch.log(factors).sum())
 
     @torch.no_grad()
@@ -786,10 +680,7 @@ class DeepSSM(EvalCacheMixin, nn.Module):
         """
         if not self.blocks:
             return False
-        return all(
-            getattr(block.lru, "select_input", "both") == "context"
-            for block in self.blocks
-        )
+        return all(getattr(block.lru, "select_input", "both") == "context" for block in self.blocks)
 
     @torch.no_grad()
     def incremental_gain_bound(self, gamma=None) -> torch.Tensor:
@@ -857,9 +748,7 @@ class DeepSSM(EvalCacheMixin, nn.Module):
 
         terms = self._block_gain_terms(device=device, dtype=dtype)
         tiny = torch.finfo(dtype).tiny
-        log_kappa = torch.stack(
-            [torch.log(t["block_factor"].clamp_min(tiny)) for t in terms]
-        )
+        log_kappa = torch.stack([torch.log(t["block_factor"].clamp_min(tiny)) for t in terms])
         log_ell = torch.stack([torch.log(t["ff_factor"].clamp_min(tiny)) for t in terms])
         log_c = torch.stack([torch.log(t["c_ssm"].clamp_min(tiny)) for t in terms])
 
@@ -884,18 +773,16 @@ class DeepSSM(EvalCacheMixin, nn.Module):
     @torch.no_grad()
     def storage_value(
         self,
-        state: Optional[Sequence[Optional[torch.Tensor]]],
+        state: Sequence[torch.Tensor | None] | None,
         gamma=None,
     ) -> torch.Tensor:
-        """Evaluate ``V_Q(s) = sum_i w_i ||s_i||^2`` for a stack state.
+        """Evaluate ``V_Q(s) = sum_i w_i V_i(s_i)`` for a stack state.
 
         ``state`` is the per-block state list :meth:`forward` returns. Returns a
         ``(batch,)`` tensor, or a scalar zero for ``None`` / an empty stack.
 
-        This assumes every cell's storage is ``V(s) = ||s||^2``, which is what the
-        per-step ``||M_t||_2 <= 1`` normalization of the ``tv`` and ``tvc`` cells
-        establishes. A cell certified by a different storage would need its own
-        quadratic form here.
+        Cells with a state_energy() hook supply their own certified storage
+        (e.g. x.T P x for full-metric defect). Other cells use squared norms.
         """
         weights = self.storage_weights(gamma=gamma)
         if state is None or weights.numel() == 0:
@@ -907,10 +794,15 @@ class DeepSSM(EvalCacheMixin, nn.Module):
             )
 
         total = None
-        for w_i, s_i in zip(weights, state):
-            energy = _state_energy(s_i, device=weights.device, dtype=weights.dtype)
+        for w_i, s_i, block in zip(weights, state, self.blocks):
+            hook = getattr(block.lru, "state_energy", None)
+            energy = (
+                hook(s_i) if callable(hook)
+                else _state_energy(s_i, device=weights.device, dtype=weights.dtype)
+            )
             if energy is None:
                 continue
+            energy = energy.to(device=weights.device, dtype=weights.dtype)
             contribution = w_i * energy
             total = contribution if total is None else total + contribution
         if total is None:
@@ -920,7 +812,7 @@ class DeepSSM(EvalCacheMixin, nn.Module):
     @torch.no_grad()
     def initial_storage_bound(
         self,
-        state: Optional[Sequence[Optional[torch.Tensor]]],
+        state: Sequence[torch.Tensor | None] | None,
         gamma=None,
     ) -> torch.Tensor:
         """``b_Q = sqrt(V_Q(s_0))``, the offset a nonzero initial state adds.
@@ -950,24 +842,26 @@ class DeepSSM(EvalCacheMixin, nn.Module):
         for index, (block, term) in enumerate(zip(self.blocks, terms)):
             raw_lip = getattr(block.ff, "raw_lip", None)
             ff_lip_trainable = isinstance(raw_lip, nn.Parameter) and raw_lip.requires_grad
-            block_rows.append({
-                "index": index,
-                "lru_type": block.lru.__class__.__name__,
-                "ff_type": block.ff.__class__.__name__,
-                "core_gamma": float(term["gamma"].detach().cpu()),
-                "ff_lip": float(term["ff_lip"].detach().cpu()),
-                "ff_lip_trainable": ff_lip_trainable,
-                "alpha_ssm": float(term["alpha_ssm"].detach().cpu()),
-                "alpha_ff": float(term["alpha_ff"].detach().cpu()),
-                "ssm_drop_factor": float(term["ssm_drop_factor"].detach().cpu()),
-                "ff_drop_factor": float(term["ff_drop_factor"].detach().cpu()),
-                "ssm_branch_gain": float(term["ssm_branch_gain"].detach().cpu()),
-                "ff_branch_gain": float(term["ff_branch_gain"].detach().cpu()),
-                "ssm_factor": float(term["ssm_factor"].detach().cpu()),
-                "ff_factor": float(term["ff_factor"].detach().cpu()),
-                "block_factor": float(term["block_factor"].detach().cpu()),
-                "c_ssm": float(term["c_ssm"].detach().cpu()),
-            })
+            block_rows.append(
+                {
+                    "index": index,
+                    "lru_type": block.lru.__class__.__name__,
+                    "ff_type": block.ff.__class__.__name__,
+                    "core_gamma": float(term["gamma"].detach().cpu()),
+                    "ff_lip": float(term["ff_lip"].detach().cpu()),
+                    "ff_lip_trainable": ff_lip_trainable,
+                    "alpha_ssm": float(term["alpha_ssm"].detach().cpu()),
+                    "alpha_ff": float(term["alpha_ff"].detach().cpu()),
+                    "ssm_drop_factor": float(term["ssm_drop_factor"].detach().cpu()),
+                    "ff_drop_factor": float(term["ff_drop_factor"].detach().cpu()),
+                    "ssm_branch_gain": float(term["ssm_branch_gain"].detach().cpu()),
+                    "ff_branch_gain": float(term["ff_branch_gain"].detach().cpu()),
+                    "ssm_factor": float(term["ssm_factor"].detach().cpu()),
+                    "ff_factor": float(term["ff_factor"].detach().cpu()),
+                    "block_factor": float(term["block_factor"].detach().cpu()),
+                    "c_ssm": float(term["c_ssm"].detach().cpu()),
+                }
+            )
 
         if terms:
             block_factors = torch.stack([term["block_factor"] for term in terms])
@@ -1089,7 +983,7 @@ class DeepSSM(EvalCacheMixin, nn.Module):
             raw_lip = getattr(block.ff, "raw_lip", None)
             if isinstance(raw_lip, nn.Parameter):
                 raw_lip.requires_grad_(False)
-            for attr in ("log_gamma", "gamma"):
+            for attr in ("log_gamma", "gamma", "gamma_raw"):
                 value = getattr(block.lru, attr, None)
                 if isinstance(value, nn.Parameter):
                     value.requires_grad_(False)
@@ -1097,194 +991,50 @@ class DeepSSM(EvalCacheMixin, nn.Module):
             self.gamma_t.requires_grad_(False)
         return self.certificate_fingerprint()
 
-    @staticmethod
-    def _last_runtime_state(state: Any) -> Any:
-        """Extract a reusable final state from a returned state trajectory."""
-        if state is None:
-            return None
-        if torch.is_tensor(state):
-            return state[:, -1, :] if state.ndim >= 3 else state
-        if isinstance(state, tuple):
-            return tuple(DeepSSM._last_runtime_state(item) for item in state)
-        if isinstance(state, list):
-            return [DeepSSM._last_runtime_state(item) for item in state]
-        raise TypeError(f"Unsupported state trajectory type: {type(state).__name__}.")
+    _last_runtime_state = staticmethod(last_runtime_state)
 
-    def forward(
-        self,
-        u: torch.Tensor,
-        state: Optional[Union[torch.Tensor, Sequence[Optional[torch.Tensor]]]] = None,
-        gamma=None,
-        mode: str = "scan",
-        reset_state: bool = True,
-        detach_state: bool = False,
-        context_gates: Optional[Sequence[dict[str, torch.Tensor]]] = None,
-        select_context: Optional[torch.Tensor] = None,
-    ):
-        u3d = _normalize_to_3d(u)
-        if gamma is not None and not self.use_cert_scaling:
-            raise ValueError("gamma override requires a model constructed with gamma set.")
-        if reset_state:
-            self.reset()
+    _smooth_capped_scale = staticmethod(smooth_capped_scale)
 
-        n_blocks = len(self.blocks)
-        if state is None:
-            layer_states: List[Optional[torch.Tensor]] = [None] * n_blocks
-        elif isinstance(state, (list, tuple)):
-            if len(state) != n_blocks:
-                raise ValueError(
-                    f"state must provide exactly one entry per SSL block: "
-                    f"expected {n_blocks}, got {len(state)}"
-                )
-            layer_states = list(state)
-        else:
-            # Convenience path: broadcast one state tensor to every block.
-            layer_states = [state] * n_blocks
+    _smooth_capped_log_scale_from_logs = staticmethod(smooth_capped_log_scale_from_logs)
 
-        if context_gates is not None and len(context_gates) != n_blocks:
-            raise ValueError(
-                f"context_gates must provide one entry per SSL block: "
-                f"expected {n_blocks}, got {len(context_gates)}"
-            )
-
-        # Encode
-        if self.use_cert_scaling:
-            encoder_eff, decoder_eff = self._capped_encoder_decoder()
-            x = F.linear(u3d, encoder_eff, bias=None)
-        else:
-            x = self.encoder(u3d)
-
-        # Blocks
-        for i, block in enumerate(self.blocks):
-            x, st = block(
-                x,
-                state=layer_states[i],
-                mode=mode,
-                reset_state=reset_state,
-                detach_state=detach_state,
-                ssm_context_gate=(
-                    None if context_gates is None else context_gates[i].get("ssm")
-                ),
-                ff_context_gate=(
-                    None if context_gates is None else context_gates[i].get("ff")
-                ),
-                select_context=select_context,
-            )
-            layer_states[i] = self._last_runtime_state(st)
-
-        # Decode
-        if self.use_cert_scaling:
-            gamma_t = self._effective_gamma_cap(
-                gamma=gamma,
-                device=x.device,
-                dtype=x.dtype,
-            )
-            log_gamma_prod = self._log_block_gain_product(
-                device=x.device,
-                dtype=x.dtype,
-            )
-            scale = self._smooth_capped_scale_from_logs(
-                gamma_t=gamma_t,
-                log_gamma_prod=log_gamma_prod,
-                temperature=self.config.cert_scale_temperature,
-            )
-            outputs = F.linear(x, decoder_eff * scale, bias=None)
-        else:
-            outputs = self.decoder(x)
-
-        return outputs, layer_states
-
-    @staticmethod
-    def _smooth_capped_scale(
-        gamma_t: torch.Tensor,
-        gamma_prod: torch.Tensor,
-        temperature: float,
-    ) -> torch.Tensor:
-        """
-        Smooth approximation of min(1, gamma_t / gamma_prod) that preserves the
-        hard guarantee by replacing max(0, log(gamma_prod / gamma_t)) with a
-        log-sum-exp / softplus upper bound.
-        """
-        dtype = gamma_prod.dtype
-        tiny = torch.finfo(dtype).tiny
-        log_gamma_prod = torch.log(gamma_prod.abs().clamp_min(tiny))
-        return DeepSSM._smooth_capped_scale_from_logs(
-            gamma_t=gamma_t,
-            log_gamma_prod=log_gamma_prod,
-            temperature=temperature,
-        )
-
-    @staticmethod
-    def _smooth_capped_log_scale_from_logs(
-        gamma_t: torch.Tensor,
-        log_gamma_prod: torch.Tensor,
-        temperature: float,
-    ) -> torch.Tensor:
-        """
-        Log of the smooth decoder scale.
-
-        Returns ``log(scale)`` where ``scale`` is no larger than
-        ``min(1, gamma_t / gamma_prod)``. Keeping the result in log space lets
-        callers compose the certificate without ever materializing ``scale``:
-        for deep stacks ``scale`` underflows to a subnormal float, and reading
-        it back through ``log(clamp_min(scale, tiny))`` would re-inflate it and
-        break ``bound <= gamma``. Returns ``-inf`` for non-positive ``gamma_t``.
-        """
-        tau = max(float(temperature), 1e-6)
-        gamma_t = gamma_t.abs()
-        tiny = torch.finfo(gamma_t.dtype).tiny
-        log_gamma_t = torch.log(gamma_t.clamp_min(tiny))
-        log_ratio = log_gamma_prod - log_gamma_t
-        smooth_log_cap = tau * F.softplus(log_ratio / tau)
-        log_scale = -smooth_log_cap
-        return torch.where(
-            gamma_t > 0, log_scale, torch.full_like(log_scale, float("-inf"))
-        )
-
-    @staticmethod
-    def _smooth_capped_scale_from_logs(
-        gamma_t: torch.Tensor,
-        log_gamma_prod: torch.Tensor,
-        temperature: float,
-    ) -> torch.Tensor:
-        """
-        Smoothly cap decoder gain without ever amplifying it.
-
-        The result is no larger than ``min(1, gamma_t / gamma_prod)``. Working
-        with ``log_gamma_prod`` avoids overflow for deep stacks or large learned
-        branch bounds. ``exp(-inf) == 0`` recovers the non-positive-gamma case.
-        """
-        log_scale = DeepSSM._smooth_capped_log_scale_from_logs(
-            gamma_t=gamma_t,
-            log_gamma_prod=log_gamma_prod,
-            temperature=temperature,
-        )
-        return torch.exp(log_scale)
+    _smooth_capped_scale_from_logs = staticmethod(smooth_capped_scale_from_logs)
 
     def _capped_encoder_decoder(self):
         """Reuse spectral caps only in gradient-free eval, with fresh weights."""
-        return self._eval_cached("encoder_decoder", lambda: (
-            self._spectrally_capped_weight(self.encoder_w),
-            self._spectrally_capped_weight(self.decoder_w),
-        ))
+        return self._eval_cached(
+            "encoder_decoder",
+            lambda: (
+                self._spectrally_capped_weight(self.encoder_w),
+                self._spectrally_capped_weight(self.decoder_w),
+            ),
+        )
 
     def _encoder_decoder_norms(self):
         """Reuse the same capped weights and their norms in gain diagnostics."""
+
         def compute():
-            return tuple(torch.linalg.matrix_norm(w.float(), ord=2).to(dtype=w.dtype)
-                         for w in self._capped_encoder_decoder())
+            return tuple(
+                torch.linalg.matrix_norm(w.float(), ord=2).to(dtype=w.dtype)
+                for w in self._capped_encoder_decoder()
+            )
+
         return self._eval_cached("encoder_decoder_norms", compute)
 
-    def reset(self):
-        for block in self.blocks:
-            block.lru.reset()
 
 # Simple recurrent baselines
+
 
 class PureLRUR(nn.Module):
     """Pure LRU block without scaffolding."""
 
-    def __init__(self, n: int, gamma: float = None, param: str = "l2ru", init: str = "eye", learn_x0: bool = False):
+    def __init__(
+        self,
+        n: int,
+        gamma: float = None,
+        param: str = "l2ru",
+        init: str = "eye",
+        learn_x0: bool = False,
+    ):
         super().__init__()
         if param == "l2ru":
             self.lru = L2RU(state_features=n, gamma=gamma, init=init, learn_x0=learn_x0)
@@ -1303,12 +1053,12 @@ class PureLRUR(nn.Module):
             raise ValueError("Unsupported param")
 
     def forward(
-            self,
-            x: torch.Tensor,
-            state: Optional[torch.Tensor] = None,
-            mode: str = "scan",
-            reset_state: bool = True,
-            detach_state: bool = True,
+        self,
+        x: torch.Tensor,
+        state: torch.Tensor | None = None,
+        mode: str = "scan",
+        reset_state: bool = True,
+        detach_state: bool = True,
     ):
         y, st = self.lru(
             _normalize_to_3d(x),
@@ -1324,20 +1074,16 @@ class PureLRUR(nn.Module):
 
 
 class SimpleRNN(nn.Module):
-    """
-    Thin wrapper around nn.RNN that first normalizes the input to 3D
-    using the same convention as DeepSSM.
+    """nn.RNN baseline with the same input and reset conventions as DeepSSM.
 
-    Input:
-      u: (T, d_input) or (B, T, d_input)
+    Inputs are (B,T,d_input), (T,d_input), or a single feature vector. Initial
+    states accept a vector, (B,d_hidden), or the full (layers*directions,B,H).
+    By default, return y and the final state of every layer/direction.
 
-    State:
-      state (h0): (d_hidden,) or (B, d_hidden) or (1, B, d_hidden)
-
-    Returns (batch-first):
-      y: (B, T, d_output)
-      h_seq (optional): (B, T+1, d_hidden) = [h0, h1, ..., hT]
-      h_last (optional): (B, d_hidden)     = hT
+    return_state=True exposes the top-layer outputs with its initial state
+    prepended, shaped (B,T+1,directions*H). return_last=True exposes only the
+    top-layer final state, shaped (B,directions*H). Enabling both returns
+    (y, trajectory, top_layer_last).
     """
 
     def __init__(
@@ -1349,8 +1095,8 @@ class SimpleRNN(nn.Module):
         num_layers: int = 1,
         nonlinearity: str = "tanh",  # "tanh" or "relu"
         bias: bool = True,
-        dropout: float = 0.0,        # only applied if num_layers > 1 (PyTorch behavior)
-        bidirectional: bool = False, # for simplicity, we keep return shapes as-is
+        dropout: float = 0.0,  # only applied if num_layers > 1 (PyTorch behavior)
+        bidirectional: bool = False,
         learn_x0: bool = False,
     ):
         super().__init__()
@@ -1374,16 +1120,16 @@ class SimpleRNN(nn.Module):
 
         # Project RNN outputs to d_output
         self.out_proj = nn.Linear(self.d_hidden * self.num_directions, self.d_output, bias=bias)
-        self.state: Optional[torch.Tensor] = None
+        self.state: torch.Tensor | None = None
 
         # Learnable initial hidden state: shape (num_layers * num_directions, 1, d_hidden)
         L = self.num_layers * self.num_directions
         if learn_x0:
             self.x0_param = nn.Parameter(torch.zeros(L, 1, self.d_hidden))
         else:
-            self.register_buffer('x0_param', None)
+            self.register_buffer("x0_param", None)
 
-    def _format_h0(self, h0: Optional[torch.Tensor], B: int, device, dtype) -> torch.Tensor:
+    def _format_h0(self, h0: torch.Tensor | None, B: int, device, dtype) -> torch.Tensor:
         """
         nn.RNN expects h0: (num_layers * num_directions, B, d_hidden)
         Accept:
@@ -1401,7 +1147,7 @@ class SimpleRNN(nn.Module):
         if h0.dim() == 1:
             h0 = h0.unsqueeze(0).unsqueeze(0)  # (1,1,H)
         elif h0.dim() == 2:
-            h0 = h0.unsqueeze(0)               # (1,B,H)
+            h0 = h0.unsqueeze(0)  # (1,B,H)
         elif h0.dim() == 3:
             pass
         else:
@@ -1423,26 +1169,23 @@ class SimpleRNN(nn.Module):
     def forward(
         self,
         u: torch.Tensor,
-        state: Optional[torch.Tensor] = None,  # h0
+        state: torch.Tensor | None = None,  # h0
         *,
         return_state: bool = False,
         return_last: bool = False,
         reset_state: bool = True,
         detach_state: bool = True,
-    ) -> Union[
-        Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-        Tuple[torch.Tensor, torch.Tensor],
-        Tuple[torch.Tensor, torch.Tensor],
-        Tuple[torch.Tensor],
-    ]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor]:
         u3d = _normalize_to_3d(u)  # (B,T,D)
         B, T, D = u3d.shape
         if D != self.d_input:
             raise ValueError(f"Expected input dim {self.d_input}, got {D}")
 
-        source_state = state if state is not None else self.state
-        if reset_state:
-            source_state = self.x0_param  # None when learn_x0=False → zeros
+        source_state = state
+        if source_state is None:
+            source_state = (
+                self.x0_param if reset_state else self.state
+            )  # None when learn_x0=False → zeros
         h0 = self._format_h0(source_state, B, u3d.device, u3d.dtype)
 
         # Run RNN
@@ -1450,29 +1193,32 @@ class SimpleRNN(nn.Module):
         self.state = hT.detach() if detach_state else hT
 
         # Project to output dim
-        y = self.out_proj(out)       # (B,T,d_output)
+        y = self.out_proj(out)  # (B,T,d_output)
 
-        # Build full hidden trajectory if requested: [h0, h1, ..., hT]
-        # nn.RNN doesn't return all hidden states per step directly,
-        # but `out` *is* the last-layer hidden state at each time.
-        # For multi-layer RNNs, this corresponds to the top layer only.
+        # nn.RNN exposes the top-layer sequence, not every layer's trajectory.
         h_seq = None
         if return_state:
             # top-layer h_t sequence is out; prepend the top-layer initial state
             top_layer_idx = self.num_directions * (self.num_layers - 1)
-            h0_top = h0[top_layer_idx: top_layer_idx + self.num_directions]  # (num_dir,B,H)
-            # If bidirectional, top "initial" is two directions; we pack them consistently
-            # by taking the forward direction state as "the" h0 for the sequence.
-            h0_seq = h0_top[0].transpose(0, 0)  # (B,H) no-op, explicit
+            h0_top = h0[top_layer_idx : top_layer_idx + self.num_directions]  # (num_dir,B,H)
+            # Concatenate directions in the same channel order as nn.RNN's output.
             h_seq = torch.empty(B, T + 1, out.size(-1), device=u3d.device, dtype=u3d.dtype)
-            h_seq[:, 0, :] = torch.cat([h0_top[d] for d in range(self.num_directions)], dim=-1) if self.num_directions > 1 else h0_top[0]
+            h_seq[:, 0, :] = (
+                torch.cat([h0_top[d] for d in range(self.num_directions)], dim=-1)
+                if self.num_directions > 1
+                else h0_top[0]
+            )
             h_seq[:, 1:, :] = out
 
         # last hidden (top layer)
         h_last = None
         if return_last:
-            top_layer = hT[-self.num_directions:]  # (num_dir,B,H)
-            h_last = torch.cat([top_layer[d] for d in range(self.num_directions)], dim=-1) if self.num_directions > 1 else top_layer[0]
+            top_layer = hT[-self.num_directions :]  # (num_dir,B,H)
+            h_last = (
+                torch.cat([top_layer[d] for d in range(self.num_directions)], dim=-1)
+                if self.num_directions > 1
+                else top_layer[0]
+            )
 
         if return_state and return_last:
             return y, h_seq, h_last
@@ -1483,11 +1229,23 @@ class SimpleRNN(nn.Module):
         return y, self.state
 
     def reset(self):
-        from .state_utils import reset_runtime_state as _reset_runtime_state
-        self.state = _reset_runtime_state(self.state, x0=self.x0_param)
+        self.state = reset_runtime_state(self.state, x0=self.x0_param)
+
 
 __all__ = [
-    "SSMConfig", "SSMConfigDict", "SSMParametrization", "SSL", "DeepSSM",
-    "PureLRUR", "SimpleRNN", "LRU", "L2RU", "lruz", "L2BoundedLTICell",
-    "Block2x2DenseL2SSM", "DefectL2SSM", "RobustMambaDiagSSM", "RobustMambaDiagLTI",
+    "SSMConfig",
+    "SSMConfigDict",
+    "SSMParametrization",
+    "SSL",
+    "DeepSSM",
+    "PureLRUR",
+    "SimpleRNN",
+    "LRU",
+    "L2RU",
+    "lruz",
+    "L2BoundedLTICell",
+    "Block2x2DenseL2SSM",
+    "DefectL2SSM",
+    "RobustMambaDiagSSM",
+    "RobustMambaDiagLTI",
 ]
