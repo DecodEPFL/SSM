@@ -1,24 +1,37 @@
 """SSM stack, context wrapper, and current/legacy cell families."""
+
 import sys as _sys
 
+from ..utils import runtime as _runtime, scan as _scan
+from . import cells, contextual, layers
+from .cells import common as _common, selective as _selective
+from .cells.legacy import L2RU, L2BoundedLTICell, lruz
+from .cells.lti import LRU, Block2x2DenseL2SSM, DefectL2SSM, defect as _defect
+from .cells.selective import RobustMambaDiagLTI, RobustMambaDiagSSM
 from .config import SSMConfig, SSMConfigDict
-from . import layers, contextual, cells
+from .contextual import ContextualDeepSSM, timewise_matrix_vector_product
 from .layers import SSL, DeepSSM, PureLRUR, SimpleRNN
 from .metric_layers import MetricDeepSSM, MetricSSMConfig
-from .cells.lti import LRU, Block2x2DenseL2SSM, DefectL2SSM, defect as _defect
-from .cells.selective import RobustMambaDiagSSM, RobustMambaDiagLTI
-from .cells.legacy import L2RU, lruz, L2BoundedLTICell
-from .contextual import ContextualDeepSSM, timewise_matrix_vector_product
-from .cells import common as _common, selective as _selective
-from ..utils import runtime as _runtime, scan as _scan
 
 __all__ = [
-    "SSMConfig", "SSMConfigDict", "SSL", "DeepSSM", "MetricDeepSSM", "MetricSSMConfig",
-    "PureLRUR", "SimpleRNN",
-    "LRU", "Block2x2DenseL2SSM", "DefectL2SSM",
-    "RobustMambaDiagSSM", "RobustMambaDiagLTI",
-    "L2RU", "lruz", "L2BoundedLTICell",
-    "ContextualDeepSSM", "timewise_matrix_vector_product",
+    "SSMConfig",
+    "SSMConfigDict",
+    "SSL",
+    "DeepSSM",
+    "MetricDeepSSM",
+    "MetricSSMConfig",
+    "PureLRUR",
+    "SimpleRNN",
+    "LRU",
+    "Block2x2DenseL2SSM",
+    "DefectL2SSM",
+    "RobustMambaDiagSSM",
+    "RobustMambaDiagLTI",
+    "L2RU",
+    "lruz",
+    "L2BoundedLTICell",
+    "ContextualDeepSSM",
+    "timewise_matrix_vector_product",
 ]
 
 # Old imports resolve directly to real modules. Keeping aliases in one place

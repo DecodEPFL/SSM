@@ -1,172 +1,285 @@
-r"""
-Tutorial: context-enriched, L2-stable Performance Boosting (``ContextualDeepSSM``)
-==================================================================================
+"""ContextualDeepSSM, step by step.
 
-One operator, ``ContextualDeepSSM``, maps a reconstructed disturbance ``w_hat``
-and an arbitrary context signal ``z`` to a control correction ``u`` while
-preserving the closed-loop L2 guarantee of the underlying ``DeepSSM`` core:
-
-    u_t = A(w_hat, z)_t  (x)  core([ w_hat_t ; Pi(z)_t ])_t      (gates live inside core)
-          \____ mixer ___/        \core/  \_filter_/
-            Port A                  Port B (additive)     Port C is inside the core blocks
-
-Three ports are toggled independently through ``context_modes``:
-
-  * "mixer" (Port A): a uniformly *bounded* matrix A_t in R^{d_output x d_features}
-    multiplies the core features e_t.  bounded x l2 = l2, unconditionally -- even
-    when z is the system state.  It is a ROUTER: its output is proportional to the
-    disturbance feature e(w_hat), so it vanishes when the disturbance is small.
-
-  * "input" (Port B): context is projected into an l2 sequence Pi(z) and
-    concatenated to the disturbance before the core.  This is the only port that
-    SYNTHESISES control from context alone, so it is the one that helps when the
-    disturbance is small and that makes context-dependent behaviour learnable.
-
-  * "gate" (Port C): per-block sigmoid gates in [0,1] attenuate the SSM/FF
-    branches.  Safe because gates only attenuate the certified branch gains.
-
-Context projections for the "input" path (``context_filter``):
-    finite_horizon  1 on t<T then 0          (loss-free on the horizon)
-    taper           flat then cosine roll-off (smooth finite_horizon)
-    difference      z_t - z_{t-1}            (l2 for switching/BV context; loss-free)
-    exponential     rho**t                   (anytime guarantee)
-    polynomial      (t+1)**-power            (anytime guarantee)
-    none            identity                 (sys-ID / finite-gain; NOT l2)
-
-Routing rule: exogenous context (reference, obstacle position) -> "input";
-endogenous/in-loop context (system state) -> "mixer" (unconditionally safe).
-
-Certificates (need a prescribed ``gamma``):
-    certified_gain_bound()      disturbance->control l2 gain  (core_gain * ||A||_inf)
-    context_offset_bound(amp)   additive context bias term    (inf for difference/none)
-    additive_channel_gain()     context->u gain (small-gain check for endogenous z)
-    gain_diagnostics()          full breakdown
-
-Run ``python Test_files/Tutorial_ContextualSSM.py`` to see all of this in action.
+Start after Tutorial_DeepSSM.py. Each numbered cell introduces one context idea.
+The first example simply passes two short sequences to a model.
+Install once from the project root: python -m pip install -e .
+Run the whole tutorial: python Test_files/Tutorial_ContextualSSM.py
 """
 
-from __future__ import annotations
+# %% 1. Add a context sequence to the ordinary input
+from dataclasses import replace
 
 import torch
+from torch import nn
 
-try:  # runnable whether the package is installed or used from a source checkout
-    from neural_ssm import ContextualDeepSSM
-except ImportError:
-    import os
-    import sys
+from neural_ssm import ContextualDeepSSM, DeepSSM, SSMConfig
 
-    sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-    from src.neural_ssm import ContextualDeepSSM
+# u is the signal to process; z is extra information, such as an operating condition.
+# Both have the same batch and time dimensions. Our context changes halfway through.
+torch.manual_seed(7)
+u = 0.2 * torch.randn(1, 8, 1)
+z = torch.zeros(1, 8, 1)
+z[:, 4:] = 1.0
 
-
-def banner(title: str) -> None:
-    print("\n" + "=" * 72 + f"\n{title}\n" + "=" * 72)
-
-
-def main() -> None:
-    torch.manual_seed(0)
-
-    # --- a tiny synthetic PB scenario --------------------------------------
-    # disturbance w_hat : a short velocity-channel burst on t in [0,5), then
-    #                     silence.  Finitely supported  =>  it is an l2 sequence.
-    # context z         : a piecewise-constant "gate" that switches at t=40 and
-    #                     t=90, i.e. well AFTER the disturbance has died out.
-    B, T, n, q, m = 1, 120, 4, 1, 2          # batch, horizon, dim(w_hat), dim(z), dim(u)
-    w = torch.zeros(B, T, n)
-    w[:, 0:5, 2:] = 0.6 * torch.randn(B, 5, 2)   # burst on the two velocity channels
-    z = torch.zeros(B, T, q)
-    z[:, 40:90] = 1.0
-    z[:, 90:] = -0.5
-    quiet = slice(40, 100)                        # NO disturbance here, but two switches
-
-    # Shared certified L2 core: prescribed gain cap (gamma) + certified
-    # parametrization (defect / l2n / tv / tvc) and a Lipschitz feed-forward.
-    core = dict(param="l2n", ff="MBLIP", gamma=1.0, d_model=24, d_state=24, n_layers=2)
-
-    # =======================================================================
-    banner("Port A -- mixer (a ROUTER): output tracks the disturbance feature")
-    mixer = ContextualDeepSSM(
-        n, q, m, context_modes=("mixer",), d_features=16, mixer_bound=4.0, **core
-    ).eval()
-    with torch.no_grad():
-        u_mix, _ = mixer(w, z, mode="loop")
-    print(f"||u|| during burst  t in [0,5)   : {u_mix[:, 0:5].norm():.4f}")
-    print(f"||u|| at switches   t in [40,100): {u_mix[:, quiet].norm():.4f}   <- decays with w_hat")
-
-    # =======================================================================
-    banner("Port B -- input + difference (a DRIVER): acts on context switches")
-    driver = ContextualDeepSSM(
-        n, q, m, context_modes=("input",), context_filter="difference", **core
-    ).eval()
-    with torch.no_grad():
-        u_drv, _ = driver(w, z, mode="loop")
-    print(f"||u|| during burst  t in [0,5)   : {u_drv[:, 0:5].norm():.4f}")
-    print(f"||u|| at switches   t in [40,100): {u_drv[:, quiet].norm():.4f}   <- driven by the gate")
-
-    # =======================================================================
-    banner("The small-disturbance limit: feed w_hat == 0")
-    zero = torch.zeros_like(w)
-    with torch.no_grad():
-        um, _ = mixer(zero, z, mode="loop")
-        ud, _ = driver(zero, z, mode="loop")
-    print(f"mixer  max|u| with w_hat=0 : {um.abs().max():.3e}   (router is exactly silent)")
-    print(f"driver max|u| with w_hat=0 : {ud.abs().max():.3e}   (driver still acts on context)")
-
-    # =======================================================================
-    banner("Certificates (require a prescribed gamma)")
-    print(f"mixer  certified w->u gain : {mixer.certified_gain_bound().item():.3f}  (= gamma * mixer_bound)")
-    print(f"driver certified w->u gain : {driver.certified_gain_bound().item():.3f}  (= gamma, no mixer)")
-
-    # A finite-horizon driver also yields a finite additive-bias bound.
-    fh = ContextualDeepSSM(
-        n, q, m, context_modes=("input",), context_filter="finite_horizon", horizon=T, **core
-    ).eval()
-    amp = float(z.abs().amax())                   # sup_t ||z_t||
-    with torch.no_grad():
-        u0, _ = fh(zero, z, mode="loop")          # w_hat=0 => output is the pure context drive
-    print(f"finite-horizon offset bound: {fh.context_offset_bound(amp):.3f}")
-    print(f"  realised ||u|| (w_hat=0) : {u0.norm():.3f}   <= offset bound")
-    print(f"difference offset bound    : {driver.context_offset_bound(amp)}   (no fixed l2 window)")
-
-    # =======================================================================
-    banner("Verify the certified bound holds on a NONZERO disturbance")
-    # The guarantee is the affine bound  ||u||_2 <= gain * ||w_hat||_2 + offset.
-    with torch.no_grad():
-        # mixer: no additive context, so offset = 0  =>  ||u|| <= gain * ||w_hat||.
-        u_m, _ = mixer(w, z, mode="loop")
-        g_m = mixer.certified_gain_bound().item()
-        rhs_m = g_m * w.norm().item()
-        assert u_m.norm().item() <= rhs_m + 1e-4
-        print(f"mixer : ||u||={u_m.norm():.3f} <= gain*||w_hat|| "
-              f"= {g_m:.2f}*{w.norm():.3f} = {rhs_m:.3f}   OK")
-
-        # finite-horizon driver: full affine bound with the additive offset.
-        u_f, _ = fh(w, z, mode="loop")
-        g_f = fh.certified_gain_bound().item()
-        off = fh.context_offset_bound(amp)
-        rhs_f = g_f * w.norm().item() + off
-        assert u_f.norm().item() <= rhs_f + 1e-4
-        print(f"driver: ||u||={u_f.norm():.3f} <= gain*||w_hat||+offset "
-              f"= {g_f:.2f}*{w.norm():.3f}+{off:.2f} = {rhs_f:.3f}   OK")
-
-    # =======================================================================
-    banner("Combine all three ports (+ sys-ID note)")
-    full = ContextualDeepSSM(
-        n, q, m,
-        context_modes=("input", "gate", "mixer"),
-        context_filter="taper", horizon=T, context_filter_ramp=20,
-        d_features=16, mixer_bound=4.0, **core,
-    ).eval()
-    with torch.no_grad():
-        u, _, aux = full(w, z, mode="loop", return_aux=True)
-    diag = full.gain_diagnostics()
-    print(f"output {tuple(u.shape)} | mixer A {tuple(aux['mixer'].shape)} | "
-          f"gates/block {len(aux['context_gates'])}")
-    print("diagnostics:", {k: diag[k] for k in
-                           ("context_modes", "matrix_norm_bound", "certified_gain_bound")})
-    print("\nSystem identification / learning: use context_filter='none' "
-          "(finite-gain prior; the output need not vanish).")
+# The "input" port concatenates context to the input features.
+# For this short example, "none" leaves the eight context samples unchanged.
+model = ContextualDeepSSM(
+    d_input=1, d_context=1, d_output=1, context_modes="input", context_filter="none", param="lru"
+)
+y, _ = model(u, z)
+print("Output shape:", y.shape)  # (1, 8, 1)
 
 
-if __name__ == "__main__":
-    main()
+# %% 2. Add a gain bound and keep context only for a finite horizon
+# SSMConfig controls the recurrent core. The wrapper's own arguments control context.
+config = SSMConfig(
+    d_model=4, d_state=8, n_layers=1, param="defect", ff="LGLU2", gamma=1.0,
+    defect_state_metric="full", defect_max_radius=1.0, defect_factor_margin=0.0,
+)
+# Full P belongs to the LTI core and stays fixed during a sequence. The wrapper
+# can still use changing context for its input, gate, and mixer ports below.
+# To use weighted normalization instead, keep these context settings and set:
+# config = replace(config, param="l2n", l2n_state_metric="full")
+windowed = ContextualDeepSSM(
+    1, 1, 1, ssm_config=config, context_modes="input", context_filter="finite_horizon", horizon=6
+)
+windowed.eval()
+with torch.no_grad():
+    y, _, details = windowed(u, z, return_aux=True)
+print("Context after the window:", details["filtered_context"].flatten().tolist())
+# The last two context samples are now zero. The gain applies to the COMBINED
+# input [u, filtered z], so this port can produce output even when u is zero.
+
+
+# %% 3. Let context gate the residual branches
+# A gate changes how strongly each residual branch contributes, with weights in [0,1].
+# This port conditions the model without adding context to the signal input.
+gated = ContextualDeepSSM(1, 1, 1, ssm_config=config, context_modes="gate")
+gated.eval()
+with torch.no_grad():
+    y, _ = gated(u, z)
+    silent, _ = gated(torch.zeros_like(u), z)
+print("Gated output shape:", y.shape)
+torch.testing.assert_close(silent, torch.zeros_like(silent))
+# Even with context present, zero input gives zero output from zero initial state.
+# Add gate_per_channel=True if each feature should have its own gate.
+
+
+# %% 4. Let context mix the output features
+# The core produces four features. A context-dependent matrix maps them to one output.
+# mixer_bound caps the matrix norm, so the final gain is at most 0.8 times the core gain.
+mixed = ContextualDeepSSM(
+    1, 1, 1, ssm_config=config, context_modes="mixer", d_features=4, mixer_bound=0.8
+)
+mixed.eval()
+with torch.no_grad():
+    y, _, details = mixed(u, z, return_aux=True)
+print("Mixer shape:", details["mixer"].shape)  # (1, 8, 1, 4): one matrix per sample
+print("Final gain bound:", mixed.certified_gain_bound().item())
+# By default, the mixer sees both u and z. mixer_include_disturbance=False
+# restricts its conditioning to context alone, as in the next combined example.
+
+
+# %% 5. Let context select the recurrent dynamics
+# TV/TVC can change their matrices at every sample. The wrapper supplies z to the selector.
+# select_input="context" means the matrices are scheduled using z alone.
+selected = ContextualDeepSSM(
+    1, 1, 1, context_modes="select", ssm_config=replace(config, param="tv", select_input="context")
+)
+selected.eval()
+with torch.no_grad():
+    y, _ = selected(u, z)
+print("Selected output shape:", y.shape)
+print("Incremental gain:", selected.incremental_gain_bound().item())
+# This also bounds output DIFFERENCES for two inputs sharing the same context
+# sequence and initial state. Use the same exogenous context for that comparison.
+
+
+# %% 6. Combine ports after understanding them individually
+# This model selects dynamics, gates residuals, and mixes output features.
+# Every scheduling pathway sees context alone, preserving the incremental certificate.
+scheduled = ContextualDeepSSM(
+    1,
+    1,
+    1,
+    context_modes=("select", "gate", "mixer"),
+    ssm_config=replace(config, param="tv", select_input="context"),
+    gate_include_disturbance=False,
+    mixer_include_disturbance=False,
+    d_features=4,
+    mixer_bound=0.8,
+)
+with torch.no_grad():
+    y, _ = scheduled(u, z)
+print("Combined incremental gain:", scheduled.incremental_gain_bound().item())
+# Adding an "input" port is also supported; its context contribution is then part
+# of the input energy, and the wrapper no longer reports this incremental certificate.
+
+# To use all four ports, also supply the context's input window.
+combined = ContextualDeepSSM(
+    1,
+    1,
+    1,
+    context_modes=("input", "select", "gate", "mixer"),
+    ssm_config=replace(config, param="tv", select_input="context"),
+    context_filter="finite_horizon",
+    horizon=8,
+    d_features=4,
+    mixer_bound=0.8,
+)
+combined_y, _ = combined(u, z)
+print("All four ports:", combined_y.shape)
+
+
+# %% 7. Stream a windowed model in two chunks
+# Reuse windowed from step 2. time_offset is the number of samples already processed.
+# Advancing this clock keeps the six-sample window aligned across chunks.
+with torch.no_grad():
+    full, _ = windowed(u, z)
+    first, state = windowed(u[:, :4], z[:, :4], detach_state=True)
+    second, _ = windowed(u[:, 4:], z[:, 4:], state=state, time_offset=4, detach_state=True)
+torch.testing.assert_close(torch.cat((first, second), dim=1), full)
+print("Windowed streaming matches the full sequence.")
+
+
+# %% 8. Use changes in context, then carry a change across a chunk boundary
+# Difference filtering uses z[t] - z[t-1]. The first increment is zero by default.
+# Here the context changes once, so only the fifth sample has a nonzero increment.
+differenced = ContextualDeepSSM(
+    1, 1, 1, ssm_config=config, context_modes="input", context_filter="difference"
+)
+differenced.eval()
+with torch.no_grad():
+    full, _, details = differenced(u, z, return_aux=True)
+print("Context increments:", details["filtered_context"].flatten().tolist())
+# For an ongoing context sequence, the increments need finite energy for the gain
+# statement to give a finite budget; differencing does not ensure that automatically.
+
+# The second chunk needs the last RAW context sample from the first chunk.
+with torch.no_grad():
+    first, state = differenced(u[:, :4], z[:, :4], detach_state=True)
+    second, _ = differenced(
+        u[:, 4:],
+        z[:, 4:],
+        state=state,
+        time_offset=4,
+        previous_context=z[:, 3:4],
+        detach_state=True,
+    )
+torch.testing.assert_close(torch.cat((first, second), dim=1), full)
+print("Differenced streaming keeps the change at the chunk boundary.")
+
+
+# %% 9. Encode a context with more raw features
+# Suppose each raw context sample has three features. A learned linear map reduces
+# them to one context feature. d_context is the width AFTER this encoding.
+raw_z = torch.cat((z, z.sin(), z.cos()), dim=-1)  # (1, 8, 3)
+encoded = ContextualDeepSSM(
+    1,
+    1,
+    1,
+    ssm_config=config,
+    context_modes="input",
+    context_filter="difference",
+    context_encoder=nn.Linear(3, 1),
+)
+encoded.eval()
+with torch.no_grad():
+    y, _ = encoded(u, raw_z)
+print("Encoded-context output shape:", y.shape)
+# When streaming this model, previous_context must also be a RAW sample of width 3.
+# The wrapper applies the same encoder before computing the increment.
+
+
+# %% 10. Try a different context window
+# Finite horizon and difference were shown above. A taper fades out smoothly
+# during its final context_filter_ramp samples, instead of cutting off abruptly.
+tapered = ContextualDeepSSM(
+    1,
+    1,
+    1,
+    ssm_config=config,
+    context_modes="input",
+    context_filter="taper",
+    horizon=8,
+    context_filter_ramp=3,
+)
+tapered_y, _ = tapered(u, z)
+
+# Exponential weighting uses decay**t; polynomial weighting uses (1+t)**(-power).
+# These windows give bounded context finite energy; polynomial power must exceed 0.5.
+exponential = ContextualDeepSSM(
+    1,
+    1,
+    1,
+    ssm_config=config,
+    context_modes="input",
+    context_filter="exponential",
+    context_filter_decay=0.9,
+)
+exponential_y, _ = exponential(u, z)
+polynomial = ContextualDeepSSM(
+    1,
+    1,
+    1,
+    ssm_config=config,
+    context_modes="input",
+    context_filter="polynomial",
+    context_filter_power=1.0,
+)
+polynomial_y, _ = polynomial(u, z)
+print("Window output shapes:", tapered_y.shape, exponential_y.shape, polynomial_y.shape)
+# trainable_context_filter=True makes exponential decay or polynomial power trainable.
+# "auto" chooses a finite horizon if horizon is supplied, otherwise exponential decay.
+
+
+# %% 11. Advanced: supply your own context window
+# A custom filter receives the context tensor. Accept time_offset so streaming
+# uses the same absolute clock as a full-sequence call.
+def custom_window(context, *, time_offset=0):
+    steps = torch.arange(time_offset, time_offset + context.shape[1], device=context.device)
+    return context / (1 + steps).reshape(1, -1, 1)
+
+
+custom = ContextualDeepSSM(
+    1, 1, 1, ssm_config=config, context_modes="input", context_filter=custom_window
+)
+custom_y, _ = custom(u, z)
+print("Custom-window output shape:", custom_y.shape)
+# The core gain still applies to [u, custom_window(z)]. For a custom window,
+# the wrapper cannot infer a uniform context-energy bound on your behalf.
+
+
+# %% 12. Advanced: pass context directly to DeepSSM's selector
+# Use this when only the selective cells need context. Specify its width explicitly.
+direct_config = replace(config, param="tv", select_context_dim=1, select_input="context")
+direct = DeepSSM(1, 1, config=direct_config)
+direct_y, _ = direct(u, select_context=z)
+print("Direct selector output shape:", direct_y.shape)
+
+# "both" lets the selector see the input AND context. Here we also try the TVC cell.
+# The zero-state gain remains certified, but the incremental bound is not guaranteed:
+# different inputs can select different matrices, even with the same context.
+input_selected = ContextualDeepSSM(
+    1,
+    1,
+    1,
+    context_modes="select",
+    ssm_config=replace(config, param="tvc", select_input="both", bcd_nonlinearity="tanh"),
+)
+input_selected_y, _ = input_selected(u, z)
+print("Input-dependent selector's incremental bound:", input_selected.incremental_gain_bound())
+
+
+# %% 13. Train the context encoder together with the recurrent core
+# model.parameters() includes the encoder and every enabled context pathway.
+# This is one ordinary training update; repeat these lines for a longer experiment.
+encoded.train()
+optimizer = torch.optim.Adam(encoded.parameters(), lr=3e-3)
+optimizer.zero_grad(set_to_none=True)
+prediction, _ = encoded(u, raw_z)
+target = 0.2 * u + 0.1 * z
+loss = (prediction - target).square().mean()
+loss.backward()
+optimizer.step()
+print("Context-model training loss:", loss.item())

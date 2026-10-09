@@ -87,8 +87,13 @@ line-length = 100
 target-version = "py39"
 src = ["src", "tests", "Test_files"]
 extend-exclude = ["build", "dist", ".venv", ".mypy_cache", ".ruff_cache"]
+
+[tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
 ignore = []
+
+[tool.ruff.lint.isort]
+combine-as-imports = true
 
 [tool.mypy]
 python_version = "3.9"

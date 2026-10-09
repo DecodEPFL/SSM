@@ -62,6 +62,16 @@ python -m pip install -e ".[dev,experiments]"
 python -m pytest
 ```
 
+Start with the [step-by-step SSM tutorial](docs/ssm_tutorial.md). The runnable
+lessons begin with a tiny model and introduce training, streaming, model choices,
+context, and metric stacks in numbered cells. Read and run them from top to bottom:
+
+```bash
+python Test_files/Tutorial_DeepSSM.py
+python Test_files/Tutorial_ContextualSSM.py
+python Test_files/Tutorial_MetricDeepSSM.py
+```
+
 For CUDA, install the PyTorch build appropriate for the target CUDA runtime
 before installing this project. The package does not install a CUDA runtime on
 its own.
@@ -92,15 +102,18 @@ print(y.shape)         # torch.Size([8, 256, 2])
 print(model.certified_gain_bound())
 ```
 
-For streaming inference, retain the returned state and disable the reset:
+For streaming inference, retain the returned state. Explicit state takes
+precedence over the reset setting:
 
 ```python
-y_1, state = model(u[:, :128], mode="scan")
-y_2, state = model(u[:, 128:], state=state, mode="scan", reset_state=False)
+model.eval()
+with torch.no_grad():
+    y_1, state = model(u[:, :128], mode="scan", detach_state=True)
+    y_2, state = model(u[:, 128:], state=state, mode="scan", detach_state=True)
 ```
 
-Use `detach_state=False` only when intentionally backpropagating through
-multiple calls (cross-call BPTT).
+Use `detach_state=False` to backpropagate through multiple calls. It is the
+`DeepSSM` default; set it to `True` for inference or truncated backpropagation.
 
 ## Choose a recurrent core
 
@@ -115,9 +128,10 @@ multiple calls (cross-call BPTT).
 | `zak` (legacy) | constrained complex LTI recurrence (`lruz`) | yes | `scan` or `loop` |
 | `l2nt` (legacy) | dense L2-bounded LTI recurrence | yes | `loop` |
 
-`l2n` uses 2×2 state blocks, so `d_state` must be even. The benchmark harness
-selects the fastest supported mode by default: convolution for `lru`/`l2n` and
-parallel scan for the other current SSMs. Legacy `l2ru`, `zak`, and `l2nt` remain
+Identity-metric `l2n` uses rotation pairs and needs even `d_state`; full-metric
+`l2n` uses general real 2×2 blocks and permits a final scalar for odd sizes.
+The benchmark harness defaults to convolution for `lru` and identity `l2n`,
+and parallel scan for full `l2n` and the other current SSMs. Legacy `l2ru`, `zak`, and `l2nt` remain
 wired for existing experiments and checkpoints; their implementations live in
 `ssm/cells/legacy/`. The UI and command-line listing mark them as legacy.
 
@@ -125,7 +139,7 @@ wired for existing experiments and checkpoints; their implementations live in
 
 Set `gamma` to request a global certificate. This requires a certified
 recurrent core (`defect`, `l2n`, `tv`, or `tvc`; the legacy certified cells also work) and a
-feed-forward layer with a declared global bound: `LGLU2`, `BLGLU2`, `MBLIP`, or
+feed-forward layer with a declared global bound: `LGLU2`, `BLGLU2`/`BudgetedLGLU2`, `MBLIP`, or
 `TLIP`. Keep `learn_x0=False`: a learned nonzero initial state needs a separate
 storage-energy term and is not covered by the pure induced-gain statement.
 
@@ -201,7 +215,7 @@ filter choices and the corresponding gain diagnostics.
 Choose `param="defect"` for the new structured contraction parametrization:
 
 ```python
-model = DeepSSM(3, 2, d_model=16, d_state=64, param="defect", gamma=1.0)
+model = DeepSSM(3, 2, d_model=16, d_state=64, param="defect", ff="LGLU2", gamma=1.0)
 y, states = model(u, mode="scan")
 ```
 
@@ -212,9 +226,49 @@ full state dimension) to trade computation for more within-block interactions.
 The existing `l2n` option is retained for comparison. Only `loop` and `scan`
 execution are supported for the new cell.
 
+For generic full LTI input/output expressivity at a prescribed gain, keep the
+small state blocks and let their storage certificate be dense:
+
+```python
+model = DeepSSM(
+    3, 2, d_model=16, d_state=64, param="defect", ff="LGLU2", gamma=1.0,
+    defect_state_metric="full", defect_max_radius=1.0, defect_factor_margin=0.0,
+)
+y, states = model(u, mode="scan")
+```
+
+The full metric adds dense setup work, while retaining the thin input/output
+factors and block scan. State energies use `x.T @ P @ x`; the stack handles
+this through `storage_value()`. Identity storage remains the default for
+existing models and checkpoints. Full storage supports blocks up to size four,
+including an odd state size with a final scalar when `block_size=2`.
+The completeness claim concerns the LTI core, excludes exact larger Jordan
+chains, and assumes strict gain below the bound. See the step-by-step examples
+in [the tutorial](docs/ssm_tutorial.md).
+
 See [the construction, configuration, and tests](docs/defect_parametrization.md).
+For normalization with the same generic LTI expressivity, enable full storage
+inside L2N's norm calculation:
+
+```python
+model = DeepSSM(
+    3, 2, d_model=16, d_state=64, param="l2n", ff="LGLU2", gamma=1.0,
+    l2n_state_metric="full",
+)
+y, states = model(u, mode="scan")
+```
+
+The cell learns `P=L.T @ L`, computes the weighted system norm using
+`L @ A @ L^-1`, then divides the original `A,B,C,D` by one scalar. The
+recurrence keeps its block structure. This adds dense setup and backward work;
+it uses the real scan rather than the identity model's rotation convolution.
+Use `state_metric="full"` on a standalone `Block2x2DenseL2SSM` or
+`MetricDeepSSM`, and `l2n_state_metric="full"` in `SSMConfig` or `DeepSSM`.
+Identity mode remains the default and retains old checkpoint compatibility.
+
 Run `python scripts/compare_defect_vs_normalization.py` for a reproducible
-timing, memory-storage, and synthetic-learning comparison.
+four-way comparison. Add `--l2n-state-metric full --defect-state-metric full`
+to compare only the two full-metric constructions.
 
 ## Additional recurrent model
 
@@ -260,7 +314,7 @@ because their cuDNN/eager paths are the better default.
 
 ```bash
 python Test_files/Tutorial_DeepSSM.py
-python Test_files/Tutorial_MetricDeepSSM.py --core both
+python Test_files/Tutorial_MetricDeepSSM.py
 python Test_files/Tutorial_ContextualSSM.py
 ```
 
