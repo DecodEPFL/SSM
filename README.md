@@ -1,43 +1,19 @@
 # neural-ssm
 
-**Robust neural state-space models in PyTorch.** `neural-ssm` combines recurrent
-state-space layers, bounded nonlinearities, and optional context-aware routing to
-build sequence models with an explicit zero-state input/output `L2`-gain bound.
+**Train state-space sequence models with PyTorch, with optional guarantees on their input/output gain.**
 
-It is useful when a model must be both expressive and well behaved: nonlinear
-system identification, disturbance-to-control maps, streaming sequence models,
-and robustness experiments.
+Use `neural-ssm` for nonlinear system identification, streaming predictions, and
+learning models for control. Start with a small recurrent model, train it with
+ordinary PyTorch operations, then add a gain bound or context when you need it.
 
-![DeepSSM architecture: encoder, repeated state-space blocks, decoder](docs/figures/l2_deepssm.svg)
-
-## At a glance
-
-| You need | Use |
-| --- | --- |
-| A standard stable LTI baseline | `DeepSSM(..., param="lru")` |
-| A deep model with a prescribed `L2` certificate | A certified `param`, a bounded `ff`, and `gamma=...` |
-| Selective, input-dependent dynamics | `param="tv"` or `"tvc"` |
-| Safe conditioning on context | `ContextualDeepSSM` with `input`, `gate`, `mixer`, and/or `select` ports |
-| System-ID comparisons and visual reports | `Test_files/run_benchmarks.py` |
-| CUDA throughput | parallel scan/FFT modes, CUDA graphs, and `torch.compile` |
-
-## Model flow
-
-```mermaid
-flowchart LR
-    U["input sequence u"] --> E["encoder"] --> B["stack of SSL blocks"] --> D["decoder"] --> Y["output sequence y"]
-    B --- R["recurrent SSM\n+plus bounded feed-forward branch"]
-    C["optional context z"] --> P["input / gate / mixer / select ports"]
-    P --> B
-```
-
-An `SSL` block has separate residual temporal and channel-mixing branches. With
-a certified recurrent cell, a bounded feed-forward layer, and a prescribed
-`gamma`, the stack reports a conservative zero-state `L2` gain bound.
+[First model](#your-first-model) · [Gain bounds](#add-a-gain-bound) ·
+[Model choices](#choose-a-recurrent-core) · [Metrics](#learn-metrics-for-the-whole-stack) ·
+[Context](#add-context) · [Tutorials](#continue-with-the-tutorials)
 
 ## Install
 
 The core package requires Python 3.9+ and PyTorch 2.2+.
+From a terminal:
 
 ```bash
 git clone https://github.com/DecodEPFL/SSM.git
@@ -48,334 +24,401 @@ python -m pip install --upgrade pip
 python -m pip install -e .
 ```
 
-For the tutorials, plotting utilities, and nonlinear system-identification
-benchmark harness, install the experiment extra:
+Run the examples below in Python. They use small synthetic sequences and require
+no dataset download. For the plotting and benchmark tools, also install:
 
 ```bash
 python -m pip install -e ".[experiments]"
 ```
 
-For development and the automated tests:
+For CUDA, install the PyTorch build matching your machine before installing the
+package. The project does not install a CUDA runtime itself.
+
+## Your first model
+
+Follow these steps in order, in the same Python session.
+
+### 1. Create a short sequence
+
+```python
+import torch
+from neural_ssm import DeepSSM
+
+u = torch.randn(1, 8, 1)  # one sequence, eight time steps, one input feature
+```
+
+Every sequence uses the shape **`(batch, time, features)`**. For example,
+`(4, 100, 3)` means four independent sequences, each with 100 samples and three
+input features.
+
+### 2. Build a model and obtain predictions
+
+```python
+model = DeepSSM(
+    d_input=1, d_output=1, param="lru",
+    d_model=4, d_state=8, n_layers=1,
+)
+y, state = model(u)
+print(y.shape)  # torch.Size([1, 8, 1]): one prediction per time step
+```
+
+This is a stable LRU recurrent baseline. Its weights are trainable; it does not
+have a prescribed whole-model gain bound.
+
+| Setting | Meaning in this example |
+| --- | --- |
+| `d_input=1`, `d_output=1` | One input and one output value per sample |
+| `d_model=4` | Four features inside the network |
+| `d_state=8` | Eight memory coordinates in each recurrent layer |
+| `n_layers=1` | One recurrent block |
+
+`state` contains one final memory tensor per layer. Here, `state[0]` has shape
+`(1, 8)`. LRU memory is complex-valued; pass the returned tensor back unchanged.
+
+### 3. Train with a familiar PyTorch loop
+
+For a tiny example, ask the model to predict `0.3` times its input:
+
+```python
+target = 0.3 * u  # replace this with your measured output sequence
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-2)
+model.train()
+
+for step in range(20):
+    optimizer.zero_grad(set_to_none=True)  # clear previous gradients
+    prediction, _ = model(u)              # start a fresh sequence
+    loss = (prediction - target).square().mean()
+    loss.backward()                       # differentiate through the sequence
+    optimizer.step()                      # update the weights
+```
+
+With your own data, supply input and target tensors with matching batch and time
+axes. The target's last dimension is `d_output`.
+
+### 4. Continue a sequence across calls
+
+Pass the first chunk's final state into the second chunk:
+
+```python
+model.eval()  # disable training-time dropout
+with torch.no_grad():
+    first, state = model(u[:, :4], detach_state=True)
+    second, state = model(u[:, 4:], state=state, detach_state=True)
+y_streamed = torch.cat((first, second), dim=1)
+```
+
+This produces the same predictions as processing the complete sequence, up to
+floating-point differences. An explicit `state` continues from that memory;
+without it, a call starts a fresh trajectory by default.
+
+For training across chunks, keep `detach_state=False` (the default). Use `True`
+at a truncated-backpropagation boundary to discard the preceding gradient
+history. `reset_state=False` instead continues from the model's stored internal
+state; `model.reset()` clears that state.
+
+## Add a gain bound
+
+Keep the same dimensions, and choose a certified recurrent core and bounded
+feedforward branch:
+
+```python
+bounded = DeepSSM(
+    1, 1, d_model=4, d_state=8, n_layers=1,
+    param="defect", ff="LGLU2", gamma=1.0,
+)
+y, state = bounded(u)
+print(bounded.certified_gain_bound().item())  # at most the requested gamma
+```
+
+`gamma=1.0` means that, **starting from zero state**, the output sequence's
+squared energy cannot exceed the input sequence's squared energy. More generally:
+
+$$
+\sum_t \|y_t\|^2 \leq \gamma^2 \sum_t \|u_t\|^2.
+$$
+
+This is an upper bound enforced by the parametrization throughout training.
+It is not an estimate from sampled inputs, and the model's actual gain can be
+smaller. It bounds the full sequence, rather than each output sample separately.
+
+Use a certified core from the table below and one of `LGLU2`, `BLGLU2`
+(`BudgetedLGLU2` is an alias), `MBLIP`, or `TLIP` for `ff`. Ordinary `MLP`/`GLU`
+and the historical `LGLU`/`LMLP` choices require `gamma=None`. Keep
+`learn_x0=False` for the zero-state statement; a nonzero initial state needs an
+additional storage-energy term, available through `storage_value(state)`.
+
+A zero-state gain bound and an incremental bound are different guarantees:
+the latter controls differences between two input/output trajectories.
+`MetricDeepSSM` below provides an incremental certificate. Input-dependent
+selective cells do not automatically provide that stronger guarantee.
+
+## Choose a recurrent core
+
+Each `DeepSSM` block combines a recurrence that carries memory with a feedforward
+branch that mixes features at each time step. `param` selects the recurrence;
+`ff` selects the feedforward. LTI cores keep their matrices fixed over time;
+selective cores can change their matrices at each sample.
+
+The following modes apply to `DeepSSM`:
+
+| `param` | What it provides | Execution modes |
+| --- | --- | --- |
+| `lru` | Stable complex diagonal LTI baseline; use `gamma=None` | `scan`, `conv`, `loop` |
+| `defect` | Certified real-block LTI core using thin defect completion | `scan`, `loop` |
+| `l2n` | Certified LTI core using full-system norm normalization | `scan`, `loop`; `conv` with identity storage only |
+| `tv` | Certified selective diagonal dynamics depending on input/context | `scan`, `loop` |
+| `tvc` | Selective dynamics with an additional direct input/output term | `scan`, `loop` |
+| `l2ru`, `zak` | Legacy certified LTI constructions | `scan`, `loop` |
+| `l2nt` | Legacy dense normalized LTI construction | `loop` |
+
+`scan` evaluates the recurrence in parallel over time. `loop` is the sequential
+reference. Where supported, `conv` evaluates the LTI response using FFT
+convolution. Compare supported modes on your sequence sizes and device.
+
+To reuse settings across models, collect them in a configuration:
+
+```python
+from dataclasses import replace
+from neural_ssm import SSMConfig
+
+config = SSMConfig(d_model=4, d_state=8, n_layers=1,
+                   param="defect", ff="LGLU2", gamma=1.0)
+normalized = DeepSSM(1, 1, config=replace(config, param="l2n"))
+selective = DeepSSM(1, 1, config=replace(config, param="tv"))
+```
+
+When you pass `config`, it supplies the model settings; make changes in the
+configuration itself. `gamma` is the fixed whole-stack target. `train_gamma`
+controls the cells' internal gain parameters, and `train_ff_lip` controls the
+feedforward gain parameters.
+
+### Allow dense state storage while keeping block scan
+
+The state metric $P$ measures energy in the recurrent memory. Both `defect`
+and `l2n` support a full, learned $P$ without making their recurrence matrix
+$A$ dense:
+
+```python
+full_l2n = DeepSSM(1, 1, config=replace(config,
+    param="l2n", l2n_state_metric="full"))
+full_defect = DeepSSM(1, 1, config=replace(config,
+    defect_state_metric="full", defect_max_radius=1.0, defect_factor_margin=0.0))
+```
+
+Identity storage is the default and has cheaper matrix preparation. Full storage
+allows the small blocks to share a dense certificate, covering generic strictly
+gain-bounded LTI input/output maps. This statement concerns the **LTI core**;
+it does not claim completeness of the nonlinear network. Exact larger Jordan
+chains may require larger blocks. The defect settings above remove fixed pole
+and contraction margins from that construction.
+
+Identity L2N uses rotation pairs and requires even `d_state`. Full L2N uses
+general real 2×2 blocks and accepts an odd state size with a final scalar; use
+`scan` or `loop`. Defect's default block size is two. Its full storage supports
+block sizes one through four, with a final scalar for odd sizes when the block
+size is two. Larger identity-storage blocks are also available through
+`defect_block_size`.
+
+Full storage adds dense preparation and backward work; the small-block recurrence
+stays fast. See the [defect construction](docs/defect_parametrization.md) and
+[measured full-metric comparison](docs/benchmarks/l2n_full_metric_cpu_2026-10-09.md)
+for the details and computational tradeoffs.
+
+## Learn metrics for the whole stack
+
+`MetricDeepSSM` learns feature-energy metrics $Q$ shared between neighbouring
+layers. This can reduce the conservatism of multiplying separate scalar layer
+bounds, and gives a prescribed **incremental** gain for the complete sequence
+map. Here, `gamma=1.0` bounds output differences by input differences when the
+two executions start from equal states.
+
+```python
+from neural_ssm import MetricDeepSSM
+
+metric = MetricDeepSSM(
+    1, 1, d_model=4, d_state=8, n_layers=2,
+    param="defect", gamma=1.0, state_metric="full",
+)
+y = metric(u, return_state=False)  # predictions only
+```
+
+This is a separate architecture: an LTI core, an activation, and an optional
+coupled residual feedforward in each layer. Built-in cores are `defect` and
+`l2n`; `ff` is `residual` (the default) or `none`. Activations are `tanh` (the
+default), `relu`, `arctan`, and `identity`. Execution modes are `scan` and `loop`.
+Use `MetricSSMConfig` when collecting these settings in a configuration.
+
+The feature metric $Q$ and state metric $P$ have different jobs. Feature
+metrics are learned by this stack; `state_metric="full"` additionally enables
+dense state storage inside either LTI core. A tighter certificate does not
+promise an exact gain calculation or better prediction accuracy.
+
+State returns differ from the ordinary stack:
+
+| Call | Return |
+| --- | --- |
+| `model(u)` or `controller(u, z)` | `(y, final_states)` |
+| `metric(u)` | `(y, state_trajectories)`, including the initial state |
+| `metric(u, return_state=False)` | `y` |
+| `metric(u, return_state=False, return_last=True)` | `(y, final_states)` for streaming |
+
+For streaming a metric model, pass those final states into the next call with
+`state=final_states`; the same `detach_state` choices apply. Keep certificate
+parameters in float32 or float64. Read the
+[metric tutorial](Test_files/Tutorial_MetricDeepSSM.py) for a gradual introduction,
+or the [architecture guide](docs/metric_transfer_ssm.md) for the equations.
+
+## Add context
+
+Context is a second sequence, such as an operating condition or reference.
+Start by adding it as an extra input feature:
+
+```python
+from neural_ssm import ContextualDeepSSM
+
+z = torch.ones(1, 8, 1)  # same batch and time axes as u
+controller = ContextualDeepSSM(
+    1, 1, 1, ssm_config=config,
+    context_modes="input", context_filter="none",
+)
+y, state = controller(u, z)
+```
+
+The positional dimensions are `d_input`, `d_context`, and `d_output`. Here,
+`"none"` leaves context unchanged. With the `input` port, the gain certificate
+applies to the **combined input** `[u, filtered_context]`; context contributes
+its own energy and may produce output even when `u` is zero.
+
+Introduce the other ports one at a time, then combine them using a tuple such
+as `context_modes=("gate", "select")`:
+
+| Port | What context changes |
+| --- | --- |
+| `input` | Adds filtered context to the input features |
+| `gate` | Attenuates residual branches with gates in `[0, 1]` |
+| `mixer` | Applies a context-dependent output matrix with a fixed norm cap |
+| `select` | Schedules the recurrent dynamics; requires `tv` or `tvc` |
+
+The [context tutorial](Test_files/Tutorial_ContextualSSM.py) covers these ports,
+finite/decaying windows, difference filtering, context encoders, and streaming.
+For chunked filtering, `time_offset` counts samples already processed;
+difference filtering also needs the previous raw context sample via
+`previous_context`.
+
+A fixed-context incremental certificate needs `select_input="context"`,
+context-only gates/mixing (`gate_include_disturbance=False`,
+`mixer_include_disturbance=False`), and no additive `input` port. Both runs must
+use the same exogenous context and initial state. Check
+`controller.incremental_gain_bound()` for this guarantee and
+`controller.gain_diagnostics()` for the zero-state certificate and filter details.
+These diagnostics do not establish stability of an arbitrary feedback loop.
+
+## Run efficiently
+
+Move the model and its inputs to the same device. For inference, combine
+`eval()` with disabled gradients to reuse prepared matrices safely:
+
+```python
+model.eval()
+with torch.inference_mode():
+    y, state = model(u)
+```
+
+Training and evaluation with gradients rebuild the required computation graph.
+Caches are invalidated after parameter updates, checkpoint loads, or dtype/device
+changes; see [parameter caching](docs/parameter_cache.md).
+
+`torch.compile(model)` is optional and has a warm-up cost. Keep shapes stable
+and measure it on your hardware. Compile regression tests cover the main stacks;
+they do not guarantee a speedup with every backend. For fixed-shape CUDA
+selective scans, set `use_cuda_graph=True` in `SSMConfig`. `REN` remains eager.
+
+## Continue with the tutorials
+
+The lessons start with small examples and add one concept at a time. Each uses
+numbered `# %%` cells, which supporting editors can run individually.
+
+| Start here | What you will learn |
+| --- | --- |
+| [DeepSSM tutorial](Test_files/Tutorial_DeepSSM.py) | Construction, training, streaming, current/legacy cores, and feedforward choices |
+| [Context tutorial](Test_files/Tutorial_ContextualSSM.py) | Each context port separately, filters, streaming, and combinations |
+| [Metric tutorial](Test_files/Tutorial_MetricDeepSSM.py) | Shared metrics, state returns, training, and energy checks |
+
+Run a complete lesson from the repository root:
+
+```bash
+python Test_files/Tutorial_DeepSSM.py
+python Test_files/Tutorial_ContextualSSM.py
+python Test_files/Tutorial_MetricDeepSSM.py
+```
+
+The [written walkthrough](docs/ssm_tutorial.md) follows the same progression.
+
+## Run experiments
+
+With the `experiments` extra installed, discover available datasets and models:
+
+```bash
+python Test_files/run_benchmarks.py --list
+```
+
+Then run a short CPU comparison on the Cascaded Tanks benchmark:
+
+```bash
+python Test_files/run_benchmarks.py \
+  --benchmarks Cascaded_Tanks --models defect l2n metric_defect metric_l2n \
+  --device cpu --epochs 10
+```
+
+The runner downloads the selected benchmark data, evaluates the official
+validation split, and saves figures and reports under `Test_files/benchmark_runs/`.
+Use `--device cuda` on a CUDA machine. `--mode auto` selects convolution for LRU
+and identity L2N, and scan for the other current SSMs. Add
+`--l2n-state-metric full --defect-state-metric full` to enable dense storage in
+both ordinary and metric models. `--metric-ff` controls the metric stack's
+feedforward independently of `--ff`.
+
+For a desktop form, run `python Test_files/benchmark_ui.py` (requires Tk support).
+For a synthetic four-way timing comparison of identity/full L2N and defect,
+run `python scripts/compare_defect_vs_normalization.py`. Add
+`--l2n-state-metric full --defect-state-metric full` to compare only full storage.
+The retained [L2RU/ZAK comparison](scripts/compare_l2ru_vs_zak.py) covers legacy
+constructions.
+
+## Package map and development
+
+```text
+src/neural_ssm/
+├── ssm/
+│   ├── config.py, registry.py   shared settings and model construction
+│   ├── layers.py               DeepSSM and residual blocks
+│   ├── metric_layers.py        MetricDeepSSM and its feature metrics
+│   ├── contextual.py           context ports and filters
+│   └── cells/                  lti/, selective/, legacy/
+├── static_layers/              ordinary and bounded feedforward layers
+├── rens/ren.py                 robust acyclic recurrent equilibrium network
+└── utils/                      scan, Lyapunov, state, and cache helpers
+```
+
+Public imports include `DeepSSM`, `SSMConfig`, `MetricDeepSSM`, `MetricSSMConfig`,
+`ContextualDeepSSM`, and `REN`. Standalone cells are also exported from
+`neural_ssm`; see the [package guide](docs/package_structure.md) for canonical
+imports, compatibility aliases, and adding a cell.
+
+For development:
 
 ```bash
 python -m pip install -e ".[dev,experiments]"
 python -m pytest
 ```
 
-Start with the [step-by-step SSM tutorial](docs/ssm_tutorial.md). The runnable
-lessons begin with a tiny model and introduce training, streaming, model choices,
-context, and metric stacks in numbered cells. Read and run them from top to bottom:
-
-```bash
-python Test_files/Tutorial_DeepSSM.py
-python Test_files/Tutorial_ContextualSSM.py
-python Test_files/Tutorial_MetricDeepSSM.py
-```
-
-For CUDA, install the PyTorch build appropriate for the target CUDA runtime
-before installing this project. The package does not install a CUDA runtime on
-its own.
-
-## Quick start
-
-`DeepSSM` consumes a tensor shaped `(batch, time, features)` and returns an
-output sequence plus one final state per SSM block.
-
-```python
-import torch
-from neural_ssm import DeepSSM
-
-model = DeepSSM(
-    d_input=3,
-    d_output=2,
-    d_model=32,
-    d_state=32,
-    n_layers=2,
-    param="tv",       # selective, L2-bounded recurrent cell
-    ff="MBLIP",       # bounded feed-forward branch
-    gamma=1.5,         # prescribed zero-state L2-gain bound
-)
-
-u = torch.randn(8, 256, 3)
-y, state = model(u, mode="scan")
-print(y.shape)         # torch.Size([8, 256, 2])
-print(model.certified_gain_bound())
-```
-
-For streaming inference, retain the returned state. Explicit state takes
-precedence over the reset setting:
-
-```python
-model.eval()
-with torch.no_grad():
-    y_1, state = model(u[:, :128], mode="scan", detach_state=True)
-    y_2, state = model(u[:, 128:], state=state, mode="scan", detach_state=True)
-```
-
-Use `detach_state=False` to backpropagate through multiple calls. It is the
-`DeepSSM` default; set it to `True` for inference or truncated backpropagation.
-
-## Choose a recurrent core
-
-| `param` | Core | Certificate | Best execution mode |
-| --- | --- | --- | --- |
-| `lru` | complex diagonal stable LTI recurrence | stable, but no global DeepSSM bound | `scan` or `conv` |
-| `defect` | defect completion with general real blocks | yes | `scan` or `loop` |
-| `l2n` | 2×2-block L2-bounded LTI recurrence | yes | `scan` or `conv` |
-| `tv` | selective diagonal SSM | yes | `scan` |
-| `tvc` | selective diagonal SSM with direct term | yes | `scan` |
-| `l2ru` (legacy) | free L2-bounded LTI recurrence | yes | `scan` or `loop` |
-| `zak` (legacy) | constrained complex LTI recurrence (`lruz`) | yes | `scan` or `loop` |
-| `l2nt` (legacy) | dense L2-bounded LTI recurrence | yes | `loop` |
-
-Identity-metric `l2n` uses rotation pairs and needs even `d_state`; full-metric
-`l2n` uses general real 2×2 blocks and permits a final scalar for odd sizes.
-The benchmark harness defaults to convolution for `lru` and identity `l2n`,
-and parallel scan for full `l2n` and the other current SSMs. Legacy `l2ru`, `zak`, and `l2nt` remain
-wired for existing experiments and checkpoints; their implementations live in
-`ssm/cells/legacy/`. The UI and command-line listing mark them as legacy.
-
-### Certificates in practice
-
-Set `gamma` to request a global certificate. This requires a certified
-recurrent core (`defect`, `l2n`, `tv`, or `tvc`; the legacy certified cells also work) and a
-feed-forward layer with a declared global bound: `LGLU2`, `BLGLU2`/`BudgetedLGLU2`, `MBLIP`, or
-`TLIP`. Keep `learn_x0=False`: a learned nonzero initial state needs a separate
-storage-energy term and is not covered by the pure induced-gain statement.
-
-The bound applies to zero-state sequence maps. It is a conservative guarantee,
-not a promise that every trained model will use the full gain budget.
-
-## Metric-transfer DeepSSM
-
-`MetricDeepSSM` learns feature energy metrics shared between adjacent layers.
-Their cancellation gives a prescribed incremental L2 bound for the whole stack,
-without multiplying independent scalar layer bounds. Both `defect` and exact
-`l2n` cores work; custom LTI cores need a bounded-real contraction certificate.
-
-```python
-from neural_ssm import MetricDeepSSM
-
-model = MetricDeepSSM(
-    3, 2, d_model=16, d_state=64, n_layers=4,
-    param="defect", gamma=1.0, activation="tanh", ff="residual",
-)
-y = model(u, return_state=False)
-```
-
-The new weighted residual feedforward is certified in each learned feature
-metric. Its equations, core interface, optimizations, and streaming API are in
-[the architecture guide](docs/metric_transfer_ssm.md). The benchmark runner and
-UI expose `metric_defect` and `metric_l2n`; `--metric-ff` chooses `residual` or
-`none`, independently of the original stack's `--ff` setting.
-
-## Context-aware DeepSSMs
-
-`ContextualDeepSSM` wraps a normal `DeepSSM` and lets a second sequence shape
-the model without losing the core's certificate.
-
-```python
-from neural_ssm import ContextualDeepSSM
-
-controller = ContextualDeepSSM(
-    d_input=3,
-    d_context=2,
-    d_output=2,
-    context_modes=("input", "gate", "mixer", "select"),
-    context_filter="difference",
-    d_features=16,
-    mixer_bound=0.8,
-    d_model=32,
-    d_state=32,
-    n_layers=2,
-    param="tv",
-    ff="MBLIP",
-    gamma=1.5,
-)
-
-disturbance = torch.randn(4, 200, 3)
-context = torch.randn(4, 200, 2)
-correction, state = controller(disturbance, context, mode="scan")
-```
-
-The four ports are complementary:
-
-| Port | Effect | When it fits |
-| --- | --- | --- |
-| `input` | Filters then concatenates context to the SSM input | exogenous references or finite-horizon context |
-| `gate` | Uses context gates in `[0, 1]` to attenuate residual branches | context-dependent modulation |
-| `mixer` | Applies a uniformly bounded context-dependent output matrix | endogenous or in-loop context |
-| `select` | Conditions selective-cell parameters directly | `tv`/`tvc` dynamics that adapt to context |
-
-See [the contextual tutorial](Test_files/Tutorial_ContextualSSM.py) for the
-filter choices and the corresponding gain diagnostics.
-
-## Defect-completion LTI cells
-
-Choose `param="defect"` for the new structured contraction parametrization:
-
-```python
-model = DeepSSM(3, 2, d_model=16, d_state=64, param="defect", ff="LGLU2", gamma=1.0)
-y, states = model(u, mode="scan")
-```
-
-It uses learned thin orthogonal factors, stable scalar defect formulas, and a
-real block scan without normalizing the assembled system matrix. The default
-blocks are general 2-by-2 matrices. Set `SSMConfig.defect_block_size=4` (or the
-full state dimension) to trade computation for more within-block interactions.
-The existing `l2n` option is retained for comparison. Only `loop` and `scan`
-execution are supported for the new cell.
-
-For generic full LTI input/output expressivity at a prescribed gain, keep the
-small state blocks and let their storage certificate be dense:
-
-```python
-model = DeepSSM(
-    3, 2, d_model=16, d_state=64, param="defect", ff="LGLU2", gamma=1.0,
-    defect_state_metric="full", defect_max_radius=1.0, defect_factor_margin=0.0,
-)
-y, states = model(u, mode="scan")
-```
-
-The full metric adds dense setup work, while retaining the thin input/output
-factors and block scan. State energies use `x.T @ P @ x`; the stack handles
-this through `storage_value()`. Identity storage remains the default for
-existing models and checkpoints. Full storage supports blocks up to size four,
-including an odd state size with a final scalar when `block_size=2`.
-The completeness claim concerns the LTI core, excludes exact larger Jordan
-chains, and assumes strict gain below the bound. See the step-by-step examples
-in [the tutorial](docs/ssm_tutorial.md).
-
-See [the construction, configuration, and tests](docs/defect_parametrization.md).
-For normalization with the same generic LTI expressivity, enable full storage
-inside L2N's norm calculation:
-
-```python
-model = DeepSSM(
-    3, 2, d_model=16, d_state=64, param="l2n", ff="LGLU2", gamma=1.0,
-    l2n_state_metric="full",
-)
-y, states = model(u, mode="scan")
-```
-
-The cell learns `P=L.T @ L`, computes the weighted system norm using
-`L @ A @ L^-1`, then divides the original `A,B,C,D` by one scalar. The
-recurrence keeps its block structure. This adds dense setup and backward work;
-it uses the real scan rather than the identity model's rotation convolution.
-Use `state_metric="full"` on a standalone `Block2x2DenseL2SSM` or
-`MetricDeepSSM`, and `l2n_state_metric="full"` in `SSMConfig` or `DeepSSM`.
-Identity mode remains the default and retains old checkpoint compatibility.
-
-Run `python scripts/compare_defect_vs_normalization.py` for a reproducible
-four-way comparison. Add `--l2n-state-metric full --defect-state-metric full`
-to compare only the two full-metric constructions.
-
-## Additional recurrent model
-
-`REN` is a robust acyclic recurrent-equilibrium network for system
-identification. Public entry points include `DeepSSM`, `SSMConfig`,
-`ContextualDeepSSM`, `REN`, `LRU`, `L2RU`, `lruz`, and the
-`neural_ssm.ssm` / `neural_ssm.layers` namespaces.
-
-Derived certified matrices and spectral caps are reused during gradient-free
-evaluation. Use `model.eval()` together with `torch.no_grad()` or
-`torch.inference_mode()`. Training and grad-enabled evaluation rebuild them.
-See [the parameter-cache audit](docs/parameter_cache.md) for model coverage,
-invalidation rules, and remaining optimization opportunities.
-
-## Speed on CUDA
-
-The library offers three compatible acceleration layers:
-
-1. **Parallel scan and FFT convolution**: choose `mode="scan"` or
-   `mode="conv"` for sequence-parallel execution where supported.
-2. **CUDA graphs for selective scans**: set `use_cuda_graph=True` in
-   `SSMConfig` for fixed-shape `tv`/`tvc` workloads. The benchmark harness
-   enables this by default.
-3. **`torch.compile`**: compile the model after construction and before its
-   first call. The main DeepSSM, contextual, and complex LTI paths are covered
-   by compile regression tests.
-
-```python
-device = torch.device("cuda")
-model = model.to(device)
-compiled_model = torch.compile(model, mode="reduce-overhead")
-output, state = compiled_model(u.to(device), mode="scan")
-```
-
-Compilation has a warm-up cost and specializes to observed execution patterns;
-keep batch and sequence shapes stable when throughput matters. `REN.forward` is
-intentionally eager, and the benchmark harness leaves LSTM/GRU/REN uncompiled
-because their cuDNN/eager paths are the better default.
-
-## Run the included experiments
-
-### Tutorials
-
-```bash
-python Test_files/Tutorial_DeepSSM.py
-python Test_files/Tutorial_MetricDeepSSM.py
-python Test_files/Tutorial_ContextualSSM.py
-```
-
-### Nonlinear system-identification benchmark harness
-
-The harness trains complete native trajectories, evaluates the benchmark's
-official validation split, and writes figures, GIFs, Markdown, and JSON reports.
-
-```bash
-# Discover datasets and model choices
-python Test_files/run_benchmarks.py --list
-
-# A small CUDA run with automatic SSM-mode selection
-python Test_files/run_benchmarks.py \
-  --benchmarks Cascaded_Tanks \
-  --models tv tvc lru lstm \
-  --device cuda --epochs 200 --compile --compile-mode reduce-overhead
-
-# Launch the desktop benchmark form (requires Tk support)
-python Test_files/benchmark_ui.py
-```
-
-For a focused comparison of the legacy L2RU and ZAK constructions:
-
-```bash
-python scripts/compare_l2ru_vs_zak.py --datasets Cascaded_Tanks --epochs 8
-```
-
-## Repository map
-
-```text
-src/neural_ssm/
-├── ssm/
-│   ├── config.py, registry.py       settings and model construction
-│   ├── layers.py                   DeepSSM, residual blocks, gain diagnostics
-│   ├── metric_layers.py            MetricDeepSSM, feature metrics, weighted residual FF
-│   ├── cells/
-│   │   ├── lti/                    lru.py, l2n.py, defect.py
-│   │   ├── selective/              tv.py, tvc.py
-│   │   └── legacy/                 l2ru.py, lruz.py, l2nt.py
-│   └── contextual.py               context wrapper, filters, gates, mixing
-├── static_layers/
-│   ├── generic_layers.py           ordinary GLU/MLP and LayerConfig
-│   └── lipschitz_mlps.py            bounded feedforward networks and primitives
-├── rens/ren.py                     robust acyclic REN
-└── utils/                          scan.py kernels; runtime.py state/caches
-tests/               certificate, context, and torch.compile regression tests
-Test_files/          tutorials, benchmark runner, visual UI, and research scripts
-scripts/             focused reproducible experiment drivers
-docs/                figures and deployment notes
-```
-
-Use `from neural_ssm import DeepSSM, SSMConfig, ContextualDeepSSM` for ordinary
-work. Earlier module paths remain aliases for retained components.
-See [the package guide](docs/package_structure.md) for canonical imports,
-the context design, compatibility, and where to add a new cell.
-
-## Citation
-
-If you use this repository in research, please cite:
-
-> **Free Parametrization of L2-bounded State Space Models**
->
-> https://arxiv.org/abs/2503.23818
+## Research reference
+
+For the original L2-bounded SSM parametrizations, cite Leonardo Massai,
+Muhammad Zakwan, and Giancarlo Ferrari-Trecate,
+[**L2RU: a Structured State Space Model with prescribed L2-bound**](https://arxiv.org/abs/2503.23818).
+
+The metric-transfer approach has a separate precedent in
+[**LipSSM: Structurally Lipschitz-Bounded Cascaded State-Space Model via Metric Transfer between Consecutive SSM Layers**](https://arxiv.org/abs/2609.30973).
+The package's current core choices and metric residual layers extend beyond the
+original L2RU paper; consult the linked construction guides for their assumptions.
