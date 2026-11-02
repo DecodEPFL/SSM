@@ -73,6 +73,10 @@ from nonlinear_benchmarks.not_splitted_benchmarks import (
 
 from src.neural_ssm import DeepSSM, SSMConfig, MetricDeepSSM, MetricSSMConfig
 from src.neural_ssm.rens.ren import REN
+from direct_spending.config import MODEL_SPECS as SPENDING_MODELS
+from direct_spending import benchmark as spending
+from split_memory import benchmark as split_adapter
+from split_memory.config import MODEL_SPECS as SPLIT_MODELS
 
 
 # ============================================================================
@@ -146,7 +150,7 @@ def load_benchmark(name: str) -> BenchmarkData:
         raise KeyError(f"Unknown benchmark {name!r}. Available: {sorted(_ALL_LOADERS)}")
 
     if not train_list or not validation_list:
-        raise RuntimeError(f"Benchmark {name!r} produced an empty train/validation split.")
+        raise RuntimeError(f"Benchmark {name!r} produced an empty train/validation split_adapter.")
 
     n_u = int(train_list[0].u.shape[-1])
     n_y = int(train_list[0].y.shape[-1])
@@ -227,7 +231,8 @@ def pack_full_sequences(
     sequences: Sequence[NormalizedSequence],
     indices: Sequence[int],
     device: torch.device,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    *, return_valid: bool = False,
+) -> tuple:
     """Pad complete trajectories for one batch and mask padding/initialization only."""
     selected = [sequences[int(i)] for i in indices]
     if not selected:
@@ -239,6 +244,7 @@ def pack_full_sequences(
     U = torch.zeros((len(selected), max_len, n_u), dtype=torch.float32, device=device)
     Y = torch.zeros((len(selected), max_len, n_y), dtype=torch.float32, device=device)
     M = torch.zeros((len(selected), max_len), dtype=torch.float32, device=device)
+    valid = torch.zeros((len(selected), max_len), dtype=torch.bool, device=device)
 
     for row, (u, y, loss_start) in enumerate(selected):
         if len(u) != len(y):
@@ -248,7 +254,8 @@ def pack_full_sequences(
         U[row, :length] = torch.as_tensor(u, dtype=torch.float32, device=device)
         Y[row, :length] = torch.as_tensor(y, dtype=torch.float32, device=device)
         M[row, start:length] = 1.0
-    return U, Y, M
+        valid[row, :length] = True
+    return (U, Y, M, valid) if return_valid else (U, Y, M)
 
 
 # ============================================================================
@@ -392,6 +399,8 @@ LEGACY_MODEL_ZOO: Dict[str, dict] = {
     for name in ("l2ru", "zak", "l2nt")
 }
 MODEL_ZOO.update(LEGACY_MODEL_ZOO)
+MODEL_ZOO.update(SPENDING_MODELS)
+MODEL_ZOO.update(SPLIT_MODELS)
 
 # Fastest equivalent execution mode per SSM parametrization (used when
 # --mode auto). lru/l2n are LTI diagonal-complex systems -> FFT convolution;
@@ -425,6 +434,10 @@ def _count_params(model: nn.Module) -> int:
 
 def _effective_width(model: nn.Module) -> Optional[int]:
     """Return the width knob changed by parameter matching, when available."""
+    if hasattr(model, "split_config"):
+        return model.split_config.heads if model.split_config.reader == "linear" else model.split_config.computation_width
+    if hasattr(model, "spending_config"):
+        return model.spending_config.width
     core = getattr(model, "core", None)
     if core is not None:
         return int(core.config.d_model)
@@ -542,6 +555,13 @@ def build_model(name: str, n_u: int, n_y: int, gconf: "GlobalModelConfig",
     spec = dict(MODEL_ZOO[name])
     kind = spec.pop("kind")
 
+    if kind == "split_memory":
+        return split_adapter.build_suite_model(n_u, n_y, gconf, param_budget, closest_width=_closest_width)
+
+    if kind == "direct_spending":
+        return spending.build_suite_model(name, n_u, n_y, gconf, param_budget,
+                                           closest_width=_closest_width)
+
     if kind == "metric_ssm":
         if param_budget and param_budget > 0:
             with torch.random.fork_rng(devices=[]):
@@ -579,6 +599,7 @@ def build_model(name: str, n_u: int, n_y: int, gconf: "GlobalModelConfig",
         return DeepSSMSim(n_u, n_y, _make_ssm_config(spec, gconf), mode=mode)
 
     if kind in ("lstm", "gru"):
+        spec["hidden"], spec["layers"] = gconf.rnn_hidden, gconf.rnn_layers
         if param_budget and param_budget > 0:
             with torch.random.fork_rng(devices=[]):
                 spec["hidden"] = _closest_width(
@@ -688,11 +709,21 @@ class GlobalModelConfig:
     use_cuda_graph: bool = True            # tv/tvc: replay the diagonal scan from a captured
     # CUDA graph (same maths; removes launch overhead). No-op for other models / on CPU.
     l2n_state_metric: str = "identity"
+    spending: Optional[dict] = None
+    rnn_hidden: int = 64
+    rnn_layers: int = 2
+    split_memory: Optional[dict] = None
 
 
 def _validate_initialization(models: Sequence[str], cfg: GlobalModelConfig) -> None:
     """Validate only the initialization settings used by selected models."""
     selected = set(models)
+    if selected.intersection(SPLIT_MODELS):
+        split_adapter.config_for_model(cfg)
+    if selected.intersection(("lstm", "gru")) and (cfg.rnn_hidden < 1 or cfg.rnn_layers < 1):
+        raise ValueError("RNN hidden width and layer count must be positive.")
+    for name in selected.intersection(SPENDING_MODELS):
+        spending.config_for_model(name, cfg)
     if "metric_defect" in selected:
         selected.add("defect")
     if "metric_l2n" in selected:
@@ -905,8 +936,8 @@ def train_model(
         denom = torch.zeros((), device=device)
         for i in range(0, len(sequences), tcfg.batch_size):
             batch_indices = range(i, min(i + tcfg.batch_size, len(sequences)))
-            U, Y, M = pack_full_sequences(sequences, batch_indices, device)
-            pred = model(U)
+            U, Y, M, valid = pack_full_sequences(sequences, batch_indices, device, return_valid=True)
+            pred = model(U, mask=valid) if isinstance(model, (spending.SpendingSim, split_adapter.SplitMemorySim)) else model(U)
             tot = tot + (((pred - Y) ** 2) * M.unsqueeze(-1)).sum()
             denom = denom + M.sum() * n_y
         denom = denom.clamp_min(1.0)
@@ -924,13 +955,13 @@ def train_model(
         seen = torch.zeros((), device=device)
         for i in range(0, n_train, tcfg.batch_size):
             idx = perm[i:i + tcfg.batch_size]
-            Ut, Yt, Mt = pack_full_sequences(train_seqs, idx, device)
+            Ut, Yt, Mt, valid = pack_full_sequences(train_seqs, idx, device, return_valid=True)
             opt.zero_grad(set_to_none=True)
             # autocast only when AMP is active (CUDA). Avoid passing 'mps'/'cpu' to
             # torch.autocast, which can raise on some torch builds even when disabled.
             amp_ctx = torch.autocast(device_type="cuda") if use_amp else contextlib.nullcontext()
             with amp_ctx:
-                pred = model(Ut)
+                pred = model(Ut, mask=valid) if isinstance(model, (spending.SpendingSim, split_adapter.SplitMemorySim)) else model(Ut)
                 loss = masked_mse(pred, Yt, Mt)
             scaler.scale(loss).backward()
             if tcfg.grad_clip:
@@ -998,6 +1029,14 @@ def evaluate_validation(model: nn.Module, bench: BenchmarkData, norm: Standardiz
             "length": int(len(d)),
             "init_window": int(d.state_initialization_window_length or 0),
         })
+        if isinstance(model, spending.SpendingSim):
+            rows[-1]["certificate"] = model.certificate()
+            if model.spending_config.diagnostics:
+                normalized = norm.norm_u(torch.as_tensor(d.u, dtype=torch.float32)).unsqueeze(0).to(device)
+                rows[-1]["storage_diagnostics"] = model.storage_diagnostics(
+                    normalized, initialization_window=int(d.state_initialization_window_length or 0))
+        if isinstance(model, split_adapter.SplitMemorySim):
+            rows[-1]["solver_diagnostics"] = model.solver_diagnostics()
         preds.append(y_pred)
     return rows, preds
 
@@ -1281,7 +1320,18 @@ class TrainingMonitor:
                  for name, (u, _y) in self._previews.items()}
         currents = [preds[p["source"]][p["idx"], p["channel"]] for p in self._panels]
 
-        # Expand the (log) loss y-range only; otherwise the cached background stays valid.
+        # Poor initial predictions can lie outside the target-only limits. Keep
+        # them visible and refresh the blit background only when an axis expands.
+        background_changed = False
+        for ax, prediction in zip(self._panel_axes, currents):
+            values = prediction[np.isfinite(prediction)]
+            if values.size:
+                low, high = float(values.min()), float(values.max())
+                current_low, current_high = ax.get_ylim()
+                if low < current_low or high > current_high:
+                    margin = .05 * max(current_high - current_low, high - low, 1e-6)
+                    ax.set_ylim(min(current_low, low - margin), max(current_high, high + margin))
+                    background_changed = True
         finite = [v for v in list(train_losses) + list(val_losses) if np.isfinite(v) and v > 0]
         if finite:
             lo, hi = min(finite) * 0.5, max(finite) * 2.0
@@ -1289,7 +1339,9 @@ class TrainingMonitor:
             if lo < clo or hi > chi:
                 self._loss_ylim = (min(clo, lo), max(chi, hi))
                 self.loss_ax.set_ylim(*self._loss_ylim)
-                self._redraw_background()
+                background_changed = True
+        if background_changed:
+            self._redraw_background()
 
         if self.show and self._prev is not None:
             for f in range(1, self.transition_frames + 1):
@@ -1526,6 +1578,14 @@ def write_reports(results: List[dict], out_dir: Path, meta: dict,
         # Per-validation-sequence detail when a split has several signals.
         for r in rows:
             seqs = r.get("validation_sequences", [])
+            if r.get("model_family") == "direct_spending" and r.get("certificate"):
+                certificate = r["certificate"]
+                lines.extend(("", f"**{certificate['label']}**", "",
+                    f"Fixed gamma: {certificate['gamma']}; actual initial beta: {certificate['initial_beta']:.6g}. "
+                    f"Certificate interval: {certificate['certified_interval']}. "
+                    "The scored suffix retains carried storage. Standardized-coordinate certificates "
+                    "include centering and do not assert a physical-coordinate zero-state bound.",
+                    "", "Spending head saturation means ||z|| > 1, not physical output clipping.", ""))
             if len(seqs) > 1:
                 lines.append("")
                 lines.append(f"<details><summary>{r['model']}: per-validation-sequence</summary>")
@@ -1582,11 +1642,14 @@ def run(args) -> None:
               "models). Prefer cpu unless you've confirmed MPS is faster for your setup.")
 
     gconf = GlobalModelConfig(
+        spending=spending.settings_from_args(args) if set(args.models).intersection(SPENDING_MODELS) else None,
+        split_memory=split_adapter.settings_from_args(args) if set(args.models).intersection(SPLIT_MODELS) else None,
         d_model=args.d_model, d_state=args.d_state, n_layers=args.n_layers,
         d_hidden=args.d_hidden, nl_layers=args.nl_layers,
         metric_activation=args.metric_activation, metric_ff=args.metric_ff,
         metric_init_feedthrough=args.metric_init_feedthrough,
         ren_dim_internal=args.ren_dim_internal, ren_dim_nl=args.ren_dim_nl,
+        rnn_hidden=args.rnn_hidden, rnn_layers=args.rnn_layers,
         per_channel_gates=args.per_channel_gates,
         lru_rmin=args.lru_rmin, lru_rmax=args.lru_rmax,
         lru_max_phase=args.lru_max_phase,
@@ -1673,19 +1736,52 @@ def run(args) -> None:
                 print(f"  [skip] unknown model {mname!r} (have {sorted(MODEL_ZOO)})")
                 continue
             print(f"  -- model: {mname}")
-            run_dir = out_root / bname / mname
+            run_name = mname
+            if mname in SPENDING_MODELS:
+                spending_cfg = spending.config_for_model(mname, gconf)
+                run_name = f"{mname}--{spending_cfg.core}--{spending_cfg.beta_mode}"
+            if mname in SPLIT_MODELS:
+                split_cfg = split_adapter.config_for_model(gconf)
+                run_name = f"{mname}--{split_cfg.reader}--{split_cfg.solver if split_cfg.reader == 'recurrent' else 'readout'}--{split_cfg.memory_backend}"
+            run_dir = out_root / bname / run_name
             run_dir.mkdir(parents=True, exist_ok=True)
             rec = {"benchmark": bname, "model": mname, "n_u": bench.n_u, "n_y": bench.n_y}
             try:
                 set_seed(args.seed)
                 model = build_model(mname, bench.n_u, bench.n_y, gconf,
                                     param_budget=param_budget)
+                model_norm = norm
+                if isinstance(model, spending.SpendingSim):
+                    if model.coordinates == "physical":
+                        model_norm = spending.identity_standardizer(bench.n_u, bench.n_y, Standardizer)
+                    rec["model_family"] = "direct_spending"
+                    rec["model_config"] = model.spending_config.to_dict()
+                    rec["model_label"] = model.spending_config.label
+                    rec["certificate"] = model.certificate()
+                    rec["target_initial_energy_requirements"] = spending.target_compatibility(
+                        bench, model_norm, model.spending_config.gamma)
+                    required = max(row["minimum_initial_energy_for_exact_target_prefixes"]
+                                   for row in rec["target_initial_energy_requirements"])
+                    print(f"     {rec['model_label']} — {model.coordinates} coordinates; "
+                          f"gamma={model.spending_config.gamma}, beta={rec['certificate']['initial_beta']:.6g}")
+                    print("     Certificate covers the full trajectory including warm-up. "
+                          "The scored suffix retains its carried storage.")
+                    if required > rec["certificate"]["initial_beta"] + 1e-6:
+                        print(f"     [initialization] exact target prefixes require initial energy >= {required:.6g} "
+                              "in these coordinates. Current initialization can limit fitting; gamma/beta are unchanged.")
+                if isinstance(model, split_adapter.SplitMemorySim):
+                    rec["model_family"] = "split_memory"
+                    rec["model_config"] = model.split_config.to_dict()
+                    rec["model_label"] = f"Split memory / {model.split_config.reader}" + (f" / {model.split_config.solver}" if model.split_config.reader == "recurrent" else "")
+                    print(f"     {rec['model_label']}; bounded gated memory; no prescribed l2-gain guarantee")
+                    if not model.split_config.require_convergence:
+                        print("     [approximation] Nonconverged finite-sweep training explicitly allowed; evaluation residuals are reported.")
                 rec["compiled"] = False
                 if args.compile:
                     kind = MODEL_ZOO[mname].get("kind")
-                    if kind in ("lstm", "gru", "ren"):
+                    if kind in ("lstm", "gru", "ren", "direct_spending", "split_memory"):
                         print(f"     torch.compile: skipped for {mname} "
-                              f"({'eager-only REN' if kind == 'ren' else 'cuDNN kernel already fused'})")
+                              f"({'eager solver diagnostics; fixed kernel is separately compilable' if kind == 'split_memory' else 'portable storage path' if kind == 'direct_spending' else 'eager-only REN' if kind == 'ren' else 'cuDNN kernel already fused'})")
                     else:
                         mode = None if args.compile_mode == "default" else args.compile_mode
                         model = torch.compile(model, mode=mode)
@@ -1704,19 +1800,19 @@ def run(args) -> None:
                 monitor = None
                 if not args.no_plot:
                     monitor = TrainingMonitor(
-                        out_dir=run_dir, bench=bench, model_name=mname, norm=norm,
+                        out_dir=run_dir, bench=bench, model_name=rec.get("model_label", mname), norm=model_norm,
                         device=device, total_epochs=tcfg.epochs,
                         plot_every=args.plot_every, gif=not args.no_gif, show=show_live,
                         max_preview_len=args.plot_max_length,
                     )
 
-                hist = train_model(model, bench, norm, tcfg, device, monitor)
+                hist = train_model(model, bench, model_norm, tcfg, device, monitor)
                 rec.update({k: hist[k] for k in
                             ("best_val_loss", "final_val_loss", "best_epoch", "epochs_run",
                              "train_time_s", "n_train_sequences", "n_validation_sequences",
                              "train_samples", "validation_samples")})
 
-                seq_rows, _ = evaluate_validation(model, bench, norm, device)
+                seq_rows, _ = evaluate_validation(model, bench, model_norm, device)
                 rec["validation_sequences"] = seq_rows
                 rec["rmse"] = float(np.mean([s["rmse"] for s in seq_rows]))
                 rec["nrmse"] = float(np.mean([s["nrmse"] for s in seq_rows]))
@@ -1743,6 +1839,28 @@ def run(args) -> None:
                                    hist["val_losses"], model, force=True)
                     rec["artifacts"] = monitor.finalize()
 
+                if isinstance(model, spending.SpendingSim):
+                    rec["history"] = hist
+                    from direct_spending.diagnostics import write_storage_plot
+                    storage_plot = write_storage_plot(seq_rows, run_dir)
+                    if storage_plot:
+                        rec.setdefault("artifacts", {})["storage_figure"] = storage_plot
+                    rec["certificate"] = model.certificate()
+                    checkpoint = run_dir / "model.pt"
+                    rec.setdefault("artifacts", {})["checkpoint"] = str(checkpoint)
+                    spending.save_checkpoint(checkpoint, model, model_norm, hist, rec)
+
+                if isinstance(model, split_adapter.SplitMemorySim):
+                    rec["history"] = hist
+                    rec["solver_diagnostics"] = model.diagnostics()
+                    # Plot previews also call the model. Report the complete scored
+                    # validation trajectory, rather than the last short preview.
+                    rec["solver_diagnostics"]["solver"] = seq_rows[-1]["solver_diagnostics"] if seq_rows else None
+                    rec["solver_diagnostics"]["solver_scope"] = "last complete validation trajectory; all trajectories have per-sequence diagnostics"
+                    rec["gradient_semantics"] = "ordinary autograd through the implemented finite-sweep graph"
+                    checkpoint = run_dir / "model.pt"
+                    rec.setdefault("artifacts", {})["checkpoint"] = str(checkpoint)
+                    split_adapter.save_checkpoint(checkpoint, model, model_norm, hist, rec)
                 rec["status"] = "ok"
                 print(f"     RMSE={rec['rmse']:.4g}  fit={rec['fit']:.3g}%  "
                       f"params={rec['n_params']}  {hist['epochs_run']} epochs in "
@@ -1751,6 +1869,8 @@ def run(args) -> None:
                 import traceback
                 rec["status"] = f"error: {type(exc).__name__}"
                 rec["error"] = str(exc)
+                if isinstance(exc, split_adapter.ConvergenceError):
+                    rec["solver_failure"] = exc.diagnostics
                 print(f"     [error] {type(exc).__name__}: {exc}")
                 if args.verbose:
                     traceback.print_exc()
@@ -1768,6 +1888,9 @@ def run(args) -> None:
         "compile": f"{args.compile_mode}" if args.compile else "off",
         "model_initialization": _initialization_metadata(gconf),
         "model_dims": f"d_model={gconf.d_model},d_state={gconf.d_state},n_layers={gconf.n_layers}",
+        "direct_spending": gconf.spending,
+        "split_memory": gconf.split_memory,
+        "launch_configuration": vars(args),
     }
     console_table(results)
     # Best model (by validation loss) per benchmark — the checkpoint it is evaluated at.
@@ -1812,7 +1935,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--amp", action="store_true", help="cuda mixed precision (loosens certified caps)")
     p.add_argument("--compile", action=argparse.BooleanOptionalAction, default=False,
-                   help="wrap models in torch.compile (skipped for lstm/gru/ren: cuDNN "
+                   help="wrap models in torch.compile (skipped for lstm/gru/ren/direct_spending/split_memory: cuDNN "
                         "kernels / eager-only REN). Expect a one-off compile pause on the "
                         "first training step and again on the first full-length eval.")
     p.add_argument("--compile-mode", default="default",
@@ -1825,6 +1948,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--n-layers", type=int, default=2)
     p.add_argument("--d-hidden", type=int, default=16)
     p.add_argument("--nl-layers", type=int, default=3)
+    p.add_argument("--rnn-hidden", type=int, default=64, help="LSTM/GRU hidden width before parameter matching")
+    p.add_argument("--rnn-layers", type=int, default=2, help="LSTM/GRU recurrent layers")
     p.add_argument("--metric-activation", default="tanh",
                    choices=["tanh", "relu", "arctan", "identity"],
                    help="Activation for metric_defect/metric_l2n")
@@ -1936,11 +2061,23 @@ def build_parser() -> argparse.ArgumentParser:
     # misc
     p.add_argument("--list", action="store_true", help="list benchmarks/models and exit")
     p.add_argument("--verbose", action="store_true")
+    p.add_argument("--config", help="saved UI configuration JSON; explicit CLI arguments override it")
+    spending.add_arguments(p)
+    split_adapter.add_arguments(p)
     return p
 
 
 def main():
-    args = build_parser().parse_args()
+    arguments = sys.argv[1:]
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config")
+    configured, _ = pre.parse_known_args(arguments)
+    if configured.config:
+        saved = json.loads(Path(configured.config).read_text())
+        if saved.get("format") != "nonlinear_benchmark_ui_v1":
+            raise SystemExit("Unsupported saved UI configuration format")
+        arguments = saved["argv"] + arguments
+    args = build_parser().parse_args(arguments)
     if args.list:
         print("Benchmarks:")
         for n in _ALL_LOADERS:

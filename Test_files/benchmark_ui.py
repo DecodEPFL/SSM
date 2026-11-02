@@ -15,11 +15,12 @@ missing, install it (e.g. ``conda install tk``).
 from __future__ import annotations
 
 import os
-import math
 import queue
 import subprocess
 import sys
 import threading
+import json
+import time
 from pathlib import Path
 
 import tkinter as tk
@@ -28,285 +29,227 @@ from tkinter import ttk, messagebox, filedialog
 _HERE = Path(__file__).resolve().parent
 _REPO_ROOT = _HERE.parent
 _RUNNER = _HERE / "run_benchmarks.py"
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+from direct_spending.config import MODEL_SPECS as SPENDING_MODELS
+from direct_spending.ui import command_arguments as spending_arguments
+from direct_spending.ui_layout import ModelOptions, ScrollableSettings, fields
+from direct_spending.ui_settings import (UI_MODELS, VALUE_DEFAULTS, TOGGLE_DEFAULTS,
+    SSM_MODELS, architecture_keys, normalize_configuration, write_configuration)
+from direct_spending.ui_results import RunResults
+from split_memory.ui import command_arguments as split_arguments
 
-# These mirror run_benchmarks.py (kept here so the UI starts instantly without
-# importing torch). Update alongside the registries there.
+# Keep the complete registry available to existing integrations, while the
+# window shows one spending family with a core selector. No torch import here.
 BENCHMARKS = [
     "EMPS", "CED", "Cascaded_Tanks", "Silverbox", "WienerHammerBenchMark",
     "ParWH", "F16", "Industrial_robot", "WienerHammerstein_Process_Noise",
 ]
-MODELS = ["lru", "l2n", "defect", "metric_defect", "metric_l2n", "tv", "tvc", "ren", "lstm", "gru", "l2ru", "zak", "l2nt"]
+VISIBLE_MODELS = list(UI_MODELS)
+MODELS = VISIBLE_MODELS + [name for name in SPENDING_MODELS if name != "direct_spending"]
 LEGACY_MODELS = {"l2ru", "zak", "l2nt"}
-INITS = ["eye", "rand"]
-FFS = ["auto", "GLU", "MLP", "LGLU2", "MBLIP", "BLGLU2", "BudgetedLGLU2", "TLIP", "LMLP"]
-DEVICES = ["auto", "cpu", "cuda", "mps"]
-GAMMAS = ["auto", "none", "0.5", "1", "2", "5", "10", "20"]
-# SSM execution mode. "auto" = fastest per model (conv for lru/l2n, scan otherwise).
-MODES = ["auto", "loop", "scan", "conv"]
-COMPILE_MODES = ["default", "reduce-overhead", "max-autotune"]
+_DEFAULTS_PATH = _REPO_ROOT / "direct_spending" / "configs" / "ui-defaults.json"
 
 
 class BenchmarkUI:
     def __init__(self, root: tk.Tk):
         self.root = root
-        root.title("Nonlinear-benchmarks runner")
-        root.geometry("1080x760")
+        root.title("Nonlinear benchmarks")
+        root.geometry("1120x920")
+        root.minsize(900, 650)
         self.proc: subprocess.Popen | None = None
         self.q: "queue.Queue[str]" = queue.Queue()
+        self.vars = {key: tk.StringVar(value=value) for key, value in VALUE_DEFAULTS.items()}
+        for key, value in TOGGLE_DEFAULTS.items():
+            setattr(self, key, tk.BooleanVar(value=value))
+        self.spending_options = None
 
         outer = ttk.Frame(root, padding=10)
         outer.pack(fill="both", expand=True)
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(0, weight=3)
+        outer.rowconfigure(2, weight=2)
+        self.settings = ScrollableSettings(outer)
+        self.settings.frame.grid(row=0, column=0, sticky="nsew")
+        body = self.settings.body
 
-        # ---- selections (benchmarks + models side by side) --------------------
-        top = ttk.Frame(outer)
-        top.pack(fill="x")
-
-        bf = ttk.LabelFrame(top, text="Benchmarks  (Cmd/Ctrl-click for several)", padding=6)
-        bf.pack(side="left", fill="both", expand=True, padx=(0, 5))
-        self.bench_list = tk.Listbox(bf, selectmode="extended", height=8, exportselection=False)
-        for b in BENCHMARKS:
-            self.bench_list.insert("end", b)
-        self.bench_list.selection_set(BENCHMARKS.index("Cascaded_Tanks"))
-        self.bench_list.pack(fill="both", expand=True)
-
-        mf = ttk.LabelFrame(top, text="Models  (Cmd/Ctrl-click for several)", padding=6)
-        mf.pack(side="left", fill="both", expand=True, padx=(5, 0))
-        self.model_list = tk.Listbox(mf, selectmode="extended", height=len(MODELS), exportselection=False)
-        for m in MODELS:
-            self.model_list.insert("end", f"{m} (legacy)" if m in LEGACY_MODELS else m)
-        self.model_list.selection_set(MODELS.index("tv"))
-        self.model_list.pack(fill="both", expand=True)
-
-        # ---- options grid -----------------------------------------------------
-        opt = ttk.LabelFrame(outer, text="Options", padding=8)
-        opt.pack(fill="x", pady=8)
-        self.vars: dict[str, tk.Variable] = {}
-
-        def combo(parent, key, label, values, default, width=10, editable=False):
-            self._row_label(parent, label)
-            var = tk.StringVar(value=str(default))
-            cb = ttk.Combobox(parent, textvariable=var, values=values, width=width,
-                              state="normal" if editable else "readonly")
-            cb.grid(row=self._r, column=self._c * 2 + 1, sticky="w", padx=(2, 14), pady=3)
-            self.vars[key] = var
-            self._advance()
-
-        def spin(parent, key, label, frm, to, default, inc=1, width=8):
-            self._row_label(parent, label)
-            var = tk.StringVar(value=str(default))
-            sp = ttk.Spinbox(parent, from_=frm, to=to, increment=inc, textvariable=var, width=width)
-            sp.grid(row=self._r, column=self._c * 2 + 1, sticky="w", padx=(2, 14), pady=3)
-            self.vars[key] = var
-            self._advance()
-
-        def entry(parent, key, label, default, width=10):
-            self._row_label(parent, label)
-            var = tk.StringVar(value=str(default))
-            en = ttk.Entry(parent, textvariable=var, width=width)
-            en.grid(row=self._r, column=self._c * 2 + 1, sticky="w", padx=(2, 14), pady=3)
-            self.vars[key] = var
-            self._advance()
-
-        self._r, self._c, self._ncols = 0, 0, 4
-        combo(opt, "device", "device", DEVICES, "auto")
-        spin(opt, "n_layers", "n_layers", 0, 16, 2)
-        spin(opt, "d_model", "d_model", 2, 512, 16)
-        spin(opt, "d_state", "d_state", 2, 512, 16, inc=2)
-        spin(opt, "d_hidden", "d_hidden", 1, 512, 16)
-        spin(opt, "nl_layers", "nl_layers", 1, 12, 3)
-        combo(opt, "gamma", "gamma", GAMMAS, "auto", editable=True)
-        combo(opt, "ff", "ff (override)", FFS, "auto")
-        combo(opt, "mode", "exec mode", MODES, "auto")
-        spin(opt, "epochs", "epochs", 1, 20000, 200)
-        spin(opt, "batch_size", "batch_size", 1, 1024, 32)
-        entry(opt, "lr", "lr", "3e-3")
-        spin(opt, "plot_every", "plot_every", 1, 1000, 10)
-        spin(opt, "plot_max_length", "plot max samples", 1, 10000000, 4000, inc=100)
-        combo(opt, "report_metric", "report metric", ["rmse", "nrmse", "fit", "r2", "mae"], "rmse")
-        entry(opt, "param_budget", "param budget (model/int/off)", "lstm", width=10)
-
-        # Model-specific controls are created once, then inserted only while the
-        # corresponding model is selected so the main options stay compact.
-        self.model_option_frames: dict[str, ttk.LabelFrame] = {}
-
-        def model_panel(model, title):
-            frame = ttk.LabelFrame(outer, text=title, padding=8)
-            self.model_option_frames[model] = frame
-            return frame
-
-        def panel_entry(frame, index, key, label, default, width=9):
-            row, column = divmod(index, 4)
-            ttk.Label(frame, text=label).grid(
-                row=row, column=2 * column, sticky="e", padx=(8, 2), pady=3,
-            )
-            var = tk.StringVar(value=str(default))
-            ttk.Entry(frame, textvariable=var, width=width).grid(
-                row=row, column=2 * column + 1, sticky="w", padx=(0, 14), pady=3,
-            )
-            self.vars[key] = var
-
-        lru_panel = model_panel("lru", "LRU initialization")
-        panel_entry(lru_panel, 0, "lru_rmin", "minimum radius", "0.8")
-        panel_entry(lru_panel, 1, "lru_rmax", "maximum radius", "0.95")
-        panel_entry(lru_panel, 2, "lru_max_phase", "maximum phase", str(2 * math.pi))
-
-        l2ru_panel = model_panel("l2ru", "Legacy L2RU initialization")
-        ttk.Label(l2ru_panel, text="mode").grid(row=0, column=0, sticky="e", padx=(8, 2), pady=3)
-        self.vars["init"] = tk.StringVar(value="eye")
-        ttk.Combobox(
-            l2ru_panel, textvariable=self.vars["init"], values=INITS,
-            width=9, state="readonly",
-        ).grid(row=0, column=1, sticky="w", padx=(0, 14), pady=3)
-        panel_entry(l2ru_panel, 1, "l2ru_eye_scale", "eye scale", "0.01")
-        panel_entry(l2ru_panel, 2, "l2ru_rand_scale", "random scale", "1.0")
-
-        zak_panel = model_panel("zak", "Legacy ZAK initialization")
-        ttk.Label(zak_panel, text="mode").grid(row=0, column=0, sticky="e", padx=(8, 2), pady=3)
-        ttk.Combobox(
-            zak_panel, textvariable=self.vars["init"], values=INITS,
-            width=9, state="readonly",
-        ).grid(row=0, column=1, sticky="w", padx=(0, 14), pady=3)
-
-        l2n_panel = model_panel("l2n", "L2N initialization")
-        panel_entry(l2n_panel, 0, "l2n_rho", "target pole radius", "0.9")
-        panel_entry(l2n_panel, 1, "l2n_max_phase", "phase half-width", "0.04")
-        panel_entry(l2n_panel, 2, "l2n_phase_center", "phase center", "0.0")
-        panel_entry(l2n_panel, 3, "l2n_offdiag_scale", "off-diagonal std", "0.05")
-        self.l2n_random_phase_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
-            l2n_panel,
-            text="random phases (otherwise all use the phase center)",
-            variable=self.l2n_random_phase_var,
-        ).grid(row=1, column=0, columnspan=8, sticky="w", padx=8, pady=(3, 0))
-
-        self.vars["l2n_state_metric"] = tk.StringVar(value="identity")
-        ttk.Label(l2n_panel, text="state storage").grid(row=2, column=0, padx=8)
-        ttk.Combobox(
-            l2n_panel, textvariable=self.vars["l2n_state_metric"],
-            values=("identity", "full"), width=9, state="readonly",
-        ).grid(row=2, column=1, sticky="w", padx=8, pady=3)
-
-        defect_panel = model_panel("defect", "Defect completion")
-        panel_entry(defect_panel, 0, "defect_block_size", "block size", "2")
-        panel_entry(defect_panel, 1, "defect_rho", "initial radius", "0.9")
-        panel_entry(defect_panel, 2, "defect_max_radius", "contraction limit", "0.999")
-        panel_entry(defect_panel, 3, "defect_factor_margin", "factor margin", "0.001")
-        panel_entry(defect_panel, 4, "defect_init_scale", "initial factor scale", "0.05")
-        panel_entry(defect_panel, 5, "defect_max_phase", "phase half-width (2x2)", "0.04")
-        panel_entry(defect_panel, 6, "defect_phase_center", "phase center (2x2)", "0.0")
-        self.defect_random_phase_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
-            defect_panel, text="random phases (2x2 blocks)",
-            variable=self.defect_random_phase_var,
-        ).grid(row=2, column=0, columnspan=8, sticky="w", padx=8, pady=(3, 0))
-
-        self.vars["defect_state_metric"] = tk.StringVar(value="identity")
-        ttk.Label(defect_panel, text="state storage").grid(row=3, column=0, padx=8)
-        ttk.Combobox(
-            defect_panel, textvariable=self.vars["defect_state_metric"],
-            values=("identity", "full"), state="readonly", width=12,
-        ).grid(row=3, column=1, padx=8, pady=(3, 0))
-
-        metric_panel = model_panel("metric_ssm", "Metric-transfer stack")
-        for column, (key, label, choices, default) in enumerate((
-            ("metric_activation", "activation", ("tanh", "relu", "arctan", "identity"), "tanh"),
-            ("metric_ff", "feedforward", ("residual", "none"), "residual"),
+        # Everything in this first box describes the run, independently of architecture.
+        shared = ttk.LabelFrame(body, text="Shared run settings", padding=8)
+        shared.pack(fill="x")
+        self.shared_frame = shared
+        selections = ttk.Frame(shared)
+        selections.pack(fill="x")
+        for index, (title, names, default, attribute) in enumerate((
+            ("Benchmarks", BENCHMARKS, "Cascaded_Tanks", "bench_list"),
+            ("Models", VISIBLE_MODELS, "tv", "model_list"),
         )):
-            ttk.Label(metric_panel, text=label).grid(row=0, column=2*column, padx=(8, 2))
-            self.vars[key] = tk.StringVar(value=default)
-            ttk.Combobox(metric_panel, textvariable=self.vars[key], values=choices,
-                         width=10, state="readonly").grid(row=0, column=2*column+1, padx=(0, 14))
-        panel_entry(metric_panel, 2, "metric_init_feedthrough", "initial direct path", "0.95")
-        ttk.Label(metric_panel, text="Uses its own feedforward setting; gamma must be auto or positive.").grid(
-            row=1, column=0, columnspan=8, sticky="w", padx=8, pady=(5, 0))
+            group = ttk.LabelFrame(selections, text=title + "  (Cmd/Ctrl-click for several)", padding=5)
+            group.pack(side="left", fill="both", expand=True, padx=(0, 4) if index == 0 else (4, 0))
+            widget = tk.Listbox(group, selectmode="extended", height=5, exportselection=False)
+            for name in names:
+                widget.insert("end", f"{name} (legacy)" if name in LEGACY_MODELS else name)
+            widget.selection_set(names.index(default))
+            widget.see(names.index(default))
+            scrollbar = ttk.Scrollbar(group, orient="vertical", command=widget.yview)
+            widget.configure(yscrollcommand=scrollbar.set)
+            scrollbar.pack(side="right", fill="y")
+            widget.pack(side="left", fill="both", expand=True)
+            setattr(self, attribute, widget)
 
-        tv_panel = model_panel("tv", "TV initialization")
-        panel_entry(tv_panel, 0, "tv_init_rho", "state decay", "0.99")
-        panel_entry(tv_panel, 1, "tv_init_delta0", "step size", "1.0")
-        panel_entry(tv_panel, 2, "tv_init_param_scale", "parameter std", "0.02")
+        common = ttk.Frame(shared, padding=(0, 6, 0, 0))
+        common.pack(fill="x")
+        self.common_controls = fields(common, ("device", "epochs", "batch_size", "lr",
+            "weight_decay", "grad_clip", "seed", "report_metric", "param_budget",
+            "plot_every", "plot_max_length"), self.vars)
+        toggles = ttk.Frame(shared)
+        toggles.pack(fill="x", pady=5)
+        for text, key in (("Live training plot", "show_var"), ("Save GIF", "gif_var"),
+                          ("Mixed precision (CUDA)", "amp_var"), ("Compile models", "compile_var")):
+            ttk.Checkbutton(toggles, text=text, variable=getattr(self, key)).pack(side="left", padx=(0, 14))
+        self.compile_controls = ttk.Frame(toggles)
+        fields(self.compile_controls, ("compile_mode",), self.vars, columns=1)
+        self.compile_var.trace_add("write", lambda *_: self._update_compile_options())
+        self._update_compile_options()
+        output = ttk.Frame(shared)
+        output.pack(fill="x", pady=(3, 0))
+        ttk.Label(output, text="Output directory").pack(side="left")
+        self.out_var = tk.StringVar(value=str(_REPO_ROOT / "Test_files" / "benchmark_runs"))
+        ttk.Entry(output, textvariable=self.out_var).pack(side="left", fill="x", expand=True, padx=6)
+        ttk.Button(output, text="Browse", command=self._browse).pack(side="left")
 
-        tvc_panel = model_panel("tvc", "TVC initialization")
-        panel_entry(tvc_panel, 0, "tvc_init_rho", "unsigned decay", "0.9")
-        panel_entry(tvc_panel, 1, "tvc_init_delta0", "step size", "1.0")
-        panel_entry(tvc_panel, 2, "tvc_init_param_scale", "parameter std", "0.02")
-        panel_entry(tvc_panel, 3, "tvc_init_sign", "decay sign", "0.995")
-        panel_entry(tvc_panel, 4, "tvc_init_b", "input coupling", "0.10")
-        panel_entry(tvc_panel, 5, "tvc_init_c", "output coupling", "0.10")
-        panel_entry(tvc_panel, 6, "tvc_init_d", "feedthrough", "0.10")
-
-        ren_panel = model_panel("ren", "REN initialization")
-        panel_entry(ren_panel, 0, "ren_dim_internal", "internal state (n)", "16")
-        panel_entry(ren_panel, 1, "ren_dim_nl", "nonlinearity (l)", "16")
-
-        # ---- toggles + output dir --------------------------------------------
-        self.toggles = ttk.Frame(outer)
-        self.toggles.pack(fill="x")
-        self.show_var = tk.BooleanVar(value=True)
-        self.gif_var = tk.BooleanVar(value=True)
-        self.amp_var = tk.BooleanVar(value=False)
-        self.pcg_var = tk.BooleanVar(value=False)
-        self.cudagraph_var = tk.BooleanVar(value=True)
-        self.compile_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(self.toggles, text="live window (--show)", variable=self.show_var).pack(side="left")
-        ttk.Checkbutton(self.toggles, text="save GIF", variable=self.gif_var).pack(side="left", padx=12)
-        ttk.Checkbutton(self.toggles, text="mixed precision (--amp, CUDA)", variable=self.amp_var).pack(side="left")
-        ttk.Checkbutton(self.toggles, text="per-channel gates", variable=self.pcg_var).pack(side="left", padx=12)
-        ttk.Checkbutton(self.toggles, text="CUDA graph (tv/tvc)", variable=self.cudagraph_var).pack(side="left")
-        ttk.Checkbutton(self.toggles, text="torch.compile", variable=self.compile_var).pack(side="left", padx=12)
-        self.vars["compile_mode"] = tk.StringVar(value="default")
-        ttk.Combobox(self.toggles, textvariable=self.vars["compile_mode"], values=COMPILE_MODES,
-                     width=15, state="readonly").pack(side="left")
-
+        self.model_options = ModelOptions(body, self)
         self.model_list.bind("<<ListboxSelect>>", self._update_model_options)
         self._update_model_options()
 
-        od = ttk.Frame(outer)
-        od.pack(fill="x", pady=(6, 0))
-        ttk.Label(od, text="output dir:").pack(side="left")
-        self.out_var = tk.StringVar(value=str(_REPO_ROOT / "Test_files" / "benchmark_runs"))
-        ttk.Entry(od, textvariable=self.out_var).pack(side="left", fill="x", expand=True, padx=6)
-        ttk.Button(od, text="Browse", command=self._browse).pack(side="left")
-
-        # ---- action buttons ---------------------------------------------------
-        btns = ttk.Frame(outer)
-        btns.pack(fill="x", pady=8)
-        self.run_btn = ttk.Button(btns, text="▶  Run", command=self._run)
+        actions = ttk.Frame(outer, padding=(0, 8))
+        actions.grid(row=1, column=0, sticky="ew")
+        self.run_btn = ttk.Button(actions, text="▶  Run", command=self._run)
         self.run_btn.pack(side="left")
-        self.stop_btn = ttk.Button(btns, text="■  Stop", command=self._stop, state="disabled")
+        self.stop_btn = ttk.Button(actions, text="■  Stop", command=self._stop, state="disabled")
         self.stop_btn.pack(side="left", padx=6)
-        ttk.Button(btns, text="Clear log", command=lambda: self._set_log("")).pack(side="left", padx=6)
-        self.status = ttk.Label(btns, text="idle")
+        ttk.Button(actions, text="Save as defaults", command=self._save_defaults).pack(side="left", padx=(14, 6))
+        ttk.Button(actions, text="Save configuration…", command=self._save_config).pack(side="left", padx=6)
+        ttk.Button(actions, text="Load configuration…", command=self._load_config).pack(side="left", padx=6)
+        self.status = ttk.Label(actions, text="idle")
         self.status.pack(side="right")
 
-        # ---- log --------------------------------------------------------------
-        logf = ttk.LabelFrame(outer, text="Log", padding=4)
-        logf.pack(fill="both", expand=True)
-        self.log = tk.Text(logf, wrap="none", height=16, bg="#0b1118", fg="#d7dde8",
-                           insertbackground="#d7dde8")
-        ys = ttk.Scrollbar(logf, orient="vertical", command=self.log.yview)
-        self.log.configure(yscrollcommand=ys.set)
-        ys.pack(side="right", fill="y")
+        tabs = ttk.Notebook(outer)
+        tabs.grid(row=2, column=0, sticky="nsew")
+        log_frame = ttk.Frame(tabs, padding=4)
+        tabs.add(log_frame, text="Log / progress")
+        toolbar = ttk.Frame(log_frame)
+        toolbar.pack(fill="x", pady=(0, 4))
+        ttk.Button(toolbar, text="Clear log", command=lambda: self._set_log("")).pack(side="left")
+        log_body = ttk.Frame(log_frame)
+        log_body.pack(fill="both", expand=True)
+        self.log = tk.Text(log_body, wrap="none", height=8, bg="#0b1118", fg="#d7dde8",
+                           insertbackground="#d7dde8", state="disabled")
+        scrollbar = ttk.Scrollbar(log_body, orient="vertical", command=self.log.yview)
+        self.log.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
         self.log.pack(side="left", fill="both", expand=True)
-        self.log.configure(state="disabled")
-
+        self.results_panel = RunResults(tabs)
+        results_toolbar = ttk.Frame(self.results_panel.results)
+        results_toolbar.pack(fill="x", pady=(0, 4), before=self.results_panel.table)
+        ttk.Button(results_toolbar, text="Open saved run…", command=self._open_report).pack(side="left")
+        ttk.Button(results_toolbar, text="Storage trace", command=self.results_panel.show_storage_trace).pack(side="left", padx=6)
+        tabs.select(log_frame)
+        self._load_defaults()
+        self.settings.bind_wheel()
         root.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.root.after(100, self._poll)
+        root.after(100, self._poll)
 
-    # ---- grid bookkeeping -----------------------------------------------------
-    def _row_label(self, parent, label):
-        ttk.Label(parent, text=label).grid(row=self._r, column=self._c * 2, sticky="e", padx=(8, 0), pady=3)
-
-    def _advance(self):
-        self._c += 1
-        if self._c >= self._ncols:
-            self._c = 0
-            self._r += 1
+    def _update_compile_options(self):
+        if self.compile_var.get():
+            self.compile_controls.pack(side="left")
+        else:
+            self.compile_controls.pack_forget()
 
     # ---- helpers --------------------------------------------------------------
     def _browse(self):
         d = filedialog.askdirectory(initialdir=self.out_var.get() or str(_REPO_ROOT))
         if d:
             self.out_var.set(d)
+
+    def _snapshot(self):
+        return {"format": "nonlinear_benchmark_ui_v1",
+                "values": {key: var.get() for key, var in self.vars.items()},
+                "benchmarks": self._selected(self.bench_list, BENCHMARKS),
+                "models": self._selected(self.model_list, VISIBLE_MODELS), "out": self.out_var.get(),
+                "toggles": {key: getattr(self, key).get() for key in TOGGLE_DEFAULTS}}
+
+    def _configuration(self):
+        return {**self._snapshot(), "argv": self._build_command()[3:]}
+
+    def _save_config(self):
+        try:
+            config = self._configuration()
+            path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("Configuration", "*.json")])
+            if path:
+                write_configuration(path, config)
+        except (ValueError, OSError) as exc:
+            messagebox.showerror("Configuration", str(exc))
+
+    def _save_defaults(self):
+        try:
+            write_configuration(_DEFAULTS_PATH, self._configuration())
+        except (ValueError, OSError) as exc:
+            messagebox.showerror("Defaults", str(exc))
+            return
+        self.status.configure(text="defaults saved")
+        self._append(f"[ui] Saved defaults for next launch: {_DEFAULTS_PATH}\n")
+
+    def _load_defaults(self):
+        if not _DEFAULTS_PATH.is_file():
+            return
+        try:
+            self._apply_configuration(json.loads(_DEFAULTS_PATH.read_text()))
+        except (ValueError, OSError, KeyError, TypeError) as exc:
+            self._append(f"[ui] Could not load saved defaults; using built-in settings: {exc}\n")
+        else:
+            self.status.configure(text="saved defaults loaded")
+
+    def _restore_controls(self, config):
+        for key, value in config["values"].items():
+            self.vars[key].set(value)
+        for key, value in config["toggles"].items():
+            getattr(self, key).set(value)
+        for widget, names, chosen in ((self.model_list, VISIBLE_MODELS, config["models"]),
+                                      (self.bench_list, BENCHMARKS, config["benchmarks"])):
+            widget.selection_clear(0, "end")
+            for name in chosen:
+                widget.selection_set(names.index(name))
+            if chosen:
+                widget.see(names.index(chosen[0]))
+        self.out_var.set(config["out"])
+        self._update_model_options()
+
+    def _apply_configuration(self, config):
+        config = normalize_configuration(config, BENCHMARKS)
+        previous = self._snapshot()
+        try:
+            self._restore_controls(config)
+            self._build_command()
+        except (ValueError, KeyError, TypeError):
+            self._restore_controls(previous)
+            raise
+
+    def _load_config(self):
+        path = filedialog.askopenfilename(filetypes=[("Configuration", "*.json")])
+        if path:
+            try:
+                self._apply_configuration(json.loads(Path(path).read_text()))
+            except (ValueError, OSError, KeyError, TypeError) as exc:
+                messagebox.showerror("Configuration", str(exc))
+
+    def _open_report(self):
+        path = filedialog.askopenfilename(initialdir=self.out_var.get(),
+                                         filetypes=[("Saved report", "report.json"), ("JSON", "*.json")])
+        if path:
+            try:
+                self.results_panel.load(path)
+            except (ValueError, OSError) as exc:
+                messagebox.showerror("Saved run", str(exc))
 
     def _set_log(self, text):
         self.log.configure(state="normal")
@@ -324,43 +267,41 @@ class BenchmarkUI:
         return [names[i] for i in listbox.curselection()]
 
     def _update_model_options(self, _event=None):
-        selected = set(self._selected(self.model_list, MODELS))
-        for name, core in (("metric_defect", "defect"), ("metric_l2n", "l2n")):
-            if name in selected:
-                selected.update((core, "metric_ssm"))
-        for model, frame in self.model_option_frames.items():
-            if model in selected:
-                if not frame.winfo_manager():
-                    frame.pack(fill="x", pady=(0, 8), before=self.toggles)
-            elif frame.winfo_manager():
-                frame.pack_forget()
+        self.model_options.select(self._selected(self.model_list, VISIBLE_MODELS))
+        self.settings.bind_wheel()
+
+    def _value(self, key):
+        # Defaults also support older programmatic control dictionaries.
+        return str(self.vars[key].get()).strip() if key in self.vars else VALUE_DEFAULTS[key]
 
     def _build_command(self):
         benches = self._selected(self.bench_list, BENCHMARKS)
-        models = self._selected(self.model_list, MODELS)
+        models = self._selected(self.model_list, VISIBLE_MODELS)
         if not benches:
             raise ValueError("Select at least one benchmark.")
         if not models:
             raise ValueError("Select at least one model.")
 
-        g = lambda k: self.vars[k].get().strip()
+        g = self._value
         cmd = [sys.executable, "-u", str(_RUNNER),
                "--benchmarks", *benches,
                "--models", *models,
                "--epochs", g("epochs"), "--batch-size", g("batch_size"), "--lr", g("lr"),
                "--plot-every", g("plot_every"),
                "--plot-max-length", g("plot_max_length"),
-               "--d-model", g("d_model"), "--d-state", g("d_state"), "--n-layers", g("n_layers"),
-               "--d-hidden", g("d_hidden"), "--nl-layers", g("nl_layers"),
-               "--gamma", g("gamma"),
+               "--weight-decay", g("weight_decay"), "--grad-clip", g("grad_clip"), "--seed", g("seed"),
                "--report-metric", g("report_metric"),
                "--param-budget", g("param_budget"),
                "--out", self.out_var.get().strip()]
         if g("device") != "auto":
             cmd += ["--device", g("device")]
-        if g("ff") != "auto":
+        active = architecture_keys(models, g("spending_core"), g("ff"), g("metric_ff"))
+        for key in ("d_model", "d_state", "n_layers", "d_hidden", "nl_layers", "gamma", "rnn_hidden", "rnn_layers"):
+            if key in active:
+                cmd += ["--" + key.replace("_", "-"), g(key)]
+        if "ff" in active and g("ff") != "auto":
             cmd += ["--ff", g("ff")]
-        if g("mode") != "auto":
+        if "mode" in active and g("mode") != "auto":
             cmd += ["--mode", g("mode")]
         if "lru" in models:
             cmd += [
@@ -419,6 +360,10 @@ class BenchmarkUI:
                 "--ren-dim-internal", g("ren_dim_internal"),
                 "--ren-dim-nl", g("ren_dim_nl"),
             ]
+        if set(models).intersection(SPENDING_MODELS):
+            cmd += spending_arguments(self.vars, models)
+        if "split_memory" in models:
+            cmd += split_arguments(self.vars)
         cmd += ["--show"] if self.show_var.get() else ["--no-show"]
         if not self.gif_var.get():
             cmd += ["--no-gif"]
@@ -426,10 +371,40 @@ class BenchmarkUI:
             cmd += ["--amp"]
         if self.compile_var.get():
             cmd += ["--compile", "--compile-mode", g("compile_mode")]
-        if self.pcg_var.get():
+        if set(models).intersection(SSM_MODELS) and self.pcg_var.get():
             cmd += ["--per-channel-gates"]
-        cmd += ["--use-cuda-graph"] if self.cudagraph_var.get() else ["--no-use-cuda-graph"]
+        if set(models).intersection(("tv", "tvc")):
+            cmd += ["--use-cuda-graph"] if self.cudagraph_var.get() else ["--no-use-cuda-graph"]
+        self._validate_run_values(active)
+
         return cmd
+
+    def _validate_run_values(self, active):
+        """Catch malformed visible fields before saving defaults or launching a child."""
+        import math
+        get = self._value
+        integer_minima = dict(epochs=1, batch_size=1, plot_every=1, plot_max_length=1, seed=0,
+                             d_model=1, d_state=1, n_layers=0, d_hidden=1, nl_layers=1,
+                             rnn_hidden=1, rnn_layers=1, ren_dim_internal=1, ren_dim_nl=1)
+        for key, minimum in integer_minima.items():
+            if key not in active and key not in ("epochs", "batch_size", "plot_every", "plot_max_length", "seed"):
+                continue
+            if int(get(key)) < minimum:
+                raise ValueError(f"{key.replace('_', ' ')} must be at least {minimum}")
+        for key in ("lr", "weight_decay", "grad_clip"):
+            value = float(get(key))
+            if not math.isfinite(value) or value < 0 or (key == "lr" and value == 0):
+                raise ValueError(f"Invalid {key.replace('_', ' ')}")
+        if "gamma" in active and get("gamma").lower() not in ("auto", "none"):
+            value = float(get("gamma"))
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError("Gain limit must be auto, none, or a positive number")
+        budget = get("param_budget").lower()
+        if budget not in ("off", "none", "0", "") and budget not in MODELS and budget not in SPENDING_MODELS:
+            if int(budget) <= 0:
+                raise ValueError("Parameter budget must be a positive integer, off, or a model name")
+        if not self.out_var.get().strip():
+            raise ValueError("Choose an output directory")
 
     # ---- run / stream ---------------------------------------------------------
     def _run(self):
@@ -443,6 +418,9 @@ class BenchmarkUI:
             return
 
         self._set_log("$ " + " ".join(cmd) + "\n\n")
+        self._run_started = time.time()
+        output_path = Path(self.out_var.get()).expanduser()
+        self._active_output = (output_path if output_path.is_absolute() else _REPO_ROOT / output_path).resolve()
         env = dict(os.environ, PYTHONUNBUFFERED="1")
         try:
             self.proc = subprocess.Popen(
@@ -481,6 +459,12 @@ class BenchmarkUI:
                     self.run_btn.configure(state="normal")
                     self.stop_btn.configure(state="disabled")
                     self.status.configure(text=f"done (exit {rc})")
+                    report = self._active_output / "report.json"
+                    if report.is_file() and report.stat().st_mtime >= self._run_started:
+                        try:
+                            self.results_panel.load(report)
+                        except (ValueError, OSError) as exc:
+                            self._append(f"[ui] report view: {exc}\n")
                 else:
                     self._append(item)
         except queue.Empty:
