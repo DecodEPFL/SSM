@@ -8,3 +8,21 @@ build/
 # Generated Python bytecode is not package source.
 __pycache__/
 *.py[cod]
+
+# Local benchmark output and saved personal UI preferences.
+/Test_files/benchmark_runs/
+/direct_spending/configs/ui-defaults.json
+
+# Generated model weights; source, configs and curated validation reports stay versioned.
+/direct_spending/**/*.pt
+/energy_bounded/**/*.pt
+/split_memory/**/*.pt
+/split_memory/validation/ui_smoke/ui-configuration.json
+/split_memory/validation/ui_smoke/ui-log.txt
+
+# Local assistant runtime logs and databases.
+/.claude-flow/
+/.swarm/
+/ruvector.db
+/ruvector.db-shm
+/ruvector.db-wal

@@ -1,0 +1,4 @@
+{"core": "lstm", "readout": "spending", "n_params": 4401, "rmse": 2.826063729745446, "training_s": 8.911781787872314}
+{"core": "lstm", "readout": "projected", "n_params": 4402, "rmse": 2.0987417829307824, "training_s": 8.85086178779602}
+{"core": "transformer", "readout": "spending", "n_params": 4529, "rmse": 21.51824947303777, "training_s": 1.451686143875122}
+{"core": "transformer", "readout": "projected", "n_params": 4530, "rmse": 2.213753907484732, "training_s": 1.5704338550567627}

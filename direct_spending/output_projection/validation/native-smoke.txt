@@ -1,0 +1,21 @@
+Device: cpu
+Benchmarks: ['Cascaded_Tanks']
+Models: ['direct_spending']
+Output: /Users/leo/Documents/Codex/2026-10-27/do-x20/work/output_projection_linear/native_smoke
+
+=== Cascaded_Tanks ===
+  loaded: n_u=1 n_y=1 train_seqs=1 validation_seqs=1 init_window=50 train_len=[1024] validation_len=[1024]
+  parameter matching: off (using each architecture's raw width defaults)
+  -- model: direct_spending
+     Output projection + linear path / transformer / zero-bias / learned gamma — standardized coordinates; gamma=0.5 (learned), beta=0
+     Certificate covers the full trajectory including warm-up. The scored suffix retains its carried storage.
+     [initialization] exact target prefixes require initial energy >= 776.985 in these coordinates. Current initialization can limit fitting; this audit does not adjust gain or initialization.
+     RMSE=2.436  fit=-14.9%  params=643  3 epochs in 0.1s
+
+benchmark           model     params     RMSE         NRMSE      fit%      R2        train s    status  
+--------------------------------------------------------------------------------------------------------
+Cascaded_Tanks      direct_s  643        2.436        1.149      -14.92    -0.3206   0.067      ok      
+
+Best on Cascaded_Tanks (by val loss): direct_spending  (val 1.266 @ epoch 3, validation RMSE 2.436, fit -14.92%)
+Reports written to /Users/leo/Documents/Codex/2026-10-27/do-x20/work/output_projection_linear/native_smoke/report.md and report.json
+Summary plot: /Users/leo/Documents/Codex/2026-10-27/do-x20/work/output_projection_linear/native_smoke/summary_rmse.png

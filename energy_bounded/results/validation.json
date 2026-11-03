@@ -1,0 +1,7 @@
+{
+  "Focused suite": "30 tests run, 29 passed, 1 accelerator check skipped; includes real SystemIDTrainer training/validation for all six arms",
+  "Existing repository suite": "188 tests run, 186 passed, 2 CUDA checks skipped (76.590 seconds)",
+  "Source and results": "All Python sources parse; comparison source hashes match delivered code",
+  "Repository preservation": "Pre-existing tracked diff and every status entry outside energy_bounded/ match the recorded baseline",
+  "Numerical stress": "32,768-token scan; 8,192-token saturation/refill; 1e100 proposals use a reported sequential fallback; FP64 gradient checks and finite zero/switch/diagnostic gradients pass"
+}

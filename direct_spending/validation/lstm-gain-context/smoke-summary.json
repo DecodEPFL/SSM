@@ -1,0 +1,28 @@
+{
+  "torch": "2.9.0",
+  "python": "3.13.9",
+  "device": "cpu",
+  "core_dtype": "float32",
+  "storage_dtype": "float64 (auto)",
+  "cpu_threads": 2,
+  "seed": 0,
+  "batch_size": 32,
+  "sequence_length": 1024,
+  "metric_start": 50,
+  "n_params": 602,
+  "epochs": 10,
+  "initial_gamma": 10.0,
+  "selected_gamma": 9.972662925720215,
+  "gamma_bounds": [
+    0.1,
+    20.0
+  ],
+  "beta": 0.0,
+  "coordinates": "standardized",
+  "validation_rmse": 21.941260898910546,
+  "train_time_s": 1.3722429275512695,
+  "max_normalized_prefix_violation": 0.0,
+  "max_normalized_identity_error": 2.298189336904957e-08,
+  "checkpoint_reload_matches": true,
+  "purpose": "wiring/gradient/certificate smoke only; not an accuracy or speed ranking"
+}

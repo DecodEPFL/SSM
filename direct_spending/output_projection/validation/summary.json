@@ -1,0 +1,25 @@
+{
+  "new_focused_host": {
+    "run": 12,
+    "passed": 12
+  },
+  "original_compatibility_cpu": {
+    "run": 55,
+    "passed": 51,
+    "skipped": 4
+  },
+  "native_ui_plus_initial_focused_host": {
+    "run": 25,
+    "passed": 25
+  },
+  "repository": {
+    "run": 188,
+    "passed": 186,
+    "skipped": 2
+  },
+  "mps_operator_fallback": "disabled during checks",
+  "cuda": "unavailable",
+  "visual_ui_verification": "unavailable, as requested",
+  "benchmark_ranking": "single-seed exploratory only",
+  "saved_ui_defaults": "preserved"
+}

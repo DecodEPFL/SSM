@@ -1,0 +1,38 @@
+test_cpu_autocast_forward_backward (energy_bounded.tests.test_cores.CoreTests.test_cpu_autocast_forward_backward) ... ok
+test_cross_chunk_gradients_preserved_including_energy (energy_bounded.tests.test_cores.CoreTests.test_cross_chunk_gradients_preserved_including_energy) ... ok
+test_explicit_detach_move_and_reset (energy_bounded.tests.test_cores.CoreTests.test_explicit_detach_move_and_reset) ... ok
+test_full_chunks_steps_outputs_and_entire_caches (energy_bounded.tests.test_cores.CoreTests.test_full_chunks_steps_outputs_and_entire_caches) ... ok
+test_future_perturbation_causality (energy_bounded.tests.test_cores.CoreTests.test_future_perturbation_causality) ... ok
+test_masked_backward_finite (energy_bounded.tests.test_cores.CoreTests.test_masked_backward_finite) ... ok
+test_masks_pause_state_and_resume_across_chunks_and_steps (energy_bounded.tests.test_cores.CoreTests.test_masks_pause_state_and_resume_across_chunks_and_steps) ... ok
+test_optional_accelerator_paths (energy_bounded.tests.test_cores.CoreTests.test_optional_accelerator_paths) ... skipped 'No CUDA/MPS backend available on this host'
+test_parameterless_arbitrary_state_core_and_nonfinite_detection (energy_bounded.tests.test_cores.CoreTests.test_parameterless_arbitrary_state_core_and_nonfinite_detection) ... ok
+test_tcn_receptive_field_and_bounded_cache (energy_bounded.tests.test_cores.CoreTests.test_tcn_receptive_field_and_bounded_cache) ... ok
+test_transformer_qkv_processes_only_new_tokens_and_offsets (energy_bounded.tests.test_cores.CoreTests.test_transformer_qkv_processes_only_new_tokens_and_offsets) ... ok
+test_adapter_layouts_and_chunk_state (energy_bounded.tests.test_integration.IntegrationTests.test_adapter_layouts_and_chunk_state) ... ok
+test_existing_system_id_trainer_actual_training_and_validation (energy_bounded.tests.test_integration.IntegrationTests.test_existing_system_id_trainer_actual_training_and_validation) ... Matplotlib is building the font cache; this may take a moment.
+ok
+test_causality_of_reservoir (energy_bounded.tests.test_reservoir.ReservoirTests.test_causality_of_reservoir) ... ok
+test_diagnostic_norm_gradients_are_finite_at_zero (energy_bounded.tests.test_reservoir.ReservoirTests.test_diagnostic_norm_gradients_are_finite_at_zero) ... ok
+test_dynamic_range_fallback_and_strict_mode (energy_bounded.tests.test_reservoir.ReservoirTests.test_dynamic_range_fallback_and_strict_mode) ... ok
+test_finite_gradients_at_zero_and_switch (energy_bounded.tests.test_reservoir.ReservoirTests.test_finite_gradients_at_zero_and_switch) ... ok
+test_gradient_agreement_away_from_kinks_and_initial_energy (energy_bounded.tests.test_reservoir.ReservoirTests.test_gradient_agreement_away_from_kinks_and_initial_energy) ... ok
+test_large_proposals_safe_backward (energy_bounded.tests.test_reservoir.ReservoirTests.test_large_proposals_safe_backward) ... ok
+test_long_sequence_really_uses_scan_and_fp32_path (energy_bounded.tests.test_reservoir.ReservoirTests.test_long_sequence_really_uses_scan_and_fp32_path) ... ok
+test_masked_nan_padding_pauses_energy_and_gradients (energy_bounded.tests.test_reservoir.ReservoirTests.test_masked_nan_padding_pauses_energy_and_gradients) ... ok
+test_prefix_identity_per_sample_and_nonzero_energy (energy_bounded.tests.test_reservoir.ReservoirTests.test_prefix_identity_per_sample_and_nonzero_energy) ... ok
+test_projection_norm_direction_and_under_budget (energy_bounded.tests.test_reservoir.ReservoirTests.test_projection_norm_direction_and_under_budget) ... ok
+test_reference_scan_long_refill_saturation_and_chunks (energy_bounded.tests.test_reservoir.ReservoirTests.test_reference_scan_long_refill_saturation_and_chunks) ... /Users/leo/miniforge3/envs/SSM/lib/python3.13/site-packages/torch/nn/modules/module.py:1786: RuntimeWarning: Energy scan cancellation risk: using sequential reference; no energy refill
+  return forward_call(*args, **kwargs)
+ok
+test_single_steps_preserve_nonzero_incoming_energy (energy_bounded.tests.test_reservoir.ReservoirTests.test_single_steps_preserve_nonzero_incoming_energy) ... ok
+test_supported_cpu_dtypes_and_checkpoint (energy_bounded.tests.test_reservoir.ReservoirTests.test_supported_cpu_dtypes_and_checkpoint) ... ok
+test_validation_and_nonfinite_failures (energy_bounded.tests.test_reservoir.ReservoirTests.test_validation_and_nonfinite_failures) ... ok
+test_zero_input_with_bias_and_no_batch_pooling (energy_bounded.tests.test_reservoir.ReservoirTests.test_zero_input_with_bias_and_no_batch_pooling) ... ok
+test_task_reproducibility_and_independent_trajectory_ids (energy_bounded.tests.test_task.TaskTests.test_task_reproducibility_and_independent_trajectory_ids) ... ok
+test_zero_initialization_and_analytic_gain (energy_bounded.tests.test_task.TaskTests.test_zero_initialization_and_analytic_gain) ... ok
+
+----------------------------------------------------------------------
+Ran 30 tests in 11.314s
+
+OK (skipped=1)

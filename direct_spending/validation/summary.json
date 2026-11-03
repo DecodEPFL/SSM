@@ -1,0 +1,107 @@
+{
+  "focused": {
+    "run": 33,
+    "passed": 32,
+    "skipped": 1
+  },
+  "existing_repository": {
+    "run": 188,
+    "passed": 186,
+    "skipped": 2
+  },
+  "projection_compatibility": {
+    "run": 30,
+    "passed": 29,
+    "skipped": 1
+  },
+  "smoke": {
+    "dataset": "Cascaded_Tanks",
+    "native_train_lengths": [
+      1024
+    ],
+    "native_validation_lengths": [
+      1024
+    ],
+    "epochs": 1,
+    "configuration_source": "existing UI command generator, saved JSON loaded by existing runner",
+    "status": "ok",
+    "checkpoint_reload": "passed; physical predictions reproduce saved metrics",
+    "artifacts": {
+      "figure": {
+        "width": 1659,
+        "height": 764
+      },
+      "storage_figure": {
+        "width": 1300,
+        "height": 390
+      }
+    },
+    "coordinates": "standardized",
+    "beta_mode": "zero",
+    "gamma": 1.0,
+    "maximum_normalized_energy_violation": 2.4112521594749475e-09,
+    "maximum_normalized_identity_error": 2.0892194979463212e-08,
+    "initialization_compatibility": "target-prefix energy requirement exceeds beta=0 at gamma=1; explicit warning recorded; no policy adjustment"
+  },
+  "ui_visual": {
+    "verified": false,
+    "reason": "Computer Use permissions are not granted",
+    "user_instruction": "Finish with visual UI verification marked unavailable",
+    "native_controls_and_layout": "Programmatic widget/geometry checks passed; visual inspection unverified",
+    "native_launch_progress_cancel_and_saved_run_interaction": "unverified",
+    "configuration_and_command_paths": "Tested with conditional fields, defaults save/reload, alias migration and invalid/corrupt file handling"
+  },
+  "backend": "CPU regression tests; Tk-capable host focused tests also passed basic MPS forward/backward. CUDA unavailable.",
+  "preservation": "Earlier projection-wrapper hashes and unrelated tracked changes match baseline. Separate concurrent benchmark outputs are preserved and excluded from the status comparison.",
+  "source_sha256": {
+    "direct_spending/config.py": "545f7f215808c10f1fce91eab33949e743a137f5c6f03c33e3ddeb29cf773bee",
+    "direct_spending/benchmark.py": "071ce68d664e4035a67affe1ef184cb688c888cc823b99e35d32a9f984f96542",
+    "direct_spending/ui.py": "c4430c25979c235921bbc47602a97b3aa32823e8e8abf7302a50cbf346fdaa3f",
+    "direct_spending/diagnostics.py": "cb179c07e5556ee1837e19629d88f4135e77e789d0e859577aade46e5ca4b175",
+    "direct_spending/__init__.py": "e50a31d8f5eb47ce86f290191e5a52386b2740174b8cceb85a223762af3243dc",
+    "direct_spending/model.py": "3330d0e19e01ca64198fbc8107958b18d6a2149c4d35b8f91ae0a41b8cd0824b",
+    "direct_spending/storage.py": "c4661ce70296c31c9461f41b3f5764dde7c65441b14eaf2a521e78ddac1668e0",
+    "direct_spending/cores.py": "4e12df7afce9c1054691eb019ebe3ecce63273b5a63616fdce39c00bbeb67d18",
+    "direct_spending/ui_layout.py": "a9812cd40f7177cae3b54bc40be302b6dbc197b608496cf41c7d573199cb959e",
+    "direct_spending/ui_settings.py": "0188dc5207fce7f7d8a2c2c95470a3931ab0ea2359afbb89d824d0d0330dd33c",
+    "direct_spending/state.py": "18c6495037b7aa15e8f8805aa1913969e413d91cff355d2d76d7658d240a1a7d",
+    "direct_spending/ui_results.py": "119193508196483a26b542dc929e8925f50d3c1e35a07cf476381b9fa30ff5dd",
+    "direct_spending/tests/test_expressivity.py": "ad52f2e6e01d6c2edbe35ed458d111c6bf64fcdffbd0a1635da90f67c7f05832",
+    "direct_spending/tests/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "direct_spending/tests/test_ui.py": "f8185f4627b278eaee6b3fcd16d7439d037a26fbb22e9ab92c21c1938a0a088c",
+    "direct_spending/tests/test_storage.py": "5ca63a4e4c25a41e4939c054b1b08df5e74ace1a041dedfa2e1fa24a130656db",
+    "direct_spending/tests/test_models.py": "ee001a7899e55902323529a56133e1c59d818ad5d5a3e8e6163c2a3383b0da43",
+    "direct_spending/tests/test_integration.py": "9708242586c7d06d155810903ff090ef0025096f2a024d508bd124bddd3126e0",
+    "Test_files/benchmark_ui.py": "db4264255775eff30e6eafb574a9b7b3958e6071c9bbdfb9eb7e84869b2ec589",
+    "Test_files/run_benchmarks.py": "bdd32d1f9bc119bc1574cd9177f230f28940ca500b3fa26096bb526f649c347f"
+  },
+  "concurrent_run": {
+    "path": "Test_files/benchmark_runs/Cascaded_Tanks/spending_gru--gru--learned",
+    "observed_epochs": 2000,
+    "observed_gamma": 7.0,
+    "handling": "left untouched; separate from all implementation smoke/test jobs; excluded from validation claims",
+    "artifact_sha256": {
+      "Test_files/benchmark_runs/Cascaded_Tanks/spending_gru--gru--learned/model.pt": "30a11a6ab902f258c7da3dabe27436d74e9d2511d20872ec548f81a037a15b8a",
+      "Test_files/benchmark_runs/Cascaded_Tanks/spending_gru--gru--learned/training.gif": "4012bd625015fbe434dc86e5b711bb8f59309b563a39cbeb5e1f7b988dea085e",
+      "Test_files/benchmark_runs/Cascaded_Tanks/spending_gru--gru--learned/storage.png": "cb9054538a1560e4821cb3b52b5d04a2e17c7c107720dbb7989109c96112bb46",
+      "Test_files/benchmark_runs/Cascaded_Tanks/spending_gru--gru--learned/training.png": "0548d270d19ab8520a92feefc045335b5e1fa6c2b0fd0d32076e45ca602274e5"
+    }
+  },
+  "ui_cleanup": {
+    "date": "2026-10-28",
+    "focused": {
+      "run": 43,
+      "passed": 43,
+      "skipped": 0
+    },
+    "existing_repository": {
+      "run": 188,
+      "passed": 186,
+      "skipped": 2
+    },
+    "native_tk": "Programmatic widget construction, model/core/beta visibility, startup defaults restoration and field bounds passed at 900x650 and 1120x920. No visual inspection.",
+    "defaults_path": "direct_spending/configs/ui-defaults.json",
+    "default_file_created_by_validation": false,
+    "mps": "Basic forward/backward check passed with host access; no GPU training/benchmark claim."
+  }
+}

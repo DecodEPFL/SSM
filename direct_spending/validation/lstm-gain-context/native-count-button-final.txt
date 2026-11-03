@@ -1,0 +1,6 @@
+test_parameter_button_counts_real_selection_without_training (direct_spending.tests.test_ui.TkWidgetTests.test_parameter_button_counts_real_selection_without_training) ... ok
+
+----------------------------------------------------------------------
+Ran 1 test in 2.293s
+
+OK

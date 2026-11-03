@@ -1,0 +1,247 @@
+{
+  "purpose": "exploratory single-seed readout comparison; no architecture ranking",
+  "python": "3.13.9",
+  "torch": "2.9.0",
+  "hardware": "macOS-15.6.1-arm64-arm-64bit-Mach-O",
+  "device": "cpu",
+  "threads": 2,
+  "core_dtype": "float32",
+  "energy_dtype": "float64 (auto)",
+  "width": 16,
+  "layers": 2,
+  "seed": 0,
+  "gamma": 10.0,
+  "beta": 0.0,
+  "batch_size": 32,
+  "lr": 0.001,
+  "weight_decay": 0.0,
+  "grad_clip": 1.0,
+  "dropout": 0.0,
+  "compile": false,
+  "coordinates": "standardized",
+  "epochs": 2,
+  "target_compatibility": [
+    {
+      "split": "train",
+      "trajectory": "train Cascaded_Tanks",
+      "minimum_initial_energy_for_exact_target_prefixes": 0.0
+    },
+    {
+      "split": "validation",
+      "trajectory": "test Cascaded_Tanks",
+      "minimum_initial_energy_for_exact_target_prefixes": 0.0
+    }
+  ],
+  "runs": [
+    {
+      "core": "lstm",
+      "readout": "spending",
+      "same_initial_core_weights": true,
+      "n_params": 4401,
+      "history": {
+        "train_losses": [
+          99.66690826416016,
+          98.35951232910156
+        ],
+        "val_losses": [
+          100.19239044189453,
+          99.6155014038086
+        ],
+        "best_val_loss": 99.6155014038086,
+        "best_epoch": 2,
+        "final_val_loss": 99.6155014038086,
+        "epochs_run": 2,
+        "train_time_s": 0.3848888874053955,
+        "n_train_sequences": 1,
+        "n_validation_sequences": 1,
+        "train_samples": 1024,
+        "validation_samples": 1024
+      },
+      "validation": [
+        {
+          "validation_name": "test Cascaded_Tanks",
+          "rmse": 21.609689223049457,
+          "rmse_per_channel": [
+            21.609689223049457
+          ],
+          "nrmse": 10.193287557500094,
+          "r2": -102.90311122988624,
+          "mae": 20.04850494133389,
+          "fit": -919.3287557500093,
+          "length": 1024,
+          "init_window": 50,
+          "certificate": {
+            "family": "direct_spending",
+            "version": 1,
+            "readout": "spending",
+            "linear_path": false,
+            "linear_initialization": null,
+            "numerical_semantics": "real-arithmetic energy identity, audited against returned outputs",
+            "spending_core": "lstm",
+            "gamma": 10.0,
+            "gamma_mode": "fixed",
+            "initial_gamma": 10.0,
+            "learned_gamma_bounds": null,
+            "uniform_gamma_bound": 10.0,
+            "gamma_semantics": "global scalar; fixed weights/gamma throughout each trajectory; reset states after optimizer updates",
+            "beta_mode": "zero",
+            "initial_beta": 0.0,
+            "coordinates": "standardized",
+            "label": "Direct spending / lstm / zero-bias (standardized coordinates)",
+            "statement": "sum ||y||^2 + S_final = initial_beta + gamma^2 sum ||input||^2",
+            "certified_interval": "complete trajectory from sample 0, including metric warm-up",
+            "metric_suffix": "skipping initialization samples does not reset storage; a suffix has its carried-storage allowance",
+            "context_features": 0,
+            "context_semantics": "optional sequence context conditions the causal core only, never supplies storage energy; beta context is separately declared constant initialization",
+            "physical_zero_state_bound": false
+          },
+          "storage_diagnostics": {
+            "gamma": 10.0,
+            "initial_beta": [
+              0.0
+            ],
+            "storage_at_metric_start": [
+              2065.891862969649
+            ],
+            "mean_spending_fraction": 0.015467865596129542,
+            "max_normalized_energy_violation": 0.0,
+            "max_normalized_identity_error": 6.559631985340218e-09,
+            "implementation": "scan",
+            "head_saturation_rate": 0.0
+          }
+        }
+      ],
+      "certificate": {
+        "family": "direct_spending",
+        "version": 1,
+        "readout": "spending",
+        "linear_path": false,
+        "linear_initialization": null,
+        "numerical_semantics": "real-arithmetic energy identity, audited against returned outputs",
+        "spending_core": "lstm",
+        "gamma": 10.0,
+        "gamma_mode": "fixed",
+        "initial_gamma": 10.0,
+        "learned_gamma_bounds": null,
+        "uniform_gamma_bound": 10.0,
+        "gamma_semantics": "global scalar; fixed weights/gamma throughout each trajectory; reset states after optimizer updates",
+        "beta_mode": "zero",
+        "initial_beta": 0.0,
+        "coordinates": "standardized",
+        "label": "Direct spending / lstm / zero-bias (standardized coordinates)",
+        "statement": "sum ||y||^2 + S_final = initial_beta + gamma^2 sum ||input||^2",
+        "certified_interval": "complete trajectory from sample 0, including metric warm-up",
+        "metric_suffix": "skipping initialization samples does not reset storage; a suffix has its carried-storage allowance",
+        "context_features": 0,
+        "context_semantics": "optional sequence context conditions the causal core only, never supplies storage energy; beta context is separately declared constant initialization",
+        "physical_zero_state_bound": false
+      },
+      "checkpoint_reload_matches": true
+    },
+    {
+      "core": "lstm",
+      "readout": "projected",
+      "same_initial_core_weights": true,
+      "n_params": 4402,
+      "history": {
+        "train_losses": [
+          1.0228725671768188,
+          1.018998622894287
+        ],
+        "val_losses": [
+          1.014634132385254,
+          1.012100100517273
+        ],
+        "best_val_loss": 1.012100100517273,
+        "best_epoch": 2,
+        "final_val_loss": 1.012100100517273,
+        "epochs_run": 2,
+        "train_time_s": 0.3350510597229004,
+        "n_train_sequences": 1,
+        "n_validation_sequences": 1,
+        "train_samples": 1024,
+        "validation_samples": 1024
+      },
+      "validation": [
+        {
+          "validation_name": "test Cascaded_Tanks",
+          "rmse": 2.1781951858979114,
+          "rmse_per_channel": [
+            2.1781951858979114
+          ],
+          "nrmse": 1.0274543820157078,
+          "r2": -0.055662507123280136,
+          "mae": 1.8215540206456868,
+          "fit": -2.7454382015707823,
+          "length": 1024,
+          "init_window": 50,
+          "certificate": {
+            "family": "energy_projection",
+            "version": 1,
+            "readout": "projected",
+            "linear_path": true,
+            "linear_initialization": "zero",
+            "numerical_semantics": "real-arithmetic energy identity; conservative clipped-output rounding may dissipate energy",
+            "spending_core": "lstm",
+            "gamma": 10.0,
+            "gamma_mode": "fixed",
+            "initial_gamma": 10.0,
+            "learned_gamma_bounds": null,
+            "uniform_gamma_bound": 10.0,
+            "gamma_semantics": "global scalar; fixed weights/gamma throughout each trajectory; reset states after optimizer updates",
+            "beta_mode": "zero",
+            "initial_beta": 0.0,
+            "coordinates": "standardized",
+            "label": "Output projection + linear path / lstm / zero-bias (standardized coordinates)",
+            "statement": "sum ||y||^2 + S_final = initial_beta + gamma^2 sum ||input||^2",
+            "certified_interval": "complete trajectory from sample 0, including metric warm-up",
+            "metric_suffix": "skipping initialization samples does not reset storage; a suffix has its carried-storage allowance",
+            "context_features": 0,
+            "context_semantics": "optional sequence context conditions the causal core only, never supplies storage energy; beta context is separately declared constant initialization",
+            "physical_zero_state_bound": false
+          },
+          "storage_diagnostics": {
+            "gamma": 10.0,
+            "initial_beta": [
+              0.0
+            ],
+            "storage_at_metric_start": [
+              3999.2029695803512
+            ],
+            "mean_spending_fraction": 1.0164161241996518e-06,
+            "max_normalized_energy_violation": 0.0,
+            "max_normalized_identity_error": 1.7498757233342146e-15,
+            "implementation": "scan_max_plus",
+            "clipping_fraction": 0.0
+          }
+        }
+      ],
+      "certificate": {
+        "family": "energy_projection",
+        "version": 1,
+        "readout": "projected",
+        "linear_path": true,
+        "linear_initialization": "zero",
+        "numerical_semantics": "real-arithmetic energy identity; conservative clipped-output rounding may dissipate energy",
+        "spending_core": "lstm",
+        "gamma": 10.0,
+        "gamma_mode": "fixed",
+        "initial_gamma": 10.0,
+        "learned_gamma_bounds": null,
+        "uniform_gamma_bound": 10.0,
+        "gamma_semantics": "global scalar; fixed weights/gamma throughout each trajectory; reset states after optimizer updates",
+        "beta_mode": "zero",
+        "initial_beta": 0.0,
+        "coordinates": "standardized",
+        "label": "Output projection + linear path / lstm / zero-bias (standardized coordinates)",
+        "statement": "sum ||y||^2 + S_final = initial_beta + gamma^2 sum ||input||^2",
+        "certified_interval": "complete trajectory from sample 0, including metric warm-up",
+        "metric_suffix": "skipping initialization samples does not reset storage; a suffix has its carried-storage allowance",
+        "context_features": 0,
+        "context_semantics": "optional sequence context conditions the causal core only, never supplies storage energy; beta context is separately declared constant initialization",
+        "physical_zero_state_bound": false
+      },
+      "checkpoint_reload_matches": true
+    }
+  ]
+}

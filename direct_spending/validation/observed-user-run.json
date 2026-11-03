@@ -1,0 +1,37 @@
+{
+  "report_timestamp": "2026-11-03 15:54:09",
+  "lr": 3000.0,
+  "grad_clip": 5.0,
+  "device": "cpu",
+  "direct_spending": {
+    "core": "transformer",
+    "width": 16,
+    "layers": 3,
+    "gamma": 10.0,
+    "beta_mode": "learned",
+    "fixed_beta": 0.0,
+    "beta_initial": 0.1,
+    "beta_width": 8,
+    "initial_features": [],
+    "tcn_kernel": 3,
+    "tcn_dilations": [
+      1,
+      2,
+      4
+    ],
+    "heads": 2,
+    "dropout": 0.0,
+    "storage_impl": "scan",
+    "energy_precision": "auto",
+    "diagnostics": false,
+    "coordinates": "standardized"
+  },
+  "results": [
+    {
+      "benchmark": "Cascaded_Tanks",
+      "model": "direct_spending",
+      "status": "error: FloatingPointError",
+      "error": "Learned softplus beta underflowed to zero; no energy floor or refill was added"
+    }
+  ]
+}

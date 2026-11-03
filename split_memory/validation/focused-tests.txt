@@ -1,0 +1,70 @@
+test_native_dataset_training_evaluation_masks_reports_and_failure_status (split_memory.tests.test_integration.IntegrationTests.test_native_dataset_training_evaluation_masks_reports_and_failure_status) ... ok
+test_prediction_plot_includes_outputs_outside_target_range (split_memory.tests.test_integration.IntegrationTests.test_prediction_plot_includes_outputs_outside_target_range) ... ok
+test_registry_factory_parameter_budget_and_no_gain_certificate (split_memory.tests.test_integration.IntegrationTests.test_registry_factory_parameter_budget_and_no_gain_certificate) ... ok
+test_tagged_checkpoints_reconstruct_precision_and_solver_overrides (split_memory.tests.test_integration.IntegrationTests.test_tagged_checkpoints_reconstruct_precision_and_solver_overrides) ... ok
+test_ui_all_readers_solvers_configuration_defaults_and_hidden_fields (split_memory.tests.test_integration.IntegrationTests.test_ui_all_readers_solvers_configuration_defaults_and_hidden_fields) ... ok
+test_model_options_and_new_parameters_saved_as_defaults (split_memory.tests.test_integration.NativeUITests.test_model_options_and_new_parameters_saved_as_defaults) ... ok
+test_real_run_button_configuration_results_and_checkpoint (split_memory.tests.test_integration.NativeUITests.test_real_run_button_configuration_results_and_checkpoint) ... ok
+test_coefficients_are_input_driven_and_padding_is_identity (split_memory.tests.test_memory.MemoryTests.test_coefficients_are_input_driven_and_padding_is_identity) ... ok
+test_long_isometric_retention_without_writes_reports_floating_slack (split_memory.tests.test_memory.MemoryTests.test_long_isometric_retention_without_writes_reports_floating_slack) ... ok
+test_memory_scan_and_proposal_gradcheck_and_huge_zero_values (split_memory.tests.test_memory.MemoryTests.test_memory_scan_and_proposal_gradcheck_and_huge_zero_values) ... ok
+test_scan_reference_nonpowers_initial_states_extreme_gates_and_long_sequences (split_memory.tests.test_memory.MemoryTests.test_scan_reference_nonpowers_initial_states_extreme_gates_and_long_sequences) ... ok
+test_ablation_readers_and_generic_optional_energy_adapter (split_memory.tests.test_model.ModelTests.test_ablation_readers_and_generic_optional_energy_adapter) ... ok
+test_adaptive_residual_and_chunk_assembled_residual_independent_audit (split_memory.tests.test_model.ModelTests.test_adaptive_residual_and_chunk_assembled_residual_independent_audit) ... /Users/leo/Library/CloudStorage/GoogleDrive-l.massai@epfl.ch/My Drive/Code/Projects/SSM-clean/split_memory/tests/test_model.py:107: UserWarning: Converting a tensor with requires_grad=True to a scalar may lead to unexpected behavior.
+Consider using tensor.detach() first. (Triggered internally at /Users/runner/work/pytorch/pytorch/pytorch/torch/csrc/autograd/generated/python_variable_methods.cpp:837.)
+  self.assertAlmostEqual(float(independent_r), info["residual"], places=14)
+ok
+test_causality_fixed_adaptive_and_reference_including_batch_independence (split_memory.tests.test_model.ModelTests.test_causality_fixed_adaptive_and_reference_including_batch_independence) ... ok
+test_compilable_fixed_kernel_outputs_and_gradients (split_memory.tests.test_model.ModelTests.test_compilable_fixed_kernel_outputs_and_gradients) ... ok
+test_dtypes_autocast_finite_zero_boundaries_and_validation (split_memory.tests.test_model.ModelTests.test_dtypes_autocast_finite_zero_boundaries_and_validation) ... ok
+test_fixed_recovers_sequential_outputs_states_and_all_gradients (split_memory.tests.test_model.ModelTests.test_fixed_recovers_sequential_outputs_states_and_all_gradients) ... ok
+test_fp64_small_solver_weight_and_incoming_state_gradcheck (split_memory.tests.test_model.ModelTests.test_fp64_small_solver_weight_and_incoming_state_gradcheck) ... ok
+test_iteration_cap_failure_rho_zero_and_large_tolerance (split_memory.tests.test_model.ModelTests.test_iteration_cap_failure_rho_zero_and_large_tolerance) ... ok
+test_padding_empty_samples_internal_gaps_and_masked_nan_values (split_memory.tests.test_model.ModelTests.test_padding_empty_samples_internal_gaps_and_masked_nan_values) ... ok
+test_reference_full_chunks_steps_reset_and_cross_chunk_autograd (split_memory.tests.test_model.ModelTests.test_reference_full_chunks_steps_reset_and_cross_chunk_autograd) ... ok
+test_row_certificate_after_optimizer_updates_and_empirical_contraction (split_memory.tests.test_model.ModelTests.test_row_certificate_after_optimizer_updates_and_empirical_contraction) ... ok
+test_shorter_sweep_gradients_converge_to_sequential_bptt (split_memory.tests.test_model.ModelTests.test_shorter_sweep_gradients_converge_to_sequential_bptt) ... ok
+test_supported_accelerators_explicitly (split_memory.tests.test_model.ModelTests.test_supported_accelerators_explicitly) ... /Users/leo/miniforge3/envs/SSM/lib/python3.13/site-packages/torch/nn/functional.py:5294: UserWarning: MPS: The constant padding of more than 3 dimensions is not currently supported natively. It uses View Ops default implementation to run. This may have performance implications. (Triggered internally at /Users/runner/work/pytorch/pytorch/pytorch/aten/src/ATen/native/mps/operations/Pad.mm:468.)
+  return torch._C._nn.pad(input, pad, mode, value)
+ok
+
+----------------------------------------------------------------------
+Ran 24 tests in 14.533s
+
+OK
+Device: cpu
+Benchmarks: ['Cascaded_Tanks']
+Models: ['split_memory']
+Output: /private/var/folders/2s/vrz_8_7127x5nsbhsywmzwl80000gn/T/tmpt0nkds_1
+
+=== Cascaded_Tanks ===
+  loaded: n_u=1 n_y=1 train_seqs=1 validation_seqs=1 init_window=50 train_len=[1024] validation_len=[1024]
+  parameter matching: off (using each architecture's raw width defaults)
+  -- model: split_memory
+     Split memory / recurrent / fixed; bounded gated memory; no prescribed l2-gain guarantee
+     RMSE=2.085  fit=1.66%  params=61  1 epochs in 0.1s
+
+benchmark           model     params     RMSE         NRMSE      fit%      R2        train s    status  
+--------------------------------------------------------------------------------------------------------
+Cascaded_Tanks      split_me  61         2.085        0.9834     1.664     0.03299   0.0741     ok      
+
+Best on Cascaded_Tanks (by val loss): split_memory  (val 0.9271 @ epoch 1, validation RMSE 2.085, fit 1.664%)
+Reports written to /private/var/folders/2s/vrz_8_7127x5nsbhsywmzwl80000gn/T/tmpt0nkds_1/report.md and report.json
+Summary plot: /private/var/folders/2s/vrz_8_7127x5nsbhsywmzwl80000gn/T/tmpt0nkds_1/summary_rmse.png
+Device: cpu
+Benchmarks: ['Cascaded_Tanks']
+Models: ['split_memory']
+Output: /private/var/folders/2s/vrz_8_7127x5nsbhsywmzwl80000gn/T/tmpt0nkds_1
+
+=== Cascaded_Tanks ===
+  loaded: n_u=1 n_y=1 train_seqs=1 validation_seqs=1 init_window=50 train_len=[1024] validation_len=[1024]
+  parameter matching: off (using each architecture's raw width defaults)
+  -- model: split_memory
+     Split memory / recurrent / fixed; bounded gated memory; no prescribed l2-gain guarantee
+     [error] ConvergenceError: Jacobi did not meet tolerance: bound=0.697374, tolerance=1e-12, sweeps=1
+
+benchmark           model     params     RMSE         NRMSE      fit%      R2        train s    status  
+--------------------------------------------------------------------------------------------------------
+Cascaded_Tanks      split_me  61         n/a          n/a        n/a       n/a       n/a        error: C
+
+Reports written to /private/var/folders/2s/vrz_8_7127x5nsbhsywmzwl80000gn/T/tmpt0nkds_1/report.md and report.json

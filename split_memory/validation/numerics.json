@@ -1,0 +1,50 @@
+{
+  "torch.float32": {
+    "batch": 2,
+    "length": 8193,
+    "heads": 2,
+    "retention": 1.0,
+    "angle": 0.013,
+    "writes": 0.0,
+    "max_abs_scan_reference": 5.4001808166503906e-05,
+    "scan_max_abs_head_norm_drift": 0.0002129077911376953,
+    "reference_max_abs_head_norm_drift": 0.0002658367156982422
+  },
+  "torch.float64": {
+    "batch": 2,
+    "length": 8193,
+    "heads": 2,
+    "retention": 1.0,
+    "angle": 0.013,
+    "writes": 0.0,
+    "max_abs_scan_reference": 1.2434497875801753e-14,
+    "scan_max_abs_head_norm_drift": 6.104006189389111e-13,
+    "reference_max_abs_head_norm_drift": 6.090683513093609e-13
+  },
+  "gradient_audit": {
+    "dtype": "float64",
+    "batch": 2,
+    "length": 9,
+    "heads": 3,
+    "computation_width": 5,
+    "sweeps": 9,
+    "max_abs_output_error": 2.7755575615628914e-17,
+    "max_abs_errors_by_parameter": {
+      "input": 2.0122792321330962e-16,
+      "incoming_memory": 1.1102230246251565e-15,
+      "incoming_computation": 8.326672684688674e-17,
+      "bias": 4.440892098500626e-16,
+      "memory.gate.weight": 1.1102230246251565e-16,
+      "memory.gate.bias": 4.440892098500626e-16,
+      "memory.angle.weight": 1.587618925213974e-14,
+      "memory.angle.bias": 2.6645352591003757e-15,
+      "memory.write.weight": 1.4224732503009818e-16,
+      "memory.write.bias": 4.440892098500626e-16,
+      "memory_projection.weight": 1.3322676295501878e-15,
+      "input_projection.weight": 2.220446049250313e-16,
+      "out_proj.weight": 2.220446049250313e-16,
+      "out_proj.bias": 1.942890293094024e-16,
+      "computation.raw": 4.440892098500626e-16
+    }
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "cpu": "Apple M1 Max",
+  "memory_bytes": 34359738368,
+  "platform": "macOS-15.6.1-arm64-arm-64bit-Mach-O",
+  "python": "3.13.9",
+  "pytorch": "2.9.0",
+  "cuda": false,
+  "mps": true,
+  "focused_test_mps_cpu_fallback_enabled": false
+}

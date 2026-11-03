@@ -1,0 +1,59 @@
+test_absolute_error_can_vanish_while_identity_relative_error_stays_large (direct_spending.tests.test_expressivity.ExpressivityDiagnostics.test_absolute_error_can_vanish_while_identity_relative_error_stays_large) ... ok
+test_static_storage_cannot_distinguish_opposite_impulses_after_no_initial_spending (direct_spending.tests.test_expressivity.ExpressivityDiagnostics.test_static_storage_cannot_distinguish_opposite_impulses_after_no_initial_spending) ... ok
+test_static_zero_input_tail_has_fixed_direction_and_geometric_storage (direct_spending.tests.test_expressivity.ExpressivityDiagnostics.test_static_zero_input_tail_has_fixed_direction_and_geometric_storage) ... ok
+test_coordinate_labels_and_target_feasibility_audit_do_not_change_policy (direct_spending.tests.test_integration.IntegrationTests.test_coordinate_labels_and_target_feasibility_audit_do_not_change_policy) ... ok
+test_padding_mask_keeps_genuine_warmup_and_pauses_only_padding (direct_spending.tests.test_integration.IntegrationTests.test_padding_mask_keeps_genuine_warmup_and_pauses_only_padding) ... ok
+test_real_native_benchmark_minimal_job_standard_results_and_checkpoint_reload (direct_spending.tests.test_integration.IntegrationTests.test_real_native_benchmark_minimal_job_standard_results_and_checkpoint_reload) ... ok
+test_registry_core_and_beta_paths_and_configuration_roundtrip (direct_spending.tests.test_integration.IntegrationTests.test_registry_core_and_beta_paths_and_configuration_roundtrip) ... ok
+test_tagged_checkpoint_all_cores_beta_modes_and_normalization (direct_spending.tests.test_integration.IntegrationTests.test_tagged_checkpoint_all_cores_beta_modes_and_normalization) ... ok
+test_ui_command_all_core_and_beta_choices_and_parameter_matching (direct_spending.tests.test_integration.IntegrationTests.test_ui_command_all_core_and_beta_choices_and_parameter_matching) ... ok
+test_ui_single_batch_commands_saved_configuration_and_cli_override (direct_spending.tests.test_integration.IntegrationTests.test_ui_single_batch_commands_saved_configuration_and_cli_override) ... ok
+test_validation_rejects_negative_energy_nonfinite_and_bad_shapes (direct_spending.tests.test_integration.IntegrationTests.test_validation_rejects_negative_energy_nonfinite_and_bad_shapes) ... ok
+test_all_cores_all_beta_modes_prefix_certificate (direct_spending.tests.test_models.ModelTests.test_all_cores_all_beta_modes_prefix_certificate) ... ok
+test_beta_computed_once_and_declared_features_never_read_inputs (direct_spending.tests.test_models.ModelTests.test_beta_computed_once_and_declared_features_never_read_inputs) ... ok
+test_core_causality_and_explicit_detach_reset_move (direct_spending.tests.test_models.ModelTests.test_core_causality_and_explicit_detach_reset_move) ... ok
+test_cpu_autocast_zero_input_and_nonfinite_detection (direct_spending.tests.test_models.ModelTests.test_cpu_autocast_zero_input_and_nonfinite_detection) ... ok
+test_cross_chunk_gradients_into_spending_and_learned_beta (direct_spending.tests.test_models.ModelTests.test_cross_chunk_gradients_into_spending_and_learned_beta) ... ok
+test_learned_beta_underflow_is_reported_without_energy_floor (direct_spending.tests.test_models.ModelTests.test_learned_beta_underflow_is_reported_without_energy_floor) ... ok
+test_learned_context_beta_reset_is_independent_of_ambient_autocast (direct_spending.tests.test_models.ModelTests.test_learned_context_beta_reset_is_independent_of_ambient_autocast) ... ok
+test_masks_compaction_resume_and_position_offsets (direct_spending.tests.test_models.ModelTests.test_masks_compaction_resume_and_position_offsets) ... ok
+test_sequence_chunks_steps_and_all_cache_tensors (direct_spending.tests.test_models.ModelTests.test_sequence_chunks_steps_and_all_cache_tensors) ... ok
+test_supported_accelerators (direct_spending.tests.test_models.ModelTests.test_supported_accelerators) ... skipped 'CUDA/MPS unavailable; no implicit backend fallback'
+test_cpu_low_precision_inputs_and_invalid_values (direct_spending.tests.test_storage.StorageTests.test_cpu_low_precision_inputs_and_invalid_values) ... ok
+test_exact_vector_unit_ball_head_zero_boundary_and_extreme (direct_spending.tests.test_storage.StorageTests.test_exact_vector_unit_ball_head_zero_boundary_and_extreme) ... ok
+test_finite_gradients_zero_available_zero_z_and_unit_boundary (direct_spending.tests.test_storage.StorageTests.test_finite_gradients_zero_available_zero_z_and_unit_boundary) ... ok
+test_known_spending_directions_released_energy_and_remaining_storage (direct_spending.tests.test_storage.StorageTests.test_known_spending_directions_released_energy_and_remaining_storage) ... ok
+test_mask_is_identity_transition_and_nan_padding_has_zero_gradient (direct_spending.tests.test_storage.StorageTests.test_mask_is_identity_transition_and_nan_padding_has_zero_gradient) ... ok
+test_positive_beta_can_fund_zero_input_tail_without_refill (direct_spending.tests.test_storage.StorageTests.test_positive_beta_can_fund_zero_input_tail_without_refill) ... ok
+test_prefix_identity_independent_samples_with_initial_energy (direct_spending.tests.test_storage.StorageTests.test_prefix_identity_independent_samples_with_initial_energy) ... ok
+test_reference_scan_gradient_agreement_and_finite_differences (direct_spending.tests.test_storage.StorageTests.test_reference_scan_gradient_agreement_and_finite_differences) ... ok
+test_scan_reference_zeros_ones_lengths_and_dynamic_range (direct_spending.tests.test_storage.StorageTests.test_scan_reference_zeros_ones_lengths_and_dynamic_range) ... ok
+test_storage_arbitrary_chunks_steps_and_nonzero_incoming_energy (direct_spending.tests.test_storage.StorageTests.test_storage_arbitrary_chunks_steps_and_nonzero_incoming_energy) ... ok
+test_storage_causality_outputs_and_trace (direct_spending.tests.test_storage.StorageTests.test_storage_causality_outputs_and_trace) ... ok
+test_zero_input_zero_storage_and_biased_proposals_no_batch_pooling (direct_spending.tests.test_storage.StorageTests.test_zero_input_zero_storage_and_biased_proposals_no_batch_pooling) ... ok
+
+----------------------------------------------------------------------
+Ran 33 tests in 0.676s
+
+OK (skipped=1)
+Device: cpu
+Benchmarks: ['Cascaded_Tanks']
+Models: ['direct_spending']
+Output: /private/var/folders/2s/vrz_8_7127x5nsbhsywmzwl80000gn/T/tmpls3uxl_g
+
+=== Cascaded_Tanks ===
+  loaded: n_u=1 n_y=1 train_seqs=1 validation_seqs=1 init_window=50 train_len=[1024] validation_len=[1024]
+  parameter matching: off (using each architecture's raw width defaults)
+  -- model: direct_spending
+     Direct spending / static_mlp / learned initial energy — standardized coordinates; gamma=1.0, beta=0.1
+     Certificate covers the full trajectory including warm-up. The scored suffix retains its carried storage.
+     [initialization] exact target prefixes require initial energy >= 138.486 in these coordinates. Current initialization can limit fitting; gamma/beta are unchanged.
+     RMSE=3.429  fit=-61.7%  params=46  1 epochs in 0.0s
+
+benchmark           model     params     RMSE         NRMSE      fit%      R2        train s    status  
+--------------------------------------------------------------------------------------------------------
+Cascaded_Tanks      direct_s  46         3.429        1.617      -61.74    -1.616    0.0154     ok      
+
+Best on Cascaded_Tanks (by val loss): direct_spending  (val 2.508 @ epoch 1, validation RMSE 3.429, fit -61.74%)
+Reports written to /private/var/folders/2s/vrz_8_7127x5nsbhsywmzwl80000gn/T/tmpls3uxl_g/report.md and report.json
+Summary plot: /private/var/folders/2s/vrz_8_7127x5nsbhsywmzwl80000gn/T/tmpls3uxl_g/summary_rmse.png

@@ -1578,14 +1578,18 @@ def write_reports(results: List[dict], out_dir: Path, meta: dict,
         # Per-validation-sequence detail when a split has several signals.
         for r in rows:
             seqs = r.get("validation_sequences", [])
-            if r.get("model_family") == "direct_spending" and r.get("certificate"):
+            if r.get("model_family") in ("direct_spending", "energy_projection") and r.get("certificate"):
                 certificate = r["certificate"]
                 lines.extend(("", f"**{certificate['label']}**", "",
-                    f"Fixed gamma: {certificate['gamma']}; actual initial beta: {certificate['initial_beta']:.6g}. "
+                    f"Gamma ({certificate.get('gamma_mode', 'fixed')}): {certificate['gamma']}; "
+                    f"declared ceiling: {certificate.get('uniform_gamma_bound', certificate['gamma'])}; "
+                    f"actual initial beta: {certificate['initial_beta']:.6g}. "
                     f"Certificate interval: {certificate['certified_interval']}. "
                     "The scored suffix retains carried storage. Standardized-coordinate certificates "
                     "include centering and do not assert a physical-coordinate zero-state bound.",
-                    "", "Spending head saturation means ||z|| > 1, not physical output clipping.", ""))
+                    "", ("Clipping means the combined NN + linear proposal exceeded the available energy."
+                          if certificate.get("readout") == "projected" else
+                          "Spending head saturation means ||z|| > 1, not physical output clipping."), ""))
             if len(seqs) > 1:
                 lines.append("")
                 lines.append(f"<details><summary>{r['model']}: per-validation-sequence</summary>")
@@ -1630,18 +1634,9 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
-def run(args) -> None:
-    device = pick_device(args.device)
-    if device.type == "cuda":
-        torch.backends.cudnn.benchmark = True
-        torch.set_float32_matmul_precision("high")
-    print(f"Device: {device}")
-    if device.type == "mps":
-        print("Note: MPS lacks the SVD op behind the certified spectral norms, so those "
-              "ops fall back to CPU (often SLOWER than '--device cpu' for these small "
-              "models). Prefer cpu unless you've confirmed MPS is faster for your setup.")
-
-    gconf = GlobalModelConfig(
+def model_config_from_args(args):
+    """One factory policy shared by training and parameter-count previews."""
+    return GlobalModelConfig(
         spending=spending.settings_from_args(args) if set(args.models).intersection(SPENDING_MODELS) else None,
         split_memory=split_adapter.settings_from_args(args) if set(args.models).intersection(SPLIT_MODELS) else None,
         d_model=args.d_model, d_state=args.d_state, n_layers=args.n_layers,
@@ -1679,6 +1674,20 @@ def run(args) -> None:
         init=args.init, gamma_override=args.gamma, ff_override=args.ff,
         mode_override=args.mode, use_cuda_graph=args.use_cuda_graph,
     )
+
+
+def run(args) -> None:
+    device = pick_device(args.device)
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+        torch.set_float32_matmul_precision("high")
+    print(f"Device: {device}")
+    if device.type == "mps":
+        print("Note: MPS lacks the SVD op behind the certified spectral norms, so those "
+              "ops fall back to CPU (often SLOWER than '--device cpu' for these small "
+              "models). Prefer cpu unless you've confirmed MPS is faster for your setup.")
+
+    gconf = model_config_from_args(args)
     try:
         _validate_initialization(args.models, gconf)
     except ValueError as exc:
@@ -1740,6 +1749,10 @@ def run(args) -> None:
             if mname in SPENDING_MODELS:
                 spending_cfg = spending.config_for_model(mname, gconf)
                 run_name = f"{mname}--{spending_cfg.core}--{spending_cfg.beta_mode}"
+                if spending_cfg.readout == "projected":
+                    run_name += "--projected-linear"
+                if spending_cfg.gamma_mode == "learned":
+                    run_name += "--learned-gamma"
             if mname in SPLIT_MODELS:
                 split_cfg = split_adapter.config_for_model(gconf)
                 run_name = f"{mname}--{split_cfg.reader}--{split_cfg.solver if split_cfg.reader == 'recurrent' else 'readout'}--{split_cfg.memory_backend}"
@@ -1754,21 +1767,21 @@ def run(args) -> None:
                 if isinstance(model, spending.SpendingSim):
                     if model.coordinates == "physical":
                         model_norm = spending.identity_standardizer(bench.n_u, bench.n_y, Standardizer)
-                    rec["model_family"] = "direct_spending"
+                    rec["model_family"] = "energy_projection" if model.spending_config.readout == "projected" else "direct_spending"
                     rec["model_config"] = model.spending_config.to_dict()
                     rec["model_label"] = model.spending_config.label
                     rec["certificate"] = model.certificate()
                     rec["target_initial_energy_requirements"] = spending.target_compatibility(
-                        bench, model_norm, model.spending_config.gamma)
+                        bench, model_norm, rec["certificate"]["gamma"])
                     required = max(row["minimum_initial_energy_for_exact_target_prefixes"]
                                    for row in rec["target_initial_energy_requirements"])
                     print(f"     {rec['model_label']} — {model.coordinates} coordinates; "
-                          f"gamma={model.spending_config.gamma}, beta={rec['certificate']['initial_beta']:.6g}")
+                          f"gamma={rec['certificate']['gamma']:.6g} ({model.spending_config.gamma_mode}), beta={rec['certificate']['initial_beta']:.6g}")
                     print("     Certificate covers the full trajectory including warm-up. "
                           "The scored suffix retains its carried storage.")
                     if required > rec["certificate"]["initial_beta"] + 1e-6:
                         print(f"     [initialization] exact target prefixes require initial energy >= {required:.6g} "
-                              "in these coordinates. Current initialization can limit fitting; gamma/beta are unchanged.")
+                              "in these coordinates. Current initialization can limit fitting; this audit does not adjust gain or initialization.")
                 if isinstance(model, split_adapter.SplitMemorySim):
                     rec["model_family"] = "split_memory"
                     rec["model_config"] = model.split_config.to_dict()
@@ -1845,7 +1858,11 @@ def run(args) -> None:
                     storage_plot = write_storage_plot(seq_rows, run_dir)
                     if storage_plot:
                         rec.setdefault("artifacts", {})["storage_figure"] = storage_plot
+                    rec["initial_target_initial_energy_requirements"] = rec["target_initial_energy_requirements"]
                     rec["certificate"] = model.certificate()
+                    rec["target_audit_gamma"] = rec["certificate"]["gamma"]
+                    rec["target_initial_energy_requirements"] = spending.target_compatibility(
+                        bench, model_norm, rec["target_audit_gamma"])
                     checkpoint = run_dir / "model.pt"
                     rec.setdefault("artifacts", {})["checkpoint"] = str(checkpoint)
                     spending.save_checkpoint(checkpoint, model, model_norm, hist, rec)

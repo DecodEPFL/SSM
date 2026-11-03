@@ -1,0 +1,17 @@
+test_accelerators (direct_spending.output_projection.test_projection.ProjectionTests.test_accelerators) ... ok
+test_checkpoint_family_dtype_and_real_parameter_count (direct_spending.output_projection.test_projection.ProjectionTests.test_checkpoint_family_dtype_and_real_parameter_count) ... ok
+test_cpu_autocast_and_available_accelerators (direct_spending.output_projection.test_projection.ProjectionTests.test_cpu_autocast_and_available_accelerators) ... ok
+test_failed_scan_audit_reports_reference_fallback_without_refill (direct_spending.output_projection.test_projection.ProjectionTests.test_failed_scan_audit_reports_reference_fallback_without_refill) ... ok
+test_finite_difference_gradcheck_away_from_switches (direct_spending.output_projection.test_projection.ProjectionTests.test_finite_difference_gradcheck_away_from_switches) ... ok
+test_full_chunks_steps_state_gradients_context_and_padding_all_cores (direct_spending.output_projection.test_projection.ProjectionTests.test_full_chunks_steps_state_gradients_context_and_padding_all_cores) ... ok
+test_gradient_agreement_and_zero_switch_boundaries (direct_spending.output_projection.test_projection.ProjectionTests.test_gradient_agreement_and_zero_switch_boundaries) ... ok
+test_huge_proposals_long_refill_and_saturation_without_scan_cancellation (direct_spending.output_projection.test_projection.ProjectionTests.test_huge_proposals_long_refill_and_saturation_without_scan_cancellation) ... ok
+test_independent_online_oracle_direction_budget_and_per_sample_accounting (direct_spending.output_projection.test_projection.ProjectionTests.test_independent_online_oracle_direction_budget_and_per_sample_accounting) ... ok
+test_linear_identity_exact_and_joint_projection_all_cores (direct_spending.output_projection.test_projection.ProjectionTests.test_linear_identity_exact_and_joint_projection_all_cores) ... ok
+test_ui_cli_defaults_and_budget_count (direct_spending.output_projection.test_projection.ProjectionTests.test_ui_cli_defaults_and_budget_count) ... ok
+test_mode_controls_count_button_defaults_and_small_window (direct_spending.output_projection.test_projection.ProjectionUI.test_mode_controls_count_button_defaults_and_small_window) ... ok
+
+----------------------------------------------------------------------
+Ran 12 tests in 13.518s
+
+OK

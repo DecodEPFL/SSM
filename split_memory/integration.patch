@@ -1,0 +1,271 @@
+--- a/direct_spending/ui_settings.py
++++ b/direct_spending/ui_settings.py
+@@ -9,13 +9,14 @@
+ import tempfile
+ 
+ from .config import MODEL_SPECS
++from split_memory.ui import DEFAULTS as SPLIT_DEFAULTS
+ from .ui import DEFAULTS as SPENDING_DEFAULTS
+ 
+ SSM_MODELS = frozenset(("lru", "l2n", "defect", "tv", "tvc", "l2ru", "zak", "l2nt"))
+ METRIC_MODELS = frozenset(("metric_defect", "metric_l2n"))
+ RNN_MODELS = frozenset(("lstm", "gru"))
+ UI_MODELS = ("lru", "l2n", "defect", "metric_defect", "metric_l2n", "tv", "tvc",
+-             "ren", "lstm", "gru", "l2ru", "zak", "l2nt", "direct_spending")
++             "ren", "lstm", "gru", "l2ru", "zak", "l2nt", "direct_spending", "split_memory")
+ 
+ # Shared fields describe the run, never an architecture.
+ SHARED_DEFAULTS = dict(device="auto", epochs="200", batch_size="32", lr="3e-3",
+@@ -32,7 +33,7 @@
+     metric_ff="residual", metric_init_feedthrough="0.95", tv_init_rho="0.99",
+     tv_init_delta0="1.0", tv_init_param_scale="0.02", tvc_init_rho="0.9", tvc_init_delta0="1.0",
+     tvc_init_param_scale="0.02", tvc_init_sign="0.995", tvc_init_b="0.10", tvc_init_c="0.10",
+-    tvc_init_d="0.10", ren_dim_internal="16", ren_dim_nl="16", **SPENDING_DEFAULTS)
++    tvc_init_d="0.10", ren_dim_internal="16", ren_dim_nl="16", **SPENDING_DEFAULTS, **SPLIT_DEFAULTS)
+ VALUE_DEFAULTS = {**SHARED_DEFAULTS, **MODEL_DEFAULTS}
+ TOGGLE_DEFAULTS = dict(show_var=True, gif_var=True, amp_var=False, compile_var=False,
+     pcg_var=False, cudagraph_var=True, l2n_random_phase_var=True, defect_random_phase_var=True)
+--- a/direct_spending/ui_layout.py
++++ b/direct_spending/ui_layout.py
+@@ -162,6 +162,10 @@
+             self.spending = SpendingOptions(frame, self.owner.vars, initialize=False)
+             self.spending.frame.pack(fill="x", pady=(6, 0))
+             self.owner.spending_options = self.spending
++        if model == "split_memory":
++            from split_memory.ui import SplitMemoryOptions
++            self.owner.split_memory_options = SplitMemoryOptions(frame, self.owner.vars)
++            self.owner.split_memory_options.frame.pack(fill="x")
+         base = {"metric_l2n": "l2n", "metric_defect": "defect"}.get(model, model)
+         if model in METRIC_MODELS:
+             group = ttk.LabelFrame(frame, text="Metric transfer", padding=4)
+--- a/Test_files/run_benchmarks.py
++++ b/Test_files/run_benchmarks.py
+@@ -75,6 +75,8 @@
+ from src.neural_ssm.rens.ren import REN
+ from direct_spending.config import MODEL_SPECS as SPENDING_MODELS
+ from direct_spending import benchmark as spending
++from split_memory import benchmark as split_adapter
++from split_memory.config import MODEL_SPECS as SPLIT_MODELS
+ 
+ 
+ # ============================================================================
+@@ -148,7 +150,7 @@
+         raise KeyError(f"Unknown benchmark {name!r}. Available: {sorted(_ALL_LOADERS)}")
+ 
+     if not train_list or not validation_list:
+-        raise RuntimeError(f"Benchmark {name!r} produced an empty train/validation split.")
++        raise RuntimeError(f"Benchmark {name!r} produced an empty train/validation split_adapter.")
+ 
+     n_u = int(train_list[0].u.shape[-1])
+     n_y = int(train_list[0].y.shape[-1])
+@@ -398,6 +400,7 @@
+ }
+ MODEL_ZOO.update(LEGACY_MODEL_ZOO)
+ MODEL_ZOO.update(SPENDING_MODELS)
++MODEL_ZOO.update(SPLIT_MODELS)
+ 
+ # Fastest equivalent execution mode per SSM parametrization (used when
+ # --mode auto). lru/l2n are LTI diagonal-complex systems -> FFT convolution;
+@@ -431,6 +434,8 @@
+ 
+ def _effective_width(model: nn.Module) -> Optional[int]:
+     """Return the width knob changed by parameter matching, when available."""
++    if hasattr(model, "split_config"):
++        return model.split_config.heads if model.split_config.reader == "linear" else model.split_config.computation_width
+     if hasattr(model, "spending_config"):
+         return model.spending_config.width
+     core = getattr(model, "core", None)
+@@ -549,6 +554,9 @@
+     hidden size for the RNN baselines); other hyperparameters are left as set."""
+     spec = dict(MODEL_ZOO[name])
+     kind = spec.pop("kind")
++
++    if kind == "split_memory":
++        return split_adapter.build_suite_model(n_u, n_y, gconf, param_budget, closest_width=_closest_width)
+ 
+     if kind == "direct_spending":
+         return spending.build_suite_model(name, n_u, n_y, gconf, param_budget,
+@@ -704,11 +712,14 @@
+     spending: Optional[dict] = None
+     rnn_hidden: int = 64
+     rnn_layers: int = 2
++    split_memory: Optional[dict] = None
+ 
+ 
+ def _validate_initialization(models: Sequence[str], cfg: GlobalModelConfig) -> None:
+     """Validate only the initialization settings used by selected models."""
+     selected = set(models)
++    if selected.intersection(SPLIT_MODELS):
++        split_adapter.config_for_model(cfg)
+     if selected.intersection(("lstm", "gru")) and (cfg.rnn_hidden < 1 or cfg.rnn_layers < 1):
+         raise ValueError("RNN hidden width and layer count must be positive.")
+     for name in selected.intersection(SPENDING_MODELS):
+@@ -926,7 +937,7 @@
+         for i in range(0, len(sequences), tcfg.batch_size):
+             batch_indices = range(i, min(i + tcfg.batch_size, len(sequences)))
+             U, Y, M, valid = pack_full_sequences(sequences, batch_indices, device, return_valid=True)
+-            pred = model(U, mask=valid) if isinstance(model, spending.SpendingSim) else model(U)
++            pred = model(U, mask=valid) if isinstance(model, (spending.SpendingSim, split_adapter.SplitMemorySim)) else model(U)
+             tot = tot + (((pred - Y) ** 2) * M.unsqueeze(-1)).sum()
+             denom = denom + M.sum() * n_y
+         denom = denom.clamp_min(1.0)
+@@ -950,7 +961,7 @@
+             # torch.autocast, which can raise on some torch builds even when disabled.
+             amp_ctx = torch.autocast(device_type="cuda") if use_amp else contextlib.nullcontext()
+             with amp_ctx:
+-                pred = model(Ut, mask=valid) if isinstance(model, spending.SpendingSim) else model(Ut)
++                pred = model(Ut, mask=valid) if isinstance(model, (spending.SpendingSim, split_adapter.SplitMemorySim)) else model(Ut)
+                 loss = masked_mse(pred, Yt, Mt)
+             scaler.scale(loss).backward()
+             if tcfg.grad_clip:
+@@ -1024,6 +1035,8 @@
+                 normalized = norm.norm_u(torch.as_tensor(d.u, dtype=torch.float32)).unsqueeze(0).to(device)
+                 rows[-1]["storage_diagnostics"] = model.storage_diagnostics(
+                     normalized, initialization_window=int(d.state_initialization_window_length or 0))
++        if isinstance(model, split_adapter.SplitMemorySim):
++            rows[-1]["solver_diagnostics"] = model.solver_diagnostics()
+         preds.append(y_pred)
+     return rows, preds
+ 
+@@ -1307,7 +1320,18 @@
+                  for name, (u, _y) in self._previews.items()}
+         currents = [preds[p["source"]][p["idx"], p["channel"]] for p in self._panels]
+ 
+-        # Expand the (log) loss y-range only; otherwise the cached background stays valid.
++        # Poor initial predictions can lie outside the target-only limits. Keep
++        # them visible and refresh the blit background only when an axis expands.
++        background_changed = False
++        for ax, prediction in zip(self._panel_axes, currents):
++            values = prediction[np.isfinite(prediction)]
++            if values.size:
++                low, high = float(values.min()), float(values.max())
++                current_low, current_high = ax.get_ylim()
++                if low < current_low or high > current_high:
++                    margin = .05 * max(current_high - current_low, high - low, 1e-6)
++                    ax.set_ylim(min(current_low, low - margin), max(current_high, high + margin))
++                    background_changed = True
+         finite = [v for v in list(train_losses) + list(val_losses) if np.isfinite(v) and v > 0]
+         if finite:
+             lo, hi = min(finite) * 0.5, max(finite) * 2.0
+@@ -1315,7 +1339,9 @@
+             if lo < clo or hi > chi:
+                 self._loss_ylim = (min(clo, lo), max(chi, hi))
+                 self.loss_ax.set_ylim(*self._loss_ylim)
+-                self._redraw_background()
++                background_changed = True
++        if background_changed:
++            self._redraw_background()
+ 
+         if self.show and self._prev is not None:
+             for f in range(1, self.transition_frames + 1):
+@@ -1617,6 +1643,7 @@
+ 
+     gconf = GlobalModelConfig(
+         spending=spending.settings_from_args(args) if set(args.models).intersection(SPENDING_MODELS) else None,
++        split_memory=split_adapter.settings_from_args(args) if set(args.models).intersection(SPLIT_MODELS) else None,
+         d_model=args.d_model, d_state=args.d_state, n_layers=args.n_layers,
+         d_hidden=args.d_hidden, nl_layers=args.nl_layers,
+         metric_activation=args.metric_activation, metric_ff=args.metric_ff,
+@@ -1713,6 +1740,9 @@
+             if mname in SPENDING_MODELS:
+                 spending_cfg = spending.config_for_model(mname, gconf)
+                 run_name = f"{mname}--{spending_cfg.core}--{spending_cfg.beta_mode}"
++            if mname in SPLIT_MODELS:
++                split_cfg = split_adapter.config_for_model(gconf)
++                run_name = f"{mname}--{split_cfg.reader}--{split_cfg.solver if split_cfg.reader == 'recurrent' else 'readout'}--{split_cfg.memory_backend}"
+             run_dir = out_root / bname / run_name
+             run_dir.mkdir(parents=True, exist_ok=True)
+             rec = {"benchmark": bname, "model": mname, "n_u": bench.n_u, "n_y": bench.n_y}
+@@ -1739,12 +1769,19 @@
+                     if required > rec["certificate"]["initial_beta"] + 1e-6:
+                         print(f"     [initialization] exact target prefixes require initial energy >= {required:.6g} "
+                               "in these coordinates. Current initialization can limit fitting; gamma/beta are unchanged.")
++                if isinstance(model, split_adapter.SplitMemorySim):
++                    rec["model_family"] = "split_memory"
++                    rec["model_config"] = model.split_config.to_dict()
++                    rec["model_label"] = f"Split memory / {model.split_config.reader}" + (f" / {model.split_config.solver}" if model.split_config.reader == "recurrent" else "")
++                    print(f"     {rec['model_label']}; bounded gated memory; no prescribed l2-gain guarantee")
++                    if not model.split_config.require_convergence:
++                        print("     [approximation] Nonconverged finite-sweep training explicitly allowed; evaluation residuals are reported.")
+                 rec["compiled"] = False
+                 if args.compile:
+                     kind = MODEL_ZOO[mname].get("kind")
+-                    if kind in ("lstm", "gru", "ren", "direct_spending"):
++                    if kind in ("lstm", "gru", "ren", "direct_spending", "split_memory"):
+                         print(f"     torch.compile: skipped for {mname} "
+-                              f"({'portable storage path' if kind == 'direct_spending' else 'eager-only REN' if kind == 'ren' else 'cuDNN kernel already fused'})")
++                              f"({'eager solver diagnostics; fixed kernel is separately compilable' if kind == 'split_memory' else 'portable storage path' if kind == 'direct_spending' else 'eager-only REN' if kind == 'ren' else 'cuDNN kernel already fused'})")
+                     else:
+                         mode = None if args.compile_mode == "default" else args.compile_mode
+                         model = torch.compile(model, mode=mode)
+@@ -1813,6 +1850,17 @@
+                     rec.setdefault("artifacts", {})["checkpoint"] = str(checkpoint)
+                     spending.save_checkpoint(checkpoint, model, model_norm, hist, rec)
+ 
++                if isinstance(model, split_adapter.SplitMemorySim):
++                    rec["history"] = hist
++                    rec["solver_diagnostics"] = model.diagnostics()
++                    # Plot previews also call the model. Report the complete scored
++                    # validation trajectory, rather than the last short preview.
++                    rec["solver_diagnostics"]["solver"] = seq_rows[-1]["solver_diagnostics"] if seq_rows else None
++                    rec["solver_diagnostics"]["solver_scope"] = "last complete validation trajectory; all trajectories have per-sequence diagnostics"
++                    rec["gradient_semantics"] = "ordinary autograd through the implemented finite-sweep graph"
++                    checkpoint = run_dir / "model.pt"
++                    rec.setdefault("artifacts", {})["checkpoint"] = str(checkpoint)
++                    split_adapter.save_checkpoint(checkpoint, model, model_norm, hist, rec)
+                 rec["status"] = "ok"
+                 print(f"     RMSE={rec['rmse']:.4g}  fit={rec['fit']:.3g}%  "
+                       f"params={rec['n_params']}  {hist['epochs_run']} epochs in "
+@@ -1821,6 +1869,8 @@
+                 import traceback
+                 rec["status"] = f"error: {type(exc).__name__}"
+                 rec["error"] = str(exc)
++                if isinstance(exc, split_adapter.ConvergenceError):
++                    rec["solver_failure"] = exc.diagnostics
+                 print(f"     [error] {type(exc).__name__}: {exc}")
+                 if args.verbose:
+                     traceback.print_exc()
+@@ -1839,6 +1889,7 @@
+         "model_initialization": _initialization_metadata(gconf),
+         "model_dims": f"d_model={gconf.d_model},d_state={gconf.d_state},n_layers={gconf.n_layers}",
+         "direct_spending": gconf.spending,
++        "split_memory": gconf.split_memory,
+         "launch_configuration": vars(args),
+     }
+     console_table(results)
+@@ -1884,7 +1935,7 @@
+     p.add_argument("--grad-clip", type=float, default=1.0)
+     p.add_argument("--amp", action="store_true", help="cuda mixed precision (loosens certified caps)")
+     p.add_argument("--compile", action=argparse.BooleanOptionalAction, default=False,
+-                   help="wrap models in torch.compile (skipped for lstm/gru/ren: cuDNN "
++                   help="wrap models in torch.compile (skipped for lstm/gru/ren/direct_spending/split_memory: cuDNN "
+                         "kernels / eager-only REN). Expect a one-off compile pause on the "
+                         "first training step and again on the first full-length eval.")
+     p.add_argument("--compile-mode", default="default",
+@@ -2012,6 +2063,7 @@
+     p.add_argument("--verbose", action="store_true")
+     p.add_argument("--config", help="saved UI configuration JSON; explicit CLI arguments override it")
+     spending.add_arguments(p)
++    split_adapter.add_arguments(p)
+     return p
+ 
+ 
+--- a/Test_files/benchmark_ui.py
++++ b/Test_files/benchmark_ui.py
+@@ -37,6 +37,7 @@
+ from direct_spending.ui_settings import (UI_MODELS, VALUE_DEFAULTS, TOGGLE_DEFAULTS,
+     SSM_MODELS, architecture_keys, normalize_configuration, write_configuration)
+ from direct_spending.ui_results import RunResults
++from split_memory.ui import command_arguments as split_arguments
+ 
+ # Keep the complete registry available to existing integrations, while the
+ # window shows one spending family with a core selector. No torch import here.
+@@ -361,6 +362,8 @@
+             ]
+         if set(models).intersection(SPENDING_MODELS):
+             cmd += spending_arguments(self.vars, models)
++        if "split_memory" in models:
++            cmd += split_arguments(self.vars)
+         cmd += ["--show"] if self.show_var.get() else ["--no-show"]
+         if not self.gif_var.get():
+             cmd += ["--no-gif"]

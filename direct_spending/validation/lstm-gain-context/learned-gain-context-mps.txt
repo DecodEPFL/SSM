@@ -1,0 +1,6 @@
+test_accelerator_learned_gain_context_forward_and_backward (direct_spending.tests.test_extensions.ExtensionTests.test_accelerator_learned_gain_context_forward_and_backward) ... ok
+
+----------------------------------------------------------------------
+Ran 1 test in 4.388s
+
+OK

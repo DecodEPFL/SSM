@@ -1,0 +1,28 @@
+{
+  "focused": {
+    "run": 55,
+    "passed": 51,
+    "skipped": 4
+  },
+  "native_ui_and_fixed_gain_mps": {
+    "run": 15,
+    "passed": 15
+  },
+  "learned_gain_context_mps": {
+    "run": 1,
+    "passed": 1
+  },
+  "final_count_button": {
+    "run": 1,
+    "passed": 1
+  },
+  "repository": {
+    "run": 188,
+    "passed": 186,
+    "skipped": 2
+  },
+  "cuda": "unavailable",
+  "visual_ui_verification": "unavailable, as requested",
+  "saved_ui_defaults": "unchanged",
+  "existing_user_reports": "not written by this work; observed concurrent changes were preserved"
+}

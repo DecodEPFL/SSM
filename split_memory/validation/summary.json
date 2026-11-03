@@ -1,0 +1,172 @@
+{
+  "date": "2026-10-28",
+  "focused": {
+    "run": 24,
+    "passed": 24,
+    "skipped": 0
+  },
+  "repository_regression": {
+    "run": 188,
+    "passed": 186,
+    "skipped": 2
+  },
+  "prior_ui_and_spending_integration": {
+    "run": 18,
+    "passed": 17,
+    "skipped": 1
+  },
+  "runtime": {
+    "cpu": "Apple M1 Max",
+    "memory_bytes": 34359738368,
+    "platform": "macOS-15.6.1-arm64-arm-64bit-Mach-O",
+    "python": "3.13.9",
+    "pytorch": "2.9.0",
+    "cuda": false,
+    "mps": true,
+    "focused_test_mps_cpu_fallback_enabled": false
+  },
+  "ui": {
+    "programmatic_native_controls": true,
+    "saved_defaults_restored_in_fresh_window": true,
+    "normal_run_button_child_job_results_and_image": true,
+    "checkpoint_reload_metrics_match": true,
+    "visual_inspection": false,
+    "visual_reason": "User previously requested finishing with visual UI verification unavailable; no screenshot/manual visual claims.",
+    "cancellation": "Existing unchanged path; not re-tested interactively.",
+    "prediction_limits_include_out_of_range_outputs": true
+  },
+  "smoke": {
+    "dataset": "Cascaded_Tanks",
+    "seed": 0,
+    "device": "cpu",
+    "dtype": "float32",
+    "batch": 1,
+    "train_length": 1024,
+    "validation_length": 1024,
+    "metric_initialization_window": 50,
+    "epochs": 1,
+    "model_config": {
+      "heads": 2,
+      "computation_width": 4,
+      "reader": "recurrent",
+      "rho": 0.7,
+      "memory_radius": 1.0,
+      "initial_retention": 0.95,
+      "row_delta": 0.0001,
+      "solver": "fixed",
+      "memory_backend": "scan",
+      "tolerance": 0.0001,
+      "fixed_sweeps": 32,
+      "max_sweeps": 64,
+      "require_convergence": true,
+      "diagnostics": true,
+      "projection_scale": 0.1,
+      "mixing_scale": 0.02
+    },
+    "trainable_parameters": 61,
+    "rmse_physical": 2.0847244728139134,
+    "nrmse": 0.9833642589771255,
+    "train_time_s": 0.08232998847961426,
+    "timing_scope": "Existing CPU training-loop timer, including epoch validation and in-loop plot preview; no accelerator synchronization required. One measurement, no throughput/ranking claim.",
+    "solver_diagnostics": {
+      "solver": "fixed",
+      "memory_backend": "scan",
+      "mask_fallback": false,
+      "tolerance": 0.0001,
+      "dtype": "torch.float32",
+      "gradient": "ordinary explicit autograd",
+      "sweeps": 32,
+      "cell_passes": 33,
+      "cell_evaluations": 33792,
+      "valid_cell_evaluations": 33792,
+      "residual": 8.642673492431641e-07,
+      "state_error_bound": 2.880891088352655e-06,
+      "converged": true,
+      "measured_row_sum": 0.6999310255050659,
+      "sufficient_uniform_sweeps": 26,
+      "bound_scope": "exact-arithmetic residual bound for the computed memory; not an interval proof",
+      "max_memory_head_norm": 0.4942769408226013,
+      "max_memory_bound_deviation": 0.0,
+      "memory_to_computation_lipschitz_inf": 0.17369751632213593,
+      "rho": 0.7
+    },
+    "status": "ok"
+  },
+  "numerics": {
+    "torch.float32": {
+      "batch": 2,
+      "length": 8193,
+      "heads": 2,
+      "retention": 1.0,
+      "angle": 0.013,
+      "writes": 0.0,
+      "max_abs_scan_reference": 5.4001808166503906e-05,
+      "scan_max_abs_head_norm_drift": 0.0002129077911376953,
+      "reference_max_abs_head_norm_drift": 0.0002658367156982422
+    },
+    "torch.float64": {
+      "batch": 2,
+      "length": 8193,
+      "heads": 2,
+      "retention": 1.0,
+      "angle": 0.013,
+      "writes": 0.0,
+      "max_abs_scan_reference": 1.2434497875801753e-14,
+      "scan_max_abs_head_norm_drift": 6.104006189389111e-13,
+      "reference_max_abs_head_norm_drift": 6.090683513093609e-13
+    },
+    "gradient_audit": {
+      "dtype": "float64",
+      "batch": 2,
+      "length": 9,
+      "heads": 3,
+      "computation_width": 5,
+      "sweeps": 9,
+      "max_abs_output_error": 2.7755575615628914e-17,
+      "max_abs_errors_by_parameter": {
+        "input": 2.0122792321330962e-16,
+        "incoming_memory": 1.1102230246251565e-15,
+        "incoming_computation": 8.326672684688674e-17,
+        "bias": 4.440892098500626e-16,
+        "memory.gate.weight": 1.1102230246251565e-16,
+        "memory.gate.bias": 4.440892098500626e-16,
+        "memory.angle.weight": 1.587618925213974e-14,
+        "memory.angle.bias": 2.6645352591003757e-15,
+        "memory.write.weight": 1.4224732503009818e-16,
+        "memory.write.bias": 4.440892098500626e-16,
+        "memory_projection.weight": 1.3322676295501878e-15,
+        "input_projection.weight": 2.220446049250313e-16,
+        "out_proj.weight": 2.220446049250313e-16,
+        "out_proj.bias": 1.942890293094024e-16,
+        "computation.raw": 4.440892098500626e-16
+      }
+    }
+  },
+  "unsupported_or_limited": {
+    "cuda": "Unavailable, not validated",
+    "mps": "Basic FP32 fixed/adaptive/sequential forward/backward passed with PYTORCH_ENABLE_MPS_FALLBACK=0. MPS high-dimensional padding emitted a View Ops implementation warning, with possible performance implications.",
+    "mps_fp64": "Not supported; explicit rejection/no CPU emulation",
+    "internal_mask_gaps": "Reported sequential batch fallback; suffix padding stays parallel",
+    "implicit_backward_and_newton": "Not implemented; ordinary autograd only",
+    "full_model_compile": "Explicitly skipped by suite. Pure fixed kernel validated with fullgraph aot_eager."
+  },
+  "preservation": "All original source/run-artifact hashes except four declared benchmark/UI wiring files match the initial baseline. The shared monitor also received a tested prediction-axis visibility correction within the runner.",
+  "source_sha256": {
+    "split_memory/config.py": "8e71ede21d94854b90f6fe938aa372f63c2304ad37e21365eb468ae00e953dab",
+    "split_memory/benchmark.py": "6909fb3c16a48f3df7d8c71f4f62d3e46ac27e6519c0fcd556a9cd32bf4a5612",
+    "split_memory/memory.py": "75e1408476e783fbf245acda4e811e1695098327a741883975a951b0ee854b4e",
+    "split_memory/ui.py": "dd1f5bfe881a4f3eedd04b32f9f9444cdbc2ad8ec33aafc27a6c645b537c7355",
+    "split_memory/__init__.py": "a91fa51bb4768ba27a5988bb16f26bd2a832611d7e09f02be7584f6362ab59bd",
+    "split_memory/solvers.py": "52da4a95233fe38c601836c5e6bed2edbf110395e3914fe6a2317b239a100ee8",
+    "split_memory/model.py": "697e4999c32a99c8376d5f1352542ddb71b32e4cd79793c81ac163e876308c3c",
+    "split_memory/state.py": "5a1bf1424fc5bb7d1efd6e14dc3417644c2f75ebd59f6334011ebaef49571b8c",
+    "split_memory/tests/test_model.py": "9b8e132f668918ee4545376df272ae618134c695991dd195d5ce25e3e3c6b9e2",
+    "split_memory/tests/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "split_memory/tests/test_memory.py": "fdb2b1a1eb243289cd50dab2a5219616b179f597ae71ab7570fc797df411fe20",
+    "split_memory/tests/test_integration.py": "7d9546fc6fe76d73ea3d9b211bc2b631354cb79dae2312d06db1c10a51ff2f1a",
+    "direct_spending/ui_settings.py": "250dea7d39bb19176a45b27440b46ccc21292155960e41f7b6a975d8de8ec03b",
+    "direct_spending/ui_layout.py": "4dd44dd3176000e22606bea99a8441d94b2df4ed46e4c6379576ed9863534865",
+    "Test_files/run_benchmarks.py": "8af78507b626643ffdd83a25a9faf875e7f1eb9ecb5c8fbcb79a3a126a7bd1d9",
+    "Test_files/benchmark_ui.py": "880924758325722212408258af5d7a4ea52ec8cc4543ce7803e3be82fc2ee90a"
+  }
+}

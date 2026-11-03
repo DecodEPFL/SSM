@@ -1,0 +1,63 @@
+{
+  "status": "ok",
+  "model_family": "energy_projection",
+  "n_params": 643,
+  "rmse": 2.4362286979948524,
+  "train_time_s": 0.0670161247253418,
+  "certificate": {
+    "family": "energy_projection",
+    "version": 1,
+    "readout": "projected",
+    "linear_path": true,
+    "linear_initialization": "zero",
+    "numerical_semantics": "real-arithmetic energy identity; conservative clipped-output rounding may dissipate energy",
+    "spending_core": "transformer",
+    "gamma": 0.49937495589256287,
+    "gamma_mode": "learned",
+    "initial_gamma": 0.5,
+    "learned_gamma_bounds": [
+      0.1,
+      2.0
+    ],
+    "uniform_gamma_bound": 2.0,
+    "gamma_semantics": "global scalar; fixed weights/gamma throughout each trajectory; reset states after optimizer updates",
+    "beta_mode": "zero",
+    "initial_beta": 0.0,
+    "coordinates": "standardized",
+    "label": "Output projection + linear path / transformer / zero-bias / learned gamma (standardized coordinates)",
+    "statement": "sum ||y||^2 + S_final = initial_beta + gamma^2 sum ||input||^2",
+    "certified_interval": "complete trajectory from sample 0, including metric warm-up",
+    "metric_suffix": "skipping initialization samples does not reset storage; a suffix has its carried-storage allowance",
+    "context_features": 0,
+    "context_semantics": "optional sequence context conditions the causal core only, never supplies storage energy; beta context is separately declared constant initialization",
+    "physical_zero_state_bound": false
+  },
+  "target_initial_energy_requirements": [
+    {
+      "split": "train",
+      "trajectory": "train Cascaded_Tanks",
+      "minimum_initial_energy_for_exact_target_prefixes": 777.5428238587344
+    },
+    {
+      "split": "validation",
+      "trajectory": "test Cascaded_Tanks",
+      "minimum_initial_energy_for_exact_target_prefixes": 714.7626530498228
+    }
+  ],
+  "diagnostics": {
+    "gamma": 0.49937495589256287,
+    "initial_beta": [
+      0.0
+    ],
+    "storage_at_metric_start": [
+      0.0
+    ],
+    "mean_spending_fraction": 0.7831554159672748,
+    "max_normalized_energy_violation": 0.0,
+    "max_normalized_identity_error": 7.345775796085202e-07,
+    "implementation": "scan_max_plus",
+    "clipping_fraction": 0.744140625
+  },
+  "checkpoint_format": "energy_projection_v1",
+  "checkpoint_reload_matches": true
+}

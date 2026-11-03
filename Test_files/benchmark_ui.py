@@ -33,10 +33,12 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 from direct_spending.config import MODEL_SPECS as SPENDING_MODELS
 from direct_spending.ui import command_arguments as spending_arguments
-from direct_spending.ui_layout import ModelOptions, ScrollableSettings, fields
+from direct_spending.ui_layout import LABELS, ModelOptions, ScrollableSettings, fields
+from direct_spending.ui_numbers import real_number, whole_number, learning_rate_preview
 from direct_spending.ui_settings import (UI_MODELS, VALUE_DEFAULTS, TOGGLE_DEFAULTS,
     SSM_MODELS, architecture_keys, normalize_configuration, write_configuration)
 from direct_spending.ui_results import RunResults
+from direct_spending.ui_parameter_count import show_parameter_count
 from split_memory.ui import command_arguments as split_arguments
 
 # Keep the complete registry available to existing integrations, while the
@@ -274,6 +276,14 @@ class BenchmarkUI:
         # Defaults also support older programmatic control dictionaries.
         return str(self.vars[key].get()).strip() if key in self.vars else VALUE_DEFAULTS[key]
 
+    def _show_parameter_count(self):
+        try:
+            command = self._build_command()
+        except ValueError as exc:
+            messagebox.showerror("Invalid options", str(exc))
+            return None
+        return show_parameter_count(self.root, command, _REPO_ROOT)
+
     def _build_command(self):
         benches = self._selected(self.bench_list, BENCHMARKS)
         models = self._selected(self.model_list, VISIBLE_MODELS)
@@ -296,6 +306,7 @@ class BenchmarkUI:
         if g("device") != "auto":
             cmd += ["--device", g("device")]
         active = architecture_keys(models, g("spending_core"), g("ff"), g("metric_ff"))
+        self._validate_run_values(active)
         for key in ("d_model", "d_state", "n_layers", "d_hidden", "nl_layers", "gamma", "rnn_hidden", "rnn_layers"):
             if key in active:
                 cmd += ["--" + key.replace("_", "-"), g(key)]
@@ -375,13 +386,10 @@ class BenchmarkUI:
             cmd += ["--per-channel-gates"]
         if set(models).intersection(("tv", "tvc")):
             cmd += ["--use-cuda-graph"] if self.cudagraph_var.get() else ["--no-use-cuda-graph"]
-        self._validate_run_values(active)
-
         return cmd
 
     def _validate_run_values(self, active):
         """Catch malformed visible fields before saving defaults or launching a child."""
-        import math
         get = self._value
         integer_minima = dict(epochs=1, batch_size=1, plot_every=1, plot_max_length=1, seed=0,
                              d_model=1, d_state=1, n_layers=0, d_hidden=1, nl_layers=1,
@@ -389,19 +397,19 @@ class BenchmarkUI:
         for key, minimum in integer_minima.items():
             if key not in active and key not in ("epochs", "batch_size", "plot_every", "plot_max_length", "seed"):
                 continue
-            if int(get(key)) < minimum:
-                raise ValueError(f"{key.replace('_', ' ')} must be at least {minimum}")
+            if whole_number(get(key), LABELS[key]) < minimum:
+                raise ValueError(f"{LABELS[key]} must be at least {minimum}")
         for key in ("lr", "weight_decay", "grad_clip"):
-            value = float(get(key))
-            if not math.isfinite(value) or value < 0 or (key == "lr" and value == 0):
-                raise ValueError(f"Invalid {key.replace('_', ' ')}")
+            value = real_number(get(key), LABELS[key])
+            if value < 0 or (key == "lr" and value == 0):
+                raise ValueError(f"{LABELS[key]} must be {'positive' if key == 'lr' else 'nonnegative'}")
         if "gamma" in active and get("gamma").lower() not in ("auto", "none"):
-            value = float(get("gamma"))
-            if not math.isfinite(value) or value <= 0:
+            value = real_number(get("gamma"), LABELS["gamma"])
+            if value <= 0:
                 raise ValueError("Gain limit must be auto, none, or a positive number")
         budget = get("param_budget").lower()
         if budget not in ("off", "none", "0", "") and budget not in MODELS and budget not in SPENDING_MODELS:
-            if int(budget) <= 0:
+            if whole_number(budget, "Parameter budget") <= 0:
                 raise ValueError("Parameter budget must be a positive integer, off, or a model name")
         if not self.out_var.get().strip():
             raise ValueError("Choose an output directory")
@@ -417,7 +425,8 @@ class BenchmarkUI:
             messagebox.showerror("Invalid options", str(exc))
             return
 
-        self._set_log("$ " + " ".join(cmd) + "\n\n")
+        self._set_log("Learning rate: " + learning_rate_preview(self._value("lr"))
+                      + " per optimizer step\n$ " + " ".join(cmd) + "\n\n")
         self._run_started = time.time()
         output_path = Path(self.out_var.get()).expanduser()
         self._active_output = (output_path if output_path.is_absolute() else _REPO_ROOT / output_path).resolve()
