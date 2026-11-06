@@ -379,6 +379,13 @@ both ordinary and metric models. `--metric-ff` controls the metric stack's
 feedforward independently of `--ff`.
 
 For a desktop form, run `python Test_files/benchmark_ui.py` (requires Tk support).
+For the standalone delayed-cue robot navigation task, click **Delayed navigation…**
+in that window, or run `python -m delayed_navigation.ui` directly. Load
+[`delayed_navigation/configs/ui-l2n-comparison.json`](delayed_navigation/configs/ui-l2n-comparison.json)
+in the example window. It exports final PNG/PDF comparisons and optional GIFs.
+The [navigation guide](delayed_navigation/README.md) explains the exact tank,
+bistable memory, GRU/LSTM/L2RU/L2N/REN baselines, metrics and initial CPU results.
+
 For a synthetic four-way timing comparison of identity/full L2N and defect,
 run `python scripts/compare_defect_vs_normalization.py`. Add
 `--l2n-state-metric full --defect-state-metric full` to compare only full storage.

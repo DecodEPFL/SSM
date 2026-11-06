@@ -129,6 +129,7 @@ class BenchmarkUI:
         self.run_btn.pack(side="left")
         self.stop_btn = ttk.Button(actions, text="■  Stop", command=self._stop, state="disabled")
         self.stop_btn.pack(side="left", padx=6)
+        ttk.Button(actions, text="Delayed navigation…", command=self._open_navigation).pack(side="left", padx=6)
         ttk.Button(actions, text="Save as defaults", command=self._save_defaults).pack(side="left", padx=(14, 6))
         ttk.Button(actions, text="Save configuration…", command=self._save_config).pack(side="left", padx=6)
         ttk.Button(actions, text="Load configuration…", command=self._load_config).pack(side="left", padx=6)
@@ -172,6 +173,12 @@ class BenchmarkUI:
         d = filedialog.askdirectory(initialdir=self.out_var.get() or str(_REPO_ROOT))
         if d:
             self.out_var.set(d)
+
+    def _open_navigation(self, config_path=None):
+        command = [sys.executable, "-m", "delayed_navigation.ui"]
+        if config_path:
+            command += ["--config", str(config_path)]
+        subprocess.Popen(command, cwd=str(_REPO_ROOT))
 
     def _snapshot(self):
         return {"format": "nonlinear_benchmark_ui_v1",
@@ -240,7 +247,11 @@ class BenchmarkUI:
         path = filedialog.askopenfilename(filetypes=[("Configuration", "*.json")])
         if path:
             try:
-                self._apply_configuration(json.loads(Path(path).read_text()))
+                config = json.loads(Path(path).read_text())
+                if config.get("benchmarks") == ["Delayed_Navigation"]:
+                    self._open_navigation(path)
+                else:
+                    self._apply_configuration(config)
             except (ValueError, OSError, KeyError, TypeError) as exc:
                 messagebox.showerror("Configuration", str(exc))
 

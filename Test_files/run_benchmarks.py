@@ -2086,11 +2086,17 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main():
     arguments = sys.argv[1:]
+    if "Delayed_Navigation" in arguments or "--benchmarks=Delayed_Navigation" in arguments:
+        from delayed_navigation.cli import main as navigation_main
+        return navigation_main(arguments)
     pre = argparse.ArgumentParser(add_help=False)
     pre.add_argument("--config")
     configured, _ = pre.parse_known_args(arguments)
     if configured.config:
         saved = json.loads(Path(configured.config).read_text())
+        if saved.get("benchmarks") == ["Delayed_Navigation"]:
+            from delayed_navigation.cli import main as navigation_main
+            return navigation_main(arguments)
         if saved.get("format") != "nonlinear_benchmark_ui_v1":
             raise SystemExit("Unsupported saved UI configuration format")
         arguments = saved["argv"] + arguments
